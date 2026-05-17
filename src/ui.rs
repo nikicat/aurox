@@ -1,0 +1,609 @@
+//! Colored user-facing CLI output (banners, package lists, progress bars, prompts).
+//!
+//! Built on `console` (styling), `indicatif` (bars/spinners), and `dialoguer`
+//! (prompts) — the pacman/yay-style UI stack. Independent of [`tracing`],
+//! which carries diagnostic events for developers and stays silent unless
+//! `RUST_LOG` enables it.
+//!
+//! Progress-bar conventions in this module:
+//! - `{prefix}` carries the **fixed** row label (`objects`, `received`, …).
+//! - `{msg}` / `{wide_msg}` carry **streaming** content (e.g. sideband lines).
+//! Splitting the two lets callers `set_message` without clobbering the label.
+
+use console::{style, Term};
+use dialoguer::Confirm;
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::sync::OnceLock;
+use std::time::Duration;
+
+/// Tick frames used by every spinner row in this module.
+const SPIN_TICKS: &str = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ ";
+
+/// Standard cadence for `enable_steady_tick`.
+pub const TICK_PERIOD: Duration = Duration::from_millis(80);
+
+/// Enable a steady tick at the canonical cadence. Always call this **after**
+/// `MultiProgress::add(pb)` so the tick thread targets the MultiProgress
+/// draw target — calling it before `add` produces phantom duplicate rows.
+pub fn tick(pb: &ProgressBar) {
+    pb.enable_steady_tick(TICK_PERIOD);
+}
+
+/// User preference for terminal color output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMode {
+    /// Detect TTY/`NO_COLOR`/etc. at print time.
+    Auto,
+    /// Force ANSI escapes on, even when stderr isn't a TTY.
+    Always,
+    /// Suppress all color escapes.
+    Never,
+}
+
+impl Default for ColorMode {
+    fn default() -> Self {
+        Self::Auto
+    }
+}
+
+static COLOR: OnceLock<ColorMode> = OnceLock::new();
+
+/// Install the process-wide color mode. First caller wins.
+pub fn set_color(mode: ColorMode) {
+    let _ = COLOR.set(mode);
+}
+
+fn color_on() -> bool {
+    match COLOR.get().copied().unwrap_or(ColorMode::Auto) {
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+        ColorMode::Auto => Term::stderr().features().colors_supported(),
+    }
+}
+
+/// Print a top-level status line (`:: msg`) in bold blue.
+pub fn info(msg: &str) {
+    if color_on() {
+        eprintln!("{} {}", style("::").bold().blue(), style(msg).bold());
+    } else {
+        eprintln!(":: {}", msg);
+    }
+}
+
+/// Print a build-phase banner (`==> msg`) in bold green.
+pub fn step(msg: &str) {
+    if color_on() {
+        eprintln!("{} {}", style("==>").bold().green(), style(msg).bold());
+    } else {
+        eprintln!("==> {}", msg);
+    }
+}
+
+/// Print a warning line in yellow.
+pub fn warn(msg: &str) {
+    if color_on() {
+        eprintln!("{} {}", style("warning:").yellow().bold(), msg);
+    } else {
+        eprintln!("warning: {}", msg);
+    }
+}
+
+/// Print an error line in red.
+pub fn error(msg: &str) {
+    if color_on() {
+        eprintln!("{} {}", style("error:").red().bold(), msg);
+    } else {
+        eprintln!("error: {}", msg);
+    }
+}
+
+/// Print a detail/follow-up line in cyan.
+pub fn note(msg: &str) {
+    if color_on() {
+        eprintln!("{} {}", style("->").cyan(), msg);
+    } else {
+        eprintln!("-> {}", msg);
+    }
+}
+
+/// Display a pacman-style grouped package list: `Packages (N) a-1.0  b-2.0`.
+pub fn pkg_list(label: &str, items: &[String]) {
+    if items.is_empty() {
+        return;
+    }
+    let header = format!("{} ({})", label, items.len());
+    let body = items.join("  ");
+    if color_on() {
+        eprintln!("\n{}\n    {}\n", style(header).bold(), body);
+    } else {
+        eprintln!("\n{}\n    {}\n", header, body);
+    }
+}
+
+/// Y/n confirmation prompt with `Y` default. Honors `noconfirm` to auto-accept.
+pub fn confirm(prompt: &str, noconfirm: bool) -> std::io::Result<bool> {
+    if noconfirm {
+        return Ok(true);
+    }
+    Confirm::new()
+        .with_prompt(prompt)
+        .default(true)
+        .interact()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+}
+
+/// Bounded-byte progress bar (used when a total is known up-front).
+pub fn bar_bytes(total: u64, label: &str) -> ProgressBar {
+    let pb = ProgressBar::new(total);
+    pb.set_draw_target(ProgressDrawTarget::hidden());
+    pb.set_style(bytes_active_style());
+    pb.set_prefix(label.to_string());
+    pb
+}
+
+/// Streaming byte counter with no known total (shows `received` + rate +
+/// elapsed). Caller should `mp.add(pb)` then `ui::tick(&pb)`.
+pub fn bar_bytes_streaming(label: &str) -> ProgressBar {
+    let pb = ProgressBar::no_length();
+    pb.set_draw_target(ProgressDrawTarget::hidden());
+    pb.set_style(bytes_pending_style());
+    pb.set_prefix(label.to_string());
+    pb
+}
+
+/// Swap a pending byte bar (`bar_bytes_streaming`) to its active form
+/// (`bar_bytes`) once a total becomes known.
+pub fn promote_byte_bar(pb: &ProgressBar, total: u64) {
+    if pb.length() != Some(total) {
+        pb.set_length(total);
+        pb.set_style(bytes_active_style());
+    }
+}
+
+fn bytes_pending_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:>14.cyan.bold} {spinner} [{elapsed:>4}] {bytes:>10} ({binary_bytes_per_sec})",
+    )
+    .unwrap()
+    .tick_chars(SPIN_TICKS)
+}
+
+fn bytes_active_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:>14.cyan.bold} {spinner} [{elapsed:>4}] {bytes:>10}/{total_bytes:<10} [{bar:20.green/dim}] {binary_bytes_per_sec} (eta {eta})",
+    )
+    .unwrap()
+    .tick_chars(SPIN_TICKS)
+    .progress_chars("##-")
+}
+
+/// Build a count-oriented progress bar (e.g. parallel index workers).
+///
+/// When `total == 0`, renders as a spinner-counter (correct UX while we
+/// wait for the real total). Call [`promote_count_bar`] once you learn the
+/// length to switch to a true progress bar. Caller should `mp.add(pb)`
+/// then `ui::tick(&pb)` if the bar starts in pending mode.
+pub fn bar_count(total: u64, label: &str) -> ProgressBar {
+    let pb = if total == 0 {
+        let pb = ProgressBar::no_length();
+        pb.set_draw_target(ProgressDrawTarget::hidden());
+        pb.set_style(count_pending_style());
+        pb
+    } else {
+        let pb = ProgressBar::new(total);
+        pb.set_draw_target(ProgressDrawTarget::hidden());
+        pb.set_style(count_active_style());
+        pb
+    };
+    pb.set_prefix(label.to_string());
+    pb
+}
+
+/// Swap a pending [`bar_count`] over to the active style and set its length.
+/// Idempotent: re-calling with the same total is a no-op.
+pub fn promote_count_bar(pb: &ProgressBar, total: u64) {
+    if pb.length() != Some(total) {
+        pb.set_length(total);
+        pb.set_style(count_active_style());
+    }
+}
+
+fn count_pending_style() -> ProgressStyle {
+    // `{elapsed}` runs from the bar's creation; reassures the user that work
+    // is happening even when gix doesn't emit per-step events for this phase.
+    ProgressStyle::with_template("{prefix:>14.cyan.bold} {spinner} [{elapsed:>4}] {pos:>10}")
+        .unwrap()
+        .tick_chars(SPIN_TICKS)
+}
+
+fn count_active_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix:>14.cyan.bold} {spinner} [{elapsed:>4}] {pos:>10}/{len:<10} [{bar:20.green/dim}] (eta {eta})",
+    )
+    .unwrap()
+    .tick_chars(SPIN_TICKS)
+    .progress_chars("##-")
+}
+
+/// Spinner with a fixed label, an elapsed-time indicator, and a streaming
+/// `wide_msg` body. Used for the libgit2 sideband channel (server-side
+/// `remote: Counting objects...` etc.) and other long-running phases.
+///
+/// Caller should `mp.add(pb)` then `ui::tick(&pb)` so the spinner animates.
+pub fn bar_sideband(label: &str) -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_draw_target(ProgressDrawTarget::hidden());
+    pb.set_style(
+        ProgressStyle::with_template(
+            "{prefix:>14.cyan.bold} {spinner} [{elapsed:>4}] {wide_msg}",
+        )
+        .unwrap()
+        .tick_chars(SPIN_TICKS),
+    );
+    pb.set_prefix(label.to_string());
+    pb
+}
+
+/// Generic tick spinner for unbounded indeterminate work.
+pub fn spinner(label: &str) -> ProgressBar {
+    bar_sideband(label)
+}
+
+// ---------------------------------------------------------------------------
+// gix progress bridge
+
+use gix::progress::prodash::progress::Step;
+use gix::progress::{Count as GixCount, Id, MessageLevel, Unit};
+use gix::{NestedProgress, Progress as GixProgressTrait};
+use indicatif::MultiProgress;
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+/// Adapter implementing [`gix::Progress`] / [`gix::NestedProgress`] on top of
+/// our indicatif bars.
+///
+/// One shared summary line carries gix's most-recent `message()`. Each
+/// gix child that actually emits step progress (`init` or `set`/`inc_by`)
+/// owns its **own** leaf bar — created lazily on first such call, removed
+/// from the `MultiProgress` when the child drops. Result: phases that emit
+/// nothing don't stack rows, and concurrent children (e.g. `remote` +
+/// `read pack`) coexist on screen the way `git clone` shows them.
+pub struct GixProgress {
+    shared: Arc<Shared>,
+    /// Sub-phase name this clone owns (used as fallback when gix never
+    /// calls `set_name` after `init`).
+    own_name: String,
+    /// Whether `init` was called with `progress::bytes()`. Drives whether
+    /// the leaf formats `{bytes}`/`{binary_bytes_per_sec}` or raw counts.
+    own_unit_is_bytes: bool,
+    /// Max recorded by `init`/`set_max`; applied to the leaf the first
+    /// time it actually gets created.
+    own_max: Option<u64>,
+    /// This node's own leaf bar (lazy). `None` until the node actually
+    /// reports step progress (`set` or `inc_by`); cleared from the
+    /// MultiProgress on `Drop`. Nodes that only get `set_name`'d (root,
+    /// intermediate ancestors) never spawn a leaf.
+    leaf: Mutex<Option<ProgressBar>>,
+}
+
+/// State shared by every node in one progress tree.
+struct Shared {
+    multi: MultiProgress,
+    summary: ProgressBar,
+}
+
+/// Detect a byte-unit by asking the unit to format its own label.
+///
+/// In prodash 31, `Bytes::display_unit` writes nothing (the suffix is baked
+/// into the value via `bytesize::ByteSize`), while every count-style unit
+/// (`Human`, `Range`) writes its name (`"objects"`, `"steps"`, ...). So an
+/// empty `display_unit` output uniquely identifies bytes — no string
+/// matching, no heuristic.
+fn unit_is_bytes(unit: &Unit) -> bool {
+    let mut s = String::new();
+    let _ = unit.as_display_value().display_unit(&mut s, 0);
+    s.is_empty()
+}
+
+impl GixProgress {
+    /// Create a fresh adapter. Stages just the summary line; leaves spawn
+    /// lazily as gix children emit progress.
+    pub fn new(label: &str) -> Self {
+        let mp = MultiProgress::new();
+        let summary = mp.add(bar_sideband(label));
+        summary.set_message("starting…");
+        tick(&summary);
+        Self {
+            shared: Arc::new(Shared { multi: mp, summary }),
+            own_name: String::new(),
+            own_unit_is_bytes: false,
+            own_max: None,
+            leaf: Mutex::new(None),
+        }
+    }
+
+    /// Clear all live bars. Intended for end-of-clone cleanup.
+    pub fn finish(&self) {
+        if let Some(pb) = self.leaf.lock().unwrap().take() {
+            pb.finish_and_clear();
+        }
+        self.shared.summary.finish_and_clear();
+    }
+
+    fn set_summary(&self, msg: String) {
+        self.shared.summary.set_message(msg);
+    }
+
+    fn lock_leaf(&self) -> MutexGuard<'_, Option<ProgressBar>> {
+        self.leaf.lock().unwrap()
+    }
+
+    /// Create or replace this node's own leaf bar with the configured style.
+    fn restart_leaf(&self, name: &str) {
+        let pb = if self.own_unit_is_bytes {
+            self.shared.multi.add(bar_bytes_streaming(leaf_label(name)))
+        } else {
+            self.shared.multi.add(bar_count(0, leaf_label(name)))
+        };
+        tick(&pb);
+        let mut g = self.lock_leaf();
+        if let Some(old) = g.replace(pb) {
+            old.finish_and_clear();
+        }
+    }
+
+    /// Ensure a leaf exists with the current style; called lazily by `set`/`inc_by`.
+    /// Applies any `own_max` that `init`/`set_max` recorded earlier. Returns
+    /// without creating anything for muted phases (e.g. server-sideband echo).
+    fn ensure_leaf(&self) {
+        if self.lock_leaf().is_some() {
+            return;
+        }
+        if leaf_is_muted(&self.own_name) {
+            return;
+        }
+        let name = if self.own_name.is_empty() {
+            "phase".to_string()
+        } else {
+            self.own_name.clone()
+        };
+        self.restart_leaf(&name);
+        if let Some(m) = self.own_max {
+            if let Some(pb) = self.lock_leaf().as_ref() {
+                if self.own_unit_is_bytes {
+                    promote_byte_bar(pb, m);
+                } else {
+                    promote_count_bar(pb, m);
+                }
+            }
+        }
+    }
+
+    fn update_leaf(&self, step: u64, max: Option<u64>) {
+        self.ensure_leaf();
+        let g = self.lock_leaf();
+        if let Some(pb) = g.as_ref() {
+            if let Some(m) = max {
+                if self.own_unit_is_bytes {
+                    promote_byte_bar(pb, m);
+                } else {
+                    promote_count_bar(pb, m);
+                }
+            }
+            pb.set_position(step);
+        }
+    }
+}
+
+impl Drop for GixProgress {
+    fn drop(&mut self) {
+        if let Some(pb) = self.leaf.lock().unwrap().take() {
+            pb.finish_and_clear();
+        }
+    }
+}
+
+/// Condense gix's long phase names into our fixed 14-wide prefix column.
+fn leaf_label(name: &str) -> &str {
+    match name.to_ascii_lowercase().as_str() {
+        "receiving objects" => "objects",
+        "indexing" | "resolving deltas" => "deltas",
+        "decompressing" => "decompress",
+        "read pack" => "pack",
+        _ => name,
+    }
+}
+
+/// Map known gix phase names to a one-line user-facing hint. The hint tells
+/// the user what gix is *actually* doing and gives a rough ETA so the silent
+/// phases don't look stuck. Returns `None` for unknown phases; in that case
+/// the summary shows just the raw gix name.
+///
+/// ETAs are calibrated for `github.com/archlinux/aur` (~155 k refs, ~2 GiB
+/// pack) on a residential connection; smaller repos finish faster.
+fn phase_hint(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("handshake") {
+        Some("TLS + HTTP smart-protocol setup")
+    } else if lower == "authentication" {
+        Some("authenticating with server")
+    } else if lower == "list refs" {
+        Some("downloading ref list (~20 s)")
+    } else if lower.starts_with("negotiate") {
+        Some("sending wants/haves to server")
+    } else if lower == "receiving pack" {
+        Some("server is packing objects, then streaming to us (~5–8 min)")
+    } else if lower == "read pack" {
+        Some("silent until server finishes packing (~3–5 min server-side, ~2–3 min stream)")
+    } else if lower == "remote" {
+        Some("server-side progress (counting / compressing objects)")
+    } else if lower == "indexing" || lower == "resolving deltas" || lower == "resolving" {
+        Some("local delta resolution (CPU-heavy, ~1–2 min)")
+    } else if lower.starts_with("decompress") || lower == "decoding" {
+        Some("decompressing pack entries")
+    } else if lower == "sorting by id" {
+        Some("sorting pack entries (brief)")
+    } else if lower == "writing index file" {
+        Some("writing pack index — finishing up")
+    } else if lower == "create index file" {
+        Some("building pack index")
+    } else if lower.contains("fetch") {
+        // After the last visible bar (Resolving), gix runs `update_refs` to
+        // write every received ref to disk; that step emits no progress for
+        // ~30 s – 2 min on a 155 k-ref mirror. So when we're back in the
+        // outer "fetch" name with no active child bars, mention it.
+        Some("finalizing — writing refs silently (~30 s – 2 min)")
+    } else {
+        None
+    }
+}
+
+/// Phases whose progress is essentially noise we'd rather hide — the server's
+/// sideband-translated "remote: Counting objects" / "remote: Compressing
+/// objects" lines, which gix re-emits as a child whose name is the full server
+/// string. The information is already visible in the summary row when the
+/// message arrives; a dedicated bar with a 28-character prefix just breaks
+/// alignment.
+fn leaf_is_muted(name: &str) -> bool {
+    name.starts_with("remote") || name.starts_with("remote:")
+}
+
+/// Render `text` as supporting/secondary UI text — mid-gray (color 244)
+/// italic. Reads clearly without competing with the bright primary text.
+/// Use for hint annotations, last-built timestamps, anything the eye should
+/// *not* lock onto.
+pub fn dim(text: impl AsRef<str>) -> impl std::fmt::Display {
+    style(text.as_ref().to_string()).color256(244).italic()
+}
+
+/// Build the summary text for a phase name, appending the hint (dimmed) when
+/// one exists. The phase name stays at full brightness so the eye locks onto
+/// it; the hint is supporting context.
+fn summary_with_hint(name: &str) -> String {
+    match phase_hint(name) {
+        Some(hint) => format!("{name} {}", dim(format!("— {hint}"))),
+        None => name.to_string(),
+    }
+}
+
+impl GixCount for GixProgress {
+    fn set(&self, step: Step) {
+        tracing::trace!(target: "gix_progress", phase = %self.own_name, step, "set");
+        self.update_leaf(step as u64, None);
+    }
+
+    fn step(&self) -> Step {
+        self.lock_leaf()
+            .as_ref()
+            .map(|pb| pb.position() as Step)
+            .unwrap_or(0)
+    }
+
+    fn inc_by(&self, step: Step) {
+        tracing::trace!(target: "gix_progress", phase = %self.own_name, step, "inc_by");
+        self.ensure_leaf();
+        if let Some(pb) = self.lock_leaf().as_ref() {
+            pb.inc(step as u64);
+        }
+    }
+
+    fn counter(&self) -> Arc<AtomicUsize> {
+        Arc::new(AtomicUsize::new(0))
+    }
+}
+
+impl GixProgressTrait for GixProgress {
+    fn init(&mut self, max: Option<Step>, unit: Option<Unit>) {
+        self.own_unit_is_bytes = unit.as_ref().is_some_and(unit_is_bytes);
+        self.own_max = max.map(|m| m as u64);
+        tracing::debug!(
+            target: "gix_progress",
+            phase = %self.own_name,
+            ?max,
+            is_bytes = self.own_unit_is_bytes,
+            "init"
+        );
+        // Don't spawn a leaf yet. Many gix nodes call `init` once at startup
+        // and then only emit `set_name` afterwards — those should never get
+        // a row of their own. The leaf is created on the first `set`/`inc_by`.
+        // If we already have a leaf and `init` is being called again to
+        // declare a length (e.g. the sideband-translated "Counting objects"
+        // line setting a max after earlier max=None messages), promote in
+        // place so the bar style matches the new bound.
+        if let (Some(m), Some(pb)) = (self.own_max, self.lock_leaf().as_ref()) {
+            if self.own_unit_is_bytes {
+                promote_byte_bar(pb, m);
+            } else {
+                promote_count_bar(pb, m);
+            }
+        }
+    }
+
+    fn unit(&self) -> Option<Unit> {
+        None
+    }
+
+    fn max(&self) -> Option<Step> {
+        self.lock_leaf()
+            .as_ref()
+            .and_then(|pb| pb.length().map(|x| x as Step))
+    }
+
+    fn set_max(&mut self, max: Option<Step>) -> Option<Step> {
+        self.own_max = max.map(|m| m as u64);
+        if let Some(m) = max {
+            // Only resize the bar if it already exists; don't spawn one here.
+            if let Some(pb) = self.lock_leaf().as_ref() {
+                if self.own_unit_is_bytes {
+                    promote_byte_bar(pb, m as u64);
+                } else {
+                    promote_count_bar(pb, m as u64);
+                }
+            }
+        }
+        max
+    }
+
+    fn set_name(&mut self, name: String) {
+        tracing::debug!(target: "gix_progress", new_name = %name, "set_name");
+        self.set_summary(summary_with_hint(&name));
+        self.own_name = name.clone();
+        if let Some(pb) = self.lock_leaf().as_ref() {
+            pb.set_prefix(leaf_label(&name).to_string());
+        }
+    }
+
+    fn name(&self) -> Option<String> {
+        Some(self.own_name.clone())
+    }
+
+    fn id(&self) -> Id {
+        *b"GITA"
+    }
+
+    fn message(&self, _level: MessageLevel, message: String) {
+        tracing::debug!(target: "gix_progress", phase = %self.own_name, %message, "message");
+        self.set_summary(message);
+    }
+}
+
+impl NestedProgress for GixProgress {
+    type SubProgress = Self;
+
+    fn add_child(&mut self, name: impl Into<String>) -> Self::SubProgress {
+        let name = name.into();
+        tracing::debug!(target: "gix_progress", parent = %self.own_name, child = %name, "add_child");
+        self.set_summary(summary_with_hint(&name));
+        Self {
+            shared: Arc::clone(&self.shared),
+            own_name: name,
+            own_unit_is_bytes: false,
+            own_max: None,
+            leaf: Mutex::new(None),
+        }
+    }
+
+    fn add_child_with_id(&mut self, name: impl Into<String>, _id: Id) -> Self::SubProgress {
+        self.add_child(name)
+    }
+}

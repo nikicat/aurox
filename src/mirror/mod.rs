@@ -1,0 +1,106 @@
+//! Bare clone of the AUR mirror plus per-pkgbase build-directory materialization.
+//!
+//! Built on [`gix`] (gitoxide), pure Rust. No subprocess, no libgit2.
+//! Per-pkgbase directories are *materialized* from the bare repo's tree
+//! objects rather than created via `git worktree add` — gitaur owns those
+//! directories, so a plain checkout is sufficient.
+
+use crate::config::Config;
+use crate::error::{Error, Result};
+use crate::index;
+use crate::paths;
+use crate::ui;
+use std::path::{Path, PathBuf};
+
+pub mod clone;
+pub mod fetch;
+pub mod sideband;
+pub mod worktree;
+
+/// Handle to the bare AUR mirror on disk.
+pub struct MirrorRepo {
+    /// On-disk path of the bare repo.
+    pub path: PathBuf,
+    /// Open gix repo. `gix::Repository` is `Send`+`Sync` so workers may share it.
+    pub repo: gix::Repository,
+}
+
+impl MirrorRepo {
+    /// Open the existing bare clone at `path` without any network access.
+    pub fn open(path: &Path) -> Result<Self> {
+        let repo = gix::open(path).map_err(|e| Error::Gix(format!("open {}: {e}", path.display())))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            repo,
+        })
+    }
+}
+
+/// Fetch mirror updates and incrementally refresh the on-disk index.
+///
+/// `force_reclone` (set by `gitaur -Syy`) blows away the existing bare clone
+/// and re-bootstraps from scratch, regardless of whether the current clone
+/// looks healthy. Use when the on-disk repo is suspected to be corrupted or
+/// when you want a clean baseline.
+pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
+    let path = paths::aur_repo_path();
+
+    if force_reclone && path.exists() {
+        ui::warn("re-clone forced (-Syy); removing existing mirror");
+        std::fs::remove_dir_all(&path)?;
+    }
+
+    if !is_bootstrapped(&path) {
+        if path.exists() {
+            ui::warn("previous bootstrap was interrupted; redoing clone");
+            std::fs::remove_dir_all(&path)?;
+        } else if !force_reclone {
+            ui::info("first run: cloning AUR mirror (this takes a few minutes)");
+        }
+        clone::bootstrap_clone(cfg, &path)?;
+        ui::info("building index");
+        let mirror = MirrorRepo::open(&path)?;
+        let idx = index::build::full_build(cfg, &mirror)?;
+        index::save(&idx, &paths::index_path())?;
+        ui::info("index built");
+        return Ok(());
+    }
+
+    ui::info("refreshing AUR mirror");
+    let mirror = MirrorRepo::open(&path)?;
+    let updates = fetch::incremental_fetch(cfg, &mirror)?;
+    if updates.is_empty() && paths::index_path().exists() {
+        ui::note("no ref updates");
+        return Ok(());
+    }
+
+    if !paths::index_path().exists() {
+        let idx = index::build::full_build(cfg, &mirror)?;
+        index::save(&idx, &paths::index_path())?;
+    } else {
+        let mut idx = index::load(&paths::index_path())?;
+        index::update::incremental_update(&mirror, &updates, &mut idx)?;
+        index::save(&idx, &paths::index_path())?;
+    }
+    ui::note(&format!("{} ref(s) updated", updates.len()));
+    Ok(())
+}
+
+/// A bare clone counts as "bootstrapped" if it has at least one branch under
+/// `refs/heads/*`. gix writes refs after the pack is durable, so absence of
+/// refs ⇒ the previous clone never finished.
+fn is_bootstrapped(path: &Path) -> bool {
+    if !path.exists() {
+        return false;
+    }
+    let Ok(repo) = gix::open(path) else {
+        return false;
+    };
+    let Ok(refs) = repo.references() else {
+        return false;
+    };
+    let Ok(mut iter) = refs.prefixed("refs/heads/") else {
+        return false;
+    };
+    iter.next().is_some()
+}

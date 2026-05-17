@@ -359,3 +359,51 @@ Test harness:
 - /home/nb/src/gitaur/src/cli/dispatch.rs
 - /home/nb/src/gitaur/src/build/makepkg.rs
 - /home/nb/src/gitaur/src/pacman/invoke.rs
+
+---
+
+## Status (updated)
+
+### Deviations from the original plan
+
+- **Git backend: `git2` → `gix`.** Measured `git2`/libgit2 reading the AUR pack at ~80 KB/s vs vanilla git at ~10 MB/s on the same connection; `gix` CLI clones in ~8:49 (vs git's 8:12). Switched to pure-Rust `gix 0.83`. No subprocess, no libgit2. Tracked in memory as `project-libgit2-http-slow`.
+- **Diagnostic stack: `log` → `tracing`.** `tracing` + `tracing-subscriber` with `EnvFilter`. User-facing colored output (`info`/`step`/`note`/`warn`/`error`/`pkg_list`/`confirm`/bars) is a separate `ui` module — not routed through `tracing`.
+- **UI stack:** `indicatif` (bars) + `console` (styling) + `dialoguer` (prompts). `GixProgress` adapter implements `gix::Progress`/`NestedProgress`/`Count`, lazily spawns per-child indicatif bars (created on first `set`/`inc_by`, cleared on `Drop`), detects byte- vs count-units via `display_unit().is_empty()`, switches bar style accordingly. Phase-name → hint mapping ("read pack" → "silent until server finishes packing (~3–5 min server-side, ~2–3 min stream)"), hints rendered in italic gray-244.
+- **Sudo: dropped warmup + keepalive.** Replaced with: one upfront batched `pacman -S --asdeps` for repo deps, unprivileged build loop with idempotent rebuild-skip (state.db `last_built_commit_oid == HEAD` AND `.pkg.tar.zst` present → skip makepkg), one final batched `pacman -U` (declinable; re-run replays only the install step). Tracked as `feedback-defer-consolidate-sudo`.
+- **Worktrees: `git worktree add` equivalent isn't in gix.** Hand-wrote the on-disk linkage: `<bare>/worktrees/<pkgbase>/{HEAD,commondir,gitdir}` + `<dest>/.git` pointer file. Native `git -C <dest> status` recognizes it; `git -C <bare> worktree list` lists it. Verified by inline integration tests.
+- **CLI: hand-rolled passthrough + `clap-derive` hybrid.** Pre-scan argv for an uppercase op letter; pacman-owned ops (`-Q`, `-R`, `-T`, `-D`, `-F`, `-U`) skip clap entirely and forward raw to `pacman` (so clap can't reject unknown short flags like `-Rns`). `-S` family and global flags go through clap → `flags::PacFlags` cluster parser. `--help`/`-Sh` use clap-generated help.
+- **`-Syy` added** — pacman-style "force full re-clone of the mirror" (~8–9 min). Useful when the bare clone gets corrupted.
+
+### Done
+
+- Cargo.toml + clippy.toml + lib/bin split.
+- `[lints.clippy]` block with `absolute_paths` + pedantic, opt-outs for `module_name_repetitions`/`must_use_candidate`/etc.
+- `paths`, `error`, `ui`, `config` (defaults + TOML loader).
+- `mirror::clone` (`gix::prepare_clone_bare` + `fetch_only`, custom `GixProgress`).
+- `mirror::fetch` (`gix::Remote::prepare_fetch` → `RefUpdate` deltas).
+- `mirror::worktree` (hand-written linked-worktree linkage + tree materialization).
+- `mirror::sideband` (helper to parse `\r`-separated server progress lines).
+- `index::srcinfo` parser (handles split pkgs, arch-suffixed list keys, dedup).
+- `index::schema` (rkyv 0.8) + `index::build` (rayon-parallel, structured concurrency: workers borrow `&Path` and reopen `gix::Repository` per closure).
+- `index::update::incremental_update` (per-ref upsert/delete; atomic file swap).
+- `index::secondary` (by_name + by_provides; parallel regex search).
+- `cli` with clap-derive Cli struct, pre-scan, dispatch; pacman passthrough; auto-generated `--help`/`-Sh`.
+- `pacman::invoke` (sudo gating heuristic), `pacman::alpm_db` (foreign_pkgs etc.), `pacman::vercmp`.
+- `resolver::classify` + `resolver::topo` (Tarjan-style with readable cycle paths) + `resolver::DepGraph::resolve` → `Plan`.
+- `build::makepkg` (PKGDEST/SRCDEST/BUILDDIR env), `build::install` (`find_produced`, `extract_pkgname` partition by direct/transitive), `build::review` (line-diff against last-built tree via gix-object), `build::state_db` (sqlite, upsert/prune).
+- `build::cmd_install` end-to-end pipeline; `cmd_sysupgrade` (foreign-pkg detect + VCS gate via `--devel`); `cmd_clean` (-Sc / -Scc).
+- Tests: 43 inline `#[cfg(test)]` + 3 integration in `tests/fake_mirror.rs`. Shared `gitaur::testing::git` helper avoids global gitconfig interference (no `commit.gpgsign` surprises).
+- 8 feedback memories captured (style, structured concurrency, sudo deferral, partial-bootstrap recovery, indicatif pitfalls, clap+pacman pattern, shared test helpers, etc.).
+
+### Not yet exercised end-to-end
+
+- A real `gitaur -S cower` against the live AUR mirror — clone has been started but never fully completed during a session (~8–9 min on this connection); the post-clone `gitaur::index::build::full_build` against 155k branches has not been measured in-tree.
+- `pacman::alpm_db` is compile-tested but not run against the real `/var/lib/pacman` (it will be, the moment a `-S` succeeds).
+- `gitaur -Syu` end-to-end against installed foreign pkgs.
+- Split-package install (e.g. `mingw-w64-gcc`).
+- `--devel` flow against an actual `-git` pkg.
+
+### Known UX caveats (upstream gix)
+
+- During the server-side packing phase (~3–5 min for the AUR mirror), gix emits no `inc_by` — only the elapsed-time spinner moves. Documented in the leaf-bar hint text.
+- After `Resolving` deltas finishes, gix runs `update_refs::update` to write the 155k loose-ref files; that step emits **zero** progress events. The summary briefly shows a "finalizing — writing refs silently (~30 s – 2 min)" hint while bars freeze; this is real disk work, not a hang. A fix would have to be upstream in gitoxide.
