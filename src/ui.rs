@@ -509,7 +509,10 @@ impl GixProgressTrait for GixProgress {
     fn init(&mut self, max: Option<Step>, unit: Option<Unit>) {
         self.own_unit_is_bytes = unit.as_ref().is_some_and(unit_is_bytes);
         self.own_max = max.map(|m| m as u64);
-        tracing::debug!(
+        // TRACE, not DEBUG: gix re-`init`s its internal progress nodes hundreds
+        // of times per fetch as it walks pack indices / refs / etc. The real
+        // state changes are `add_child` (new phase) and `message` (sideband).
+        tracing::trace!(
             target: "gix_progress",
             phase = %self.own_name,
             ?max,
@@ -558,7 +561,12 @@ impl GixProgressTrait for GixProgress {
     }
 
     fn set_name(&mut self, name: String) {
-        tracing::debug!(target: "gix_progress", new_name = %name, "set_name");
+        // Dedupe: gix re-emits the same name on every progress tick (e.g.
+        // "remote: Counting objects" hundreds of times). Only the actual phase
+        // *transitions* are interesting — those become DEBUG.
+        if name != self.own_name {
+            tracing::debug!(target: "gix_progress", old = %self.own_name, new = %name, "set_name");
+        }
         self.set_summary(summary_with_hint(&name));
         self.own_name.clone_from(&name);
         if let Some(pb) = self.lock_leaf().as_ref() {
@@ -576,7 +584,19 @@ impl GixProgressTrait for GixProgress {
 
     fn message(&self, _level: MessageLevel, message: String) {
         tracing::debug!(target: "gix_progress", phase = %self.own_name, %message, "message");
+        // Synthesized marker: gix emits no `set_name`/`add_child` for the
+        // ~15–20s post-pack ref-update phase, so the log goes silent right
+        // when most users start wondering if it's hung. The only event gix
+        // does fire beforehand is this "read pack" wrap-up message — promote
+        // it into an explicit "next phase begins" line.
+        let synth_post_pack_marker = self.own_name == "read pack" && message.starts_with("done");
         self.set_summary(message);
+        if synth_post_pack_marker {
+            tracing::debug!(
+                target: "gix_progress",
+                "post-pack phase begins: updating refs and writing pack manifest (silent in gix)"
+            );
+        }
     }
 }
 

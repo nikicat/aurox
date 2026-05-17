@@ -65,9 +65,10 @@ PASS-THROUGH (raw `pacman` — clap doesn't parse these):\n\
   -Q, -R, -T, -D, -F, -U, and any flags they accept\n\
 \n\
 ENVIRONMENT:\n\
-  RUST_LOG=gitaur=debug    enable diagnostic tracing\n\
+  RUST_LOG=gitaur=debug    raise console tracing level\n\
   EDITOR                   used by PKGBUILD review's `edit` choice\n\
 \n\
+Execution logs (debug level, last 10 runs): $XDG_STATE_HOME/gitaur/logs/\n\
 Persistent settings: ~/.config/gitaur/config.toml";
 
 /// Top-level entry. Returns the desired process exit code.

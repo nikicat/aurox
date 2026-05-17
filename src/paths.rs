@@ -41,9 +41,19 @@ pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// Directory holding per-invocation execution logs.
+pub fn logs_dir() -> PathBuf {
+    state_dir().join("logs")
+}
+
 /// Create the state directory tree if missing.
 pub fn ensure_state_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir())?;
     std::fs::create_dir_all(state_dir().join("pkgs"))?;
     Ok(())
+}
+
+/// Create the logs directory if missing.
+pub fn ensure_logs_dir() -> std::io::Result<()> {
+    std::fs::create_dir_all(logs_dir())
 }

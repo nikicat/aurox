@@ -7,6 +7,7 @@ pub mod cli;
 pub mod config;
 pub mod error;
 pub mod index;
+pub mod logging;
 pub mod mirror;
 pub mod pacman;
 pub mod paths;
