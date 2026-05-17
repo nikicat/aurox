@@ -64,8 +64,7 @@ impl StateDb {
     pub fn record_build(&mut self, pkgbase: &str, oid_hex: &str, version: &str) -> Result<()> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-            .unwrap_or(0);
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
         self.conn.execute(
             "INSERT INTO builds(pkgbase, last_built_commit_oid, last_built_version, built_at)
              VALUES(?1, ?2, ?3, ?4)
