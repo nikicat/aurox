@@ -14,7 +14,12 @@ name = "gitaur"
 path = "src/main.rs"
 
 [dependencies]
-gix = { version = "0.83", features = [
+# Pinned to nikicat/gitoxide#b-plus-c-integration until the two upstream PRs
+# https://github.com/GitoxideLabs/gitoxide/pull/2604 (gix-ref: skip name validation
+# in packed-refs binary search) and #2605 (gix: cache packed-refs in a HashMap during
+# fetch update_refs) land in a published gix release. Together they bring
+# `gitaur -Sy` against the AUR mirror from ~11s to ~5s (≈ git fetch parity).
+gix = { git = "https://github.com/nikicat/gitoxide", rev = "7606d2ed1", features = [
   "blocking-http-transport-reqwest-rust-tls",
   "worktree-mutation",
 ] }
