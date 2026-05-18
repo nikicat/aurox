@@ -156,10 +156,16 @@ branch.
 What you must **not** do: `gix::open(&path)` inside the worker closure.
 Reopening reparses config + rescans refs + rediscovers alternates per
 branch and dominates wall time (observed: ~2.2 ms/branch ⇒ 5+ minutes
-on the 150 k-branch AUR mirror). The regression test in
-`tests/build_worker_shares_repo.rs` asserts the
-`WORKER_REPO_OPENS` counter in `index::build` stays at zero; bump it
-from any future worker-side `gix::open` so the test catches the regression.
+on the 150 k-branch AUR mirror). Two regression tests guard this:
+
+- `tests/build_worker_shares_repo.rs` asserts the `WORKER_REPO_OPENS`
+  counter in `index::build` stays at zero; bump it from any future
+  worker-side `gix::open` so the counter test catches the regression.
+- `tests/full_build_rusage.rs` is a black-box check: builds a realistic
+  5 k-branch mirror (`git fast-import` + `git repack -ad` + `git pack-refs`)
+  and asserts `getrusage(RUSAGE_SELF).ru_minflt` stays under 20 k for the
+  `full_build` call. The bug-vs-fix ratio is ~13× (38 k vs 3 k) — wide
+  enough to survive CI drift. Linux-gated.
 
 ### Why `makepkg -d` (skip dep checks) instead of `-s`?
 

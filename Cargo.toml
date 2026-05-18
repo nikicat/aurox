@@ -48,6 +48,7 @@ glob = "0.3"
 
 [dev-dependencies]
 tempfile = "3"
+nix = { version = "0.31", features = ["resource"] }
 
 [profile.release]
 lto = "thin"
