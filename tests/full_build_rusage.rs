@@ -59,9 +59,8 @@ fn fast_import_fixture(bare: &Path, n: usize) {
         let stdin = child.stdin.as_mut().unwrap();
         for i in 0..n {
             let branch = format!("pkg{i:05}");
-            let srcinfo = format!(
-                "pkgbase = {branch}\npkgver = 1\npkgrel = 1\npkgname = {branch}\n",
-            );
+            let srcinfo =
+                format!("pkgbase = {branch}\npkgver = 1\npkgrel = 1\npkgname = {branch}\n",);
             writeln!(stdin, "blob").unwrap();
             writeln!(stdin, "mark :1").unwrap();
             writeln!(stdin, "data {}", srcinfo.len()).unwrap();
@@ -116,8 +115,7 @@ fn full_build_does_not_mmap_per_branch() {
     let minflt = r1.minor_page_faults() - r0.minor_page_faults();
     let majflt = r1.major_page_faults() - r0.major_page_faults();
     let vcsw = r1.voluntary_context_switches() - r0.voluntary_context_switches();
-    let ivcsw =
-        r1.involuntary_context_switches() - r0.involuntary_context_switches();
+    let ivcsw = r1.involuntary_context_switches() - r0.involuntary_context_switches();
 
     eprintln!("=== full_build over {N_BRANCHES} branches ===");
     eprintln!("entries:               {}", idx.entries.len());
