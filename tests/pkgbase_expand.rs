@@ -167,7 +167,10 @@ fn split_pkgbase_partial_selection_constrains_build_pipeline() {
     let mut plan = resolve(&cfg, &idx, Some(&by), &pac, &expanded.targets).unwrap();
     plan.pkgname_selections = expanded.selections;
     plan.direct_targets.extend(expanded.direct_pkgnames);
-    assert_eq!(plan.aur_strata, vec![vec!["linux-headers-multi".to_string()]]);
+    assert_eq!(
+        plan.aur_strata,
+        vec![vec!["linux-headers-multi".to_string()]]
+    );
     assert!(plan.direct_targets.contains("linux-headers-multi-core"));
     assert!(plan.direct_targets.contains("linux-headers-multi-extras"));
     assert!(!plan.direct_targets.contains("linux-headers-multi-docs"));
@@ -341,8 +344,7 @@ fn pkgname_target_skips_selector_even_when_pkgbase_could_match() {
         Ok(n.to_vec())
     };
     let expanded =
-        expand_pkgbase_targets(&idx, Some(&by), &pac, &["cower".to_string()], &mut select)
-            .unwrap();
+        expand_pkgbase_targets(&idx, Some(&by), &pac, &["cower".to_string()], &mut select).unwrap();
     assert_eq!(expanded.targets, vec!["cower".to_string()]);
     assert_eq!(calls, 0, "selector must not run on pkgname hits");
 }

@@ -80,7 +80,9 @@ pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
         match index::load(&idx_path) {
             Ok(idx) => Some(idx),
             Err(e) => {
-                ui::warn(&format!("existing index unreadable, rebuilding from scratch: {e}"));
+                ui::warn(&format!(
+                    "existing index unreadable, rebuilding from scratch: {e}"
+                ));
                 None
             }
         }

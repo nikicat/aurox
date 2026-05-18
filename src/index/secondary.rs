@@ -71,11 +71,7 @@ impl Secondary {
     ///
     /// `None` means no provides match anywhere in the index (the resolver
     /// should fall back to pkgbase / Missing).
-    pub fn provider_of<'a>(
-        &self,
-        idx: &'a IndexFile,
-        name: &str,
-    ) -> Option<(usize, &'a str)> {
+    pub fn provider_of<'a>(&self, idx: &'a IndexFile, name: &str) -> Option<(usize, &'a str)> {
         let bare = strip_version_constraint(name);
         let &entry_idx = self.by_provides.get(bare)?.first()?;
         let entry = idx.entries.get(entry_idx as usize)?;
@@ -168,7 +164,12 @@ mod tests {
 
     /// Construct a split pkgbase where exactly one pkgname declares the
     /// given provides — the bisq shape (`bisq-desktop` provides `bisq`).
-    fn mk_scoped(pkgbase: &str, owner: &str, owner_provides: &[&str], others: &[&str]) -> IndexEntry {
+    fn mk_scoped(
+        pkgbase: &str,
+        owner: &str,
+        owner_provides: &[&str],
+        others: &[&str],
+    ) -> IndexEntry {
         let mut pkgnames = vec![Pkgname {
             name: owner.into(),
             provides: owner_provides.iter().map(|s| (*s).into()).collect(),

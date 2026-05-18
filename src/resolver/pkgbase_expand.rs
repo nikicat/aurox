@@ -158,8 +158,7 @@ pub fn expand_pkgbase_targets(
         // Record selection only when it's a true subset — full selection
         // is the default and doesn't need to constrain `pacman -U`.
         if chosen.len() < entry.pkgnames.len() {
-            out.selections
-                .insert(entry.pkgbase.clone(), chosen.clone());
+            out.selections.insert(entry.pkgbase.clone(), chosen.clone());
         }
         out.targets.push(entry.pkgbase.clone());
         out.direct_pkgnames.extend(chosen);
@@ -286,7 +285,11 @@ mod tests {
             &mut select_all,
         )
         .unwrap();
-        assert_eq!(r.targets, vec!["bisq".to_string()], "resolve target is pkgbase");
+        assert_eq!(
+            r.targets,
+            vec!["bisq".to_string()],
+            "resolve target is pkgbase"
+        );
         assert_eq!(
             r.direct_pkgnames,
             vec!["bisq-desktop".to_string()],
@@ -371,7 +374,11 @@ mod tests {
         assert_eq!(r.targets, vec!["split-pkg".to_string()]);
         assert_eq!(
             r.direct_pkgnames,
-            vec!["split-a".to_string(), "split-b".to_string(), "split-c".to_string()],
+            vec![
+                "split-a".to_string(),
+                "split-b".to_string(),
+                "split-c".to_string()
+            ],
         );
         assert!(
             r.selections.is_empty(),
@@ -415,14 +422,8 @@ mod tests {
             calls += 1;
             Ok(n.to_vec())
         };
-        let r = expand_pkgbase_targets(
-            &idx,
-            Some(&by),
-            &pac,
-            &["cower".to_string()],
-            &mut select,
-        )
-        .unwrap();
+        let r = expand_pkgbase_targets(&idx, Some(&by), &pac, &["cower".to_string()], &mut select)
+            .unwrap();
         assert_eq!(r.targets, vec!["cower".to_string()]);
         assert_eq!(calls, 0, "selector must not be invoked on pkgname hits");
     }
@@ -484,7 +485,11 @@ mod tests {
         // routes through `by_pkgbase`, which is unique.
         let idx = IndexFile {
             entries: vec![
-                entry("commit-mono-font", &["otf-commit-mono", "ttf-commit-mono"], &[]),
+                entry(
+                    "commit-mono-font",
+                    &["otf-commit-mono", "ttf-commit-mono"],
+                    &[],
+                ),
                 // Unrelated pkgbase that happens to ship a pkgname matching
                 // a sibling of the entry above.
                 entry("otf-commit-mono", &["otf-commit-mono"], &[]),

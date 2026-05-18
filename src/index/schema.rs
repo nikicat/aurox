@@ -82,10 +82,11 @@ impl IndexEntry {
     /// not significant; callers that need attribution should walk
     /// `pkgnames` directly.
     pub fn all_provides(&self) -> impl Iterator<Item = &str> {
-        self.provides
-            .iter()
-            .map(String::as_str)
-            .chain(self.pkgnames.iter().flat_map(|p| p.provides.iter().map(String::as_str)))
+        self.provides.iter().map(String::as_str).chain(
+            self.pkgnames
+                .iter()
+                .flat_map(|p| p.provides.iter().map(String::as_str)),
+        )
     }
 }
 

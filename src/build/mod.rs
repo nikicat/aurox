@@ -304,9 +304,7 @@ fn filter_by_selection(files: &[PathBuf], selection: Option<&[String]>) -> Vec<P
     };
     files
         .iter()
-        .filter(|f| {
-            install::extract_pkgname(f).is_some_and(|n| sel.iter().any(|s| s == &n))
-        })
+        .filter(|f| install::extract_pkgname(f).is_some_and(|n| sel.iter().any(|s| s == &n)))
         .cloned()
         .collect()
 }
