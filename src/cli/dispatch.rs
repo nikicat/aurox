@@ -1,6 +1,6 @@
 //! Decide whether to handle an operation natively or pass through to pacman.
 
-use crate::build;
+use crate::build::{self, PlanMode};
 use crate::cli::flags::{self, PacFlags};
 use crate::cli::Cli;
 use crate::config::Config;
@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::index;
 use crate::mirror;
 use crate::pacman::invoke;
+use crate::ui;
 
 /// Top-level routing entry — clap already pre-scanned for pacman-owned ops,
 /// so by this point `cli.args` is gitaur's responsibility (`-S` family or
@@ -17,6 +18,10 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
     let f = flags::parse(argv);
 
     if argv.is_empty() {
+        if cli.plan_only {
+            ui::info("plan: refresh AUR mirror + rebuild index");
+            return Ok(0);
+        }
         return mirror::cmd_refresh(cfg, false).map(|()| 0);
     }
 
@@ -38,6 +43,14 @@ fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8
     let noconfirm = cli.noconfirm || f.has_long("noconfirm");
     let asdeps = cli.asdeps || f.has_long("asdeps");
     let devel = cli.devel || f.has_long("devel");
+    let plan_only = cli.plan_only || f.has_long("plan-only");
+    let plan_mode = if plan_only {
+        PlanMode::Only
+    } else if cli.plan || f.has_long("plan") {
+        PlanMode::Show
+    } else {
+        PlanMode::Run
+    };
 
     if f.has('h') || f.has_long("help") {
         // Same auto-generated help as `gitaur --help` — clap already lists
@@ -67,20 +80,33 @@ fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8
     let force_reclone = f.op_letters.iter().filter(|c| **c == 'y').count() >= 2;
 
     if refresh {
-        mirror::cmd_refresh(cfg, force_reclone)?;
+        if plan_only {
+            let what = if force_reclone {
+                "plan: force-reclone AUR mirror + rebuild index"
+            } else {
+                "plan: refresh AUR mirror + rebuild index"
+            };
+            ui::info(what);
+        } else {
+            mirror::cmd_refresh(cfg, force_reclone)?;
+        }
     }
 
     if upgrade {
-        let mut pac_args = vec!["-Syu".to_string()];
-        if noconfirm {
-            pac_args.push("--noconfirm".into());
+        if plan_only {
+            ui::info("plan: pacman -Syu (skipped in plan-only mode)");
+        } else {
+            let mut pac_args = vec!["-Syu".to_string()];
+            if noconfirm {
+                pac_args.push("--noconfirm".into());
+            }
+            invoke::exec_pacman(cfg, &pac_args)?;
         }
-        invoke::exec_pacman(cfg, &pac_args)?;
-        build::cmd_sysupgrade(cfg, cfg.devel || devel, noconfirm)?;
+        build::cmd_sysupgrade(cfg, cfg.devel || devel, noconfirm, plan_mode)?;
     }
 
     if !f.positional.is_empty() {
-        build::cmd_install(cfg, &f.positional, noconfirm, asdeps)?;
+        build::cmd_install(cfg, &f.positional, noconfirm, asdeps, plan_mode)?;
     } else if !upgrade && !refresh {
         return Err(Error::other("no targets specified"));
     }

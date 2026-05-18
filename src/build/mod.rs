@@ -34,6 +34,60 @@ struct BuiltPkg {
     files: Vec<PathBuf>,
 }
 
+/// Whether to display the resolved [`Plan`] before executing it, and whether
+/// to execute at all. Driven by `--plan` / `--plan-only` on the command line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlanMode {
+    /// Default: print the plan only when a build prompt would otherwise show it.
+    #[default]
+    Run,
+    /// Print the plan before executing it.
+    Show,
+    /// Print the plan and exit without executing.
+    Only,
+}
+
+impl PlanMode {
+    fn show(self) -> bool {
+        matches!(self, Self::Show | Self::Only)
+    }
+    fn dry(self) -> bool {
+        matches!(self, Self::Only)
+    }
+}
+
+/// Render the resolved [`Plan`] to stderr using the same grouped list format
+/// the AUR confirmation prompt uses. Shared by `--plan` / `--plan-only` and
+/// the regular pre-confirm display so output is identical.
+fn print_plan(plan: &Plan) {
+    if plan.direct_repo.is_empty()
+        && plan.transitive_repo.is_empty()
+        && plan.aur_strata.is_empty()
+    {
+        ui::info("plan: nothing to do");
+        return;
+    }
+    if !plan.direct_repo.is_empty() {
+        ui::pkg_list("Repo packages (explicit)", &plan.direct_repo);
+    }
+    if !plan.transitive_repo.is_empty() {
+        ui::pkg_list("Repo dependencies", &plan.transitive_repo);
+    }
+    if !plan.aur_strata.is_empty() {
+        let total = plan.aur_strata.len();
+        if total == 1 {
+            ui::pkg_list("AUR build order", &plan.aur_strata[0]);
+        } else {
+            for (i, stratum) in plan.aur_strata.iter().enumerate() {
+                ui::pkg_list(
+                    &format!("AUR build stratum {}/{total}", i + 1),
+                    stratum,
+                );
+            }
+        }
+    }
+}
+
 /// Entry point for `gitaur -S <targets>`.
 ///
 /// Loads the pacman snapshot and (optionally) the AUR index in parallel, then
@@ -41,7 +95,13 @@ struct BuiltPkg {
 /// so the user sees pacman's native UI; only mixed/AUR plans run the full
 /// build pipeline.
 #[instrument(skip(cfg))]
-pub fn cmd_install(cfg: &Config, targets: &[String], noconfirm: bool, asdeps: bool) -> Result<u8> {
+pub fn cmd_install(
+    cfg: &Config,
+    targets: &[String],
+    noconfirm: bool,
+    asdeps: bool,
+    plan_mode: PlanMode,
+) -> Result<u8> {
     let idx_path = paths::index_path();
 
     // Pacman snapshot + AUR index loaded concurrently. PacmanIndex iterates
@@ -88,6 +148,13 @@ pub fn cmd_install(cfg: &Config, targets: &[String], noconfirm: bool, asdeps: bo
     // `.pkg.tar.zst` Explicit instead of `--asdeps`.
     plan.direct_targets.extend(expanded.direct_pkgnames);
 
+    if plan_mode.show() {
+        print_plan(&plan);
+    }
+    if plan_mode.dry() {
+        return Ok(0);
+    }
+
     // Pure-repo fast path: nothing to build, delegate to pacman so the user
     // gets pacman's own "Proceed with installation?" prompt verbatim. Direct
     // targets stay explicit; transitive repo deps (none here, since AUR is
@@ -116,13 +183,9 @@ pub fn cmd_install(cfg: &Config, targets: &[String], noconfirm: bool, asdeps: bo
         .map(|(i, _)| i)
         .ok_or_else(|| Error::other("internal: AUR plan without index"))?;
 
-    if !plan.direct_repo.is_empty() {
-        ui::pkg_list("Repo packages (explicit)", &plan.direct_repo);
+    if !plan_mode.show() {
+        print_plan(&plan);
     }
-    if !plan.transitive_repo.is_empty() {
-        ui::pkg_list("Repo dependencies", &plan.transitive_repo);
-    }
-    ui::pkg_list("AUR build order", &plan.aur_order());
 
     if !ui::confirm("Proceed with build?", noconfirm)? {
         return Err(Error::UserAbort);
@@ -364,7 +427,12 @@ fn install_stratum(
 }
 
 /// Entry point for the AUR half of `-Syu`.
-pub fn cmd_sysupgrade(cfg: &Config, devel: bool, noconfirm: bool) -> Result<u8> {
+pub fn cmd_sysupgrade(
+    cfg: &Config,
+    devel: bool,
+    noconfirm: bool,
+    plan_mode: PlanMode,
+) -> Result<u8> {
     let idx = index::load(&paths::index_path())?;
     let by = Secondary::build(&idx);
     let alpm = alpm_db::open()?;
@@ -395,7 +463,7 @@ pub fn cmd_sysupgrade(cfg: &Config, devel: bool, noconfirm: bool) -> Result<u8> 
         return Ok(0);
     }
     ui::pkg_list("AUR upgrades", &queue);
-    cmd_install(cfg, &queue, noconfirm, false)
+    cmd_install(cfg, &queue, noconfirm, false, plan_mode)
 }
 
 /// Entry point for `-Sc` / `-Scc`.

@@ -193,6 +193,44 @@ Inside the container the gitaur binary is at `/work/target/debug/gitaur`,
   tempfile. Don't try to make it interactive — the parallel runner
   intentionally swallows stdin.
 
+## Manual smoke tests against the real AUR
+
+The unit + container suites use synthetic fixtures by design, so they
+exercise the code paths but not the messy shape of real-world AUR data.
+For sanity-checking changes to `resolver/` or to plan-rendering, run
+`--plan-only` against representative pkgbases from a populated index
+(`gitaur -Sy` first). `--plan-only` resolves the full Plan and prints
+strata without touching `makepkg` or `pacman`, so it's safe to run
+freely.
+
+Candidates (verified against the May 2026 AUR mirror — pkgbase names
+are stable, the exact dep counts drift):
+
+| Pkgbase                  | Strata | AUR pkgs | What it exercises |
+| ------------------------ | -----: | -------: | ----------------- |
+| `spotify`                |      1 |        1 | single-stratum, mixed repo deps |
+| `ptree`                  |      2 |        2 | two strata, no repo deps |
+| `python-pythonnet`       |      2 |        2 | two strata, no repo deps |
+| `ffmpeg-compat-54`       |      3 |        3 | three strata, heavy repo deps |
+| `ros-melodic-move-base`  |     15 |       93 | deep stratum stack, broad repo deps |
+| `ros-melodic-turtlebot3` |     15 |      121 | widest realistic AUR pipeline |
+
+Avoid `python38-*` pkgbases: they reference ~60 missing dependencies
+(`python3.8` itself, plus an orphaned helper-pkg tail), so the resolver
+fails fast with `UnknownTargets` before producing a Plan. Useful as a
+negative-test target for the missing-deps error path, but not for plan
+rendering.
+
+`examples/deep_strata.rs` is the scanner that produced this list — run
+it after `gitaur -Sy` to refresh the candidates if the index drifts:
+
+```sh
+cargo run --example deep_strata
+```
+
+It uses the real `resolver::resolve`, so anything it reports is
+something gitaur can actually plan.
+
 ## CI
 
 Tier 1 runs in GitHub Actions on every push/PR via `.github/workflows/ci.yml`.
