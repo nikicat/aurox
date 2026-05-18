@@ -58,15 +58,14 @@ fn fast_import_fixture(bare: &Path, n: usize) {
     {
         let stdin = child.stdin.as_mut().unwrap();
         for i in 0..n {
-            let branch = format!("pkg{i:05}");
-            let srcinfo =
-                format!("pkgbase = {branch}\npkgver = 1\npkgrel = 1\npkgname = {branch}\n",);
+            let b = format!("pkg{i:05}");
+            let srcinfo = format!("pkgbase = {b}\npkgver = 1\npkgrel = 1\npkgname = {b}\n");
             writeln!(stdin, "blob").unwrap();
             writeln!(stdin, "mark :1").unwrap();
             writeln!(stdin, "data {}", srcinfo.len()).unwrap();
             stdin.write_all(srcinfo.as_bytes()).unwrap();
             writeln!(stdin).unwrap();
-            writeln!(stdin, "commit refs/heads/{branch}").unwrap();
+            writeln!(stdin, "commit refs/heads/{b}").unwrap();
             writeln!(stdin, "committer t <t@t> 0 +0000").unwrap();
             let msg = format!("c{i}");
             writeln!(stdin, "data {}", msg.len()).unwrap();
