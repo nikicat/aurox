@@ -24,10 +24,10 @@ jobs:
           rustup default stable
           rustup component add rustfmt clippy
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
