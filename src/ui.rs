@@ -17,6 +17,7 @@ use crate::pacman::verdiff::{self, BumpKind};
 use console::{style, Term};
 use dialoguer::{Confirm, MultiSelect};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::io::{BufRead, IsTerminal, Write};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -236,9 +237,24 @@ fn paint_suffix(s: &str, kind: BumpKind) -> console::StyledObject<&str> {
 }
 
 /// Y/n confirmation prompt with `Y` default. Honors `noconfirm` to auto-accept.
+///
+/// Falls back to a plain `stdin.read_line` when stdin is not a TTY so callers
+/// can pipe an answer (`echo n | gitaur -S foo`), matching pacman/yay UX.
 pub fn confirm(prompt: &str, noconfirm: bool) -> std::io::Result<bool> {
     if noconfirm {
         return Ok(true);
+    }
+    let stdin = std::io::stdin();
+    if !stdin.is_terminal() {
+        let mut out = std::io::stdout().lock();
+        write!(out, "{prompt} [Y/n] ")?;
+        out.flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 {
+            return Ok(true);
+        }
+        let answer = line.trim();
+        return Ok(!matches!(answer, "n" | "N" | "no" | "No" | "NO"));
     }
     Confirm::new()
         .with_prompt(prompt)
