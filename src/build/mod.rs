@@ -185,7 +185,7 @@ pub fn cmd_install(
             .as_ref()
             .map(|(i, _)| i)
             .ok_or_else(|| Error::other("internal: AUR plan without index"))?;
-        run_aur_pipeline(cfg, idx, &plan, noconfirm, asdeps)?;
+        run_aur_pipeline(cfg, idx, &pac, &plan, noconfirm, asdeps)?;
     }
     Ok(0)
 }
@@ -232,6 +232,7 @@ fn install_repo_phase(cfg: &Config, plan: &Plan, asdeps: bool) -> Result<()> {
 fn run_aur_pipeline(
     cfg: &Config,
     idx: &IndexFile,
+    pac: &PacmanIndex,
     plan: &Plan,
     noconfirm: bool,
     asdeps: bool,
@@ -262,7 +263,8 @@ fn run_aur_pipeline(
             // selected `.pkg.tar.zst` files so `install_stratum`'s
             // `pacman -U` transaction skips the rest.
             let selection = plan.pkgname_selections.get(pkgbase).map(Vec::as_slice);
-            let outputs = build_one(cfg, &mirror, idx, &mut db, pkgbase, selection, noconfirm)?;
+            let outputs =
+                build_one(cfg, &mirror, idx, pac, &mut db, pkgbase, selection, noconfirm)?;
             stratum_built.push(BuiltPkg {
                 pkgbase: pkgbase.clone(),
                 files: outputs,
@@ -286,11 +288,13 @@ fn run_aur_pipeline(
     Ok(())
 }
 
-#[instrument(skip(cfg, mirror, idx, db, selection))]
+#[instrument(skip(cfg, mirror, idx, pac, db, selection))]
+#[allow(clippy::too_many_arguments)]
 fn build_one(
     cfg: &Config,
     mirror: &MirrorRepo,
     idx: &IndexFile,
+    pac: &PacmanIndex,
     db: &mut StateDb,
     pkgbase: &str,
     selection: Option<&[String]>,
@@ -336,7 +340,20 @@ fn build_one(
         }
     }
 
-    review::review(db, mirror, pkgbase, &wt, noconfirm)?;
+    let new_ver = version_string(entry);
+    let installed_ver = entry
+        .pkgnames
+        .iter()
+        .find_map(|p| pac.installed_version(&p.name));
+    review::review(
+        db,
+        mirror,
+        pkgbase,
+        &new_ver,
+        installed_ver,
+        &wt,
+        noconfirm,
+    )?;
     ui::step(&format!("makepkg {pkgbase}"));
     makepkg::run(cfg, &wt.path)?;
 
@@ -348,9 +365,8 @@ fn build_one(
         )));
     }
 
-    let version = version_string(entry);
-    db.record_build(pkgbase, &head_hex, &version)?;
-    info!(pkgbase, version, files = outputs.len(), "build recorded");
+    db.record_build(pkgbase, &head_hex, &new_ver)?;
+    info!(pkgbase, version = new_ver, files = outputs.len(), "build recorded");
     Ok(outputs)
 }
 

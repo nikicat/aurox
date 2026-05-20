@@ -1,4 +1,5 @@
-//! PKGBUILD review UX: full file on first install, diff against last build on update.
+//! PKGBUILD review UX: label by installed-vs-new (install / upgrade / reinstall),
+//! and show full PKGBUILD on a fresh build or a diff against the last build.
 //!
 //! Diff uses the bare mirror repo's object DB (not a `.git` inside the
 //! worktree) — the build directory is just materialized files.
@@ -14,12 +15,16 @@ use gix::ObjectId;
 use std::process::Command;
 use tracing::{debug, info, instrument};
 
-/// Drive the review prompt loop for one pkgbase.
+/// Drive the review prompt loop for one pkgbase. `installed_ver` is the
+/// pacman-localdb version of any pkgname in this pkgbase (None when not
+/// installed); `new_ver` is the version the AUR index reports.
 #[instrument(skip(db, mirror, wt))]
 pub fn review(
     db: &StateDb,
     mirror: &MirrorRepo,
     pkgbase: &str,
+    new_ver: &str,
+    installed_ver: Option<&str>,
     wt: &Worktree,
     noconfirm: bool,
 ) -> Result<()> {
@@ -34,7 +39,7 @@ pub fn review(
     }
 
     loop {
-        show(mirror, pkgbase, wt, prior.as_ref())?;
+        show(mirror, pkgbase, new_ver, installed_ver, wt, prior.as_ref())?;
         let choice = Select::new()
             .with_prompt(format!("[{pkgbase}] review"))
             .items(&["proceed", "view PKGBUILD", "edit", "skip", "abort"])
@@ -54,19 +59,21 @@ pub fn review(
 fn show(
     mirror: &MirrorRepo,
     pkgbase: &str,
+    new_ver: &str,
+    installed_ver: Option<&str>,
     wt: &Worktree,
     prior: Option<&BuildRecord>,
 ) -> Result<()> {
+    let header = match installed_ver {
+        None => format!("install: {pkgbase} {new_ver}"),
+        Some(v) if v == new_ver => format!("reinstall: {pkgbase} {new_ver}"),
+        Some(v) => format!("upgrade: {pkgbase} {v} → {new_ver}"),
+    };
+    ui::step(&header);
     match prior {
-        None => {
-            ui::step(&format!("first install: {pkgbase}"));
-            show_pkgbuild(wt)?;
-        }
+        None => show_pkgbuild(wt)?,
         Some(prev) => {
-            ui::step(&format!(
-                "update: {pkgbase} (last built {})",
-                prev.last_built_version
-            ));
+            ui::note(&format!("last built {}", prev.last_built_version));
             show_diff(mirror, wt, &prev.last_built_commit_oid)?;
         }
     }
