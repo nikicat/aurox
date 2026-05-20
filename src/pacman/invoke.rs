@@ -2,62 +2,61 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::pacman::alpm_db;
+use crate::pacman::vercmp;
 use std::process::Command;
 use tracing::{debug, info, instrument};
 
+/// Sentinel value [`PkgUpgrade::repo`] carries for AUR-sourced rows.
+pub const REPO_AUR: &str = "aur";
+
 /// One package whose installed version is older than what's available
-/// in a sync repo (a row of `pacman -Qu` output) or in the AUR index.
+/// in a sync repo or in the AUR index.
+///
+/// `repo` is the pacman sync-DB name (`core`, `extra`, `multilib`, …) for
+/// repo upgrades, or [`REPO_AUR`] for AUR upgrades. It drives both grouping
+/// in the upgrade table and the source column shown to the user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PkgUpgrade {
+    pub repo: String,
     pub name: String,
     pub old_ver: String,
     pub new_ver: String,
 }
 
-/// Query `pacman -Qu` for upgradable repo packages. Runs unprivileged: the
-/// local + sync DBs are world-readable, so the plan can be shown before any
-/// sudo prompt. Exit status 1 with empty stdout is pacman's "nothing to
-/// upgrade" — treated as `Ok(vec![])`, not an error.
+/// Walk alpm directly for upgradable repo packages — no shell-out, no parser.
+///
+/// For every installed package, the first sync DB (in pacman.conf order) that
+/// declares the same pkgname wins; if its version is newer we record an
+/// upgrade and tag it with that DB's name. Packages absent from every sync DB
+/// (foreign / AUR) are skipped here — they go through [`crate::build`].
 #[instrument]
 pub fn query_repo_upgrades() -> Result<Vec<PkgUpgrade>> {
-    let out = Command::new("pacman").arg("-Qu").output()?;
-    let code = out.status.code().unwrap_or(-1);
-    if code == 1 && out.stdout.is_empty() {
-        return Ok(Vec::new());
-    }
-    if !out.status.success() {
-        return Err(Error::other(format!(
-            "pacman -Qu exited with status {code}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let alpm = alpm_db::open()?;
     let mut upgrades = Vec::new();
-    for line in text.lines() {
-        if let Some(u) = parse_qu_line(line) {
-            upgrades.push(u);
+    for ipkg in alpm.localdb().pkgs() {
+        for db in alpm.syncdbs() {
+            let Ok(spkg) = db.pkg(ipkg.name()) else {
+                continue;
+            };
+            let installed = ipkg.version().to_string();
+            let avail = spkg.version().to_string();
+            if vercmp::is_outdated(&installed, &avail) {
+                upgrades.push(PkgUpgrade {
+                    repo: db.name().to_string(),
+                    name: ipkg.name().to_string(),
+                    old_ver: installed,
+                    new_ver: avail,
+                });
+            }
+            // First syncdb that declares this pkgname is the one pacman would
+            // pull from — don't keep scanning later DBs even if they also
+            // carry it (e.g. testing repos shadowing core).
+            break;
         }
     }
-    debug!(count = upgrades.len(), "pacman -Qu parsed");
+    debug!(count = upgrades.len(), "alpm repo upgrades scanned");
     Ok(upgrades)
-}
-
-/// Parse one line of `pacman -Qu` output: `name old_ver -> new_ver`. Anything
-/// else (blank lines, `[ignored]` markers pacman tacks onto held packages)
-/// returns `None` so the caller drops it silently.
-fn parse_qu_line(line: &str) -> Option<PkgUpgrade> {
-    let mut parts = line.split_whitespace();
-    let name = parts.next()?;
-    let old_ver = parts.next()?;
-    if parts.next()? != "->" {
-        return None;
-    }
-    let new_ver = parts.next()?;
-    Some(PkgUpgrade {
-        name: name.to_string(),
-        old_ver: old_ver.to_string(),
-        new_ver: new_ver.to_string(),
-    })
 }
 
 /// Exec `pacman` with `argv`, prepending the privilege escalator when needed.
@@ -121,24 +120,5 @@ mod tests {
     fn print_flag_disables_sudo() {
         assert!(!needs_sudo(&["-Syu".into(), "--print".into()]));
         assert!(!needs_sudo(&["-Syu".into(), "-p".into()]));
-    }
-
-    #[test]
-    fn parses_qu_line() {
-        assert_eq!(
-            parse_qu_line("vim 9.0-1 -> 9.1-2"),
-            Some(PkgUpgrade {
-                name: "vim".into(),
-                old_ver: "9.0-1".into(),
-                new_ver: "9.1-2".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_malformed_qu_lines() {
-        assert_eq!(parse_qu_line(""), None);
-        assert_eq!(parse_qu_line("vim 9.0-1"), None);
-        assert_eq!(parse_qu_line("vim 9.0-1 => 9.1-2"), None);
     }
 }

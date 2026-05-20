@@ -75,16 +75,24 @@ fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8
     }
 
     if upgrade {
-        // Show the union (repo + AUR) upgrade plan first — identical to
-        // `gitaur -Qu`, unprivileged — gate on a single confirmation, then
-        // run pacman and the AUR pipeline without re-prompting. Use `-Qu`
-        // for a dry-run preview that never reaches this confirm step.
-        build::cmd_query_upgrades(cfg.devel || devel)?;
-        if !ui::confirm("Proceed with upgrade?", noconfirm)? {
-            return Err(Error::UserAbort);
+        // Build the unified repo + AUR plan unprivileged, hand it to the
+        // interactive picker, then act on the user's selection. The picker
+        // falls back to the default mask under `noconfirm` or non-TTY stdin,
+        // so cron / pipes keep working without prompting.
+        let plan = build::collect_upgrade_plan(cfg.devel || devel)?;
+        if plan.is_empty() {
+            ui::info("nothing to do");
+        } else {
+            let sel = ui::select_upgrades(&plan, cfg, noconfirm)
+                .map_err(|e| Error::other(format!("upgrade selection: {e}")))?;
+            if sel.is_empty() {
+                return Err(Error::UserAbort);
+            }
+            run_repo_upgrade(cfg, &sel)?;
+            if !sel.aur.is_empty() {
+                build::cmd_install(cfg, &sel.aur, noconfirm, false, true)?;
+            }
         }
-        invoke::exec_pacman(cfg, &["-Syu".into(), "--noconfirm".into()])?;
-        build::cmd_sysupgrade(cfg, cfg.devel || devel, noconfirm)?;
     }
 
     if !f.positional.is_empty() {
@@ -94,4 +102,28 @@ fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8
     }
 
     Ok(0)
+}
+
+/// Drive `pacman -Syu` for the selected repo packages.
+///
+/// If the user deselected any rows, those pkgnames become `--ignore=<csv>` —
+/// pacman still resolves the full upgrade graph (partial-upgrade safety) but
+/// pins the listed versions. If every repo upgrade was deselected we skip the
+/// pacman call entirely; there's nothing to do (and no point asking for sudo).
+fn run_repo_upgrade(cfg: &Config, sel: &ui::UpgradeSelection) -> Result<u8> {
+    if sel.repo.is_empty() {
+        return Ok(0);
+    }
+    if !sel.repo_skipped.is_empty() {
+        ui::warn(&format!(
+            "partial upgrade — pinning {} repo package(s) via --ignore (Arch officially discourages partial upgrades)",
+            sel.repo_skipped.len()
+        ));
+    }
+    let mut argv: Vec<String> = vec!["-Syu".into(), "--noconfirm".into()];
+    if !sel.repo_skipped.is_empty() {
+        argv.push("--ignore".into());
+        argv.push(sel.repo_skipped.join(","));
+    }
+    invoke::exec_pacman(cfg, &argv)
 }

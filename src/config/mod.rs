@@ -32,6 +32,12 @@ pub struct Config {
     pub devel: bool,
     /// `prompt` | `skip` | `always-show` — PKGBUILD review default.
     pub review_default: String,
+    /// Pre-check AUR rows in the interactive `-Syu` picker. `false` (default)
+    /// matches the "AUR is opt-in" mental model: repo upgrades are usually
+    /// uncontroversial, AUR rebuilds are expensive and worth confirming.
+    /// Flip to `true` to get the yay/paru behavior where every upgrade is
+    /// pre-selected.
+    pub aur_default_select: bool,
 }
 
 impl Default for Config {

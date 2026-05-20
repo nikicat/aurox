@@ -87,7 +87,8 @@ pub fn resolve(
     let mut queue: Vec<(String, bool)> = targets.iter().map(|t| (t.clone(), true)).collect();
     while let Some((target, is_direct)) = queue.pop() {
         let bare = secondary::strip_version_constraint(&target).to_string();
-        match classify(by, pac, &bare) {
+        let source = resolve_target_source(by, pac, &bare, is_direct);
+        match source {
             Source::Installed(concrete) => {
                 debug!(target = %bare, %concrete, "already satisfied (installed)");
             }
@@ -182,6 +183,36 @@ pub fn resolve(
         "plan resolved",
     );
     Ok(plan)
+}
+
+/// Wrap [`classify`] with a rebuild override for direct targets: when the
+/// user explicitly named a pkg that classifies as `Installed` and that name
+/// also exists in the AUR index, return `Source::Aur` so the build path
+/// picks it up. The classifier stops at pacman precedence and can't see
+/// version, so an outdated installed AUR pkg would otherwise be silently
+/// dropped — breaking `-Syu`'s AUR half and `-S name` on an already-
+/// installed AUR pkg. Transitive deps keep the default behavior; a satisfied
+/// dep is not a rebuild trigger.
+fn resolve_target_source(
+    by: Option<&Secondary>,
+    pac: &PacmanIndex,
+    bare: &str,
+    is_direct: bool,
+) -> Source {
+    let source = classify(by, pac, bare);
+    if !is_direct {
+        return source;
+    }
+    let (Source::Installed(_), Some(by)) = (&source, by) else {
+        return source;
+    };
+    let aur_hit = by
+        .by_name
+        .get(bare)
+        .copied()
+        .or_else(|| by.by_provides.get(bare).and_then(|v| v.first().copied()))
+        .or_else(|| by.by_pkgbase.get(bare).copied());
+    aur_hit.map_or(source, |i| Source::Aur(i as usize))
 }
 
 #[cfg(test)]
@@ -520,6 +551,55 @@ mod tests {
             "rust must not appear in both buckets, got transitive {:?}",
             plan.transitive_repo
         );
+    }
+
+    // ---- direct-rebuild override ----------------------------------------
+
+    /// A direct target that's already installed but also lives in the AUR
+    /// index must rebuild (route to `aur_strata`), not get dropped as satisfied.
+    /// This is the `-Syu` AUR upgrade path and `-S name` on an installed AUR
+    /// pkg — the classifier can't see version, so the resolver overrides.
+    #[test]
+    fn installed_direct_aur_target_routes_to_rebuild() {
+        let idx = IndexFile {
+            entries: vec![entry("brave-bin", &[], &[])],
+            ..IndexFile::empty()
+        };
+        let by = Secondary::build(&idx);
+        let mut pac = PacmanIndex::default();
+        pac.installed
+            .insert("brave-bin".into(), "1:1.90.121-1".into());
+        let cfg = default_config();
+        let plan = resolve(
+            &cfg,
+            &idx,
+            Some(&by),
+            &pac,
+            &["brave-bin".to_string()],
+        )
+        .unwrap();
+        assert_eq!(plan.aur_strata, vec![vec!["brave-bin".to_string()]]);
+    }
+
+    /// Transitive deps that are already installed must stay dropped — only
+    /// direct targets get the rebuild override. A makedep `helper` that's
+    /// installed shouldn't trigger a needless rebuild of `helper`.
+    #[test]
+    fn installed_transitive_aur_dep_is_still_dropped() {
+        let idx = IndexFile {
+            entries: vec![
+                entry("client", &[], &["helper"]),
+                entry("helper", &[], &[]),
+            ],
+            ..IndexFile::empty()
+        };
+        let by = Secondary::build(&idx);
+        let mut pac = PacmanIndex::default();
+        pac.installed.insert("helper".into(), "1.0-1".into());
+        let cfg = default_config();
+        let plan = resolve(&cfg, &idx, Some(&by), &pac, &["client".to_string()]).unwrap();
+        // Only client should be in the build plan; helper stays satisfied.
+        assert_eq!(plan.aur_strata, vec![vec!["client".to_string()]]);
     }
 
     // ---- cycles ---------------------------------------------------------

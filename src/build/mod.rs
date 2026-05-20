@@ -109,8 +109,8 @@ fn rows_for_aur(pkgbases: &[String], idx: &IndexFile) -> Vec<(String, String)> {
 /// single confirmation gitaur drives every `pacman` call with `--noconfirm`
 /// so the user is asked once; pacman never re-prompts. `already_confirmed`
 /// short-circuits the gate for callers that have already confirmed at a
-/// higher level (e.g. `-Syu` → [`cmd_sysupgrade`]); PKGBUILD review prompts
-/// still respect `noconfirm`.
+/// higher level (e.g. the `-Syu` interactive picker in `cli::dispatch`);
+/// PKGBUILD review prompts still respect `noconfirm`.
 #[instrument(skip(cfg))]
 pub fn cmd_install(
     cfg: &Config,
@@ -452,6 +452,7 @@ fn aur_upgrades(
         let need = (devel && is_vcs) || vercmp::is_outdated(&installed_ver, &aur_ver);
         if need {
             out.push(PkgUpgrade {
+                repo: invoke::REPO_AUR.into(),
                 name,
                 old_ver: installed_ver,
                 new_ver: aur_ver,
@@ -462,47 +463,29 @@ fn aur_upgrades(
 }
 
 /// `gitaur -Qu` — show the union of pacman-repo and AUR upgrade candidates
-/// as two aligned, colorized tables grouped by source. Read-only and
-/// unprivileged (no sudo), so safe to call both as the bare `-Qu` and as
-/// a preview before `-Syu` runs.
+/// in one flat, severity-sorted table grouped by `repo` column. Read-only
+/// and unprivileged (no sudo), so safe to call both as the bare `-Qu` and
+/// as a preview before `-Syu` runs.
 #[instrument]
 pub fn cmd_query_upgrades(devel: bool) -> Result<u8> {
-    let mut repo = invoke::query_repo_upgrades()?;
-    let alpm = alpm_db::open()?;
-    let pac = PacmanIndex::build(&alpm);
-    let idx_path = paths::index_path();
-    let mut aur = if idx_path.exists() {
-        let idx = index::load(&idx_path)?;
-        let by = Secondary::build(&idx);
-        aur_upgrades(&idx, &by, &pac, devel)
-    } else {
-        Vec::new()
-    };
-    repo.sort_by(|a, b| a.name.cmp(&b.name));
-    aur.sort_by(|a, b| a.name.cmp(&b.name));
-    ui::upgrade_table("Repo upgrades", &repo);
-    ui::upgrade_table("AUR upgrades", &aur);
+    ui::upgrade_table(&collect_upgrade_plan(devel)?);
     Ok(0)
 }
 
-/// Entry point for the AUR half of `-Syu`. The dispatch-level `-Syu` confirm
-/// has already accepted the unified plan, so `already_confirmed=true` short-
-/// circuits `cmd_install`'s own gate (PKGBUILD review still honors
-/// `noconfirm`).
-pub fn cmd_sysupgrade(cfg: &Config, devel: bool, noconfirm: bool) -> Result<u8> {
-    let idx = index::load(&paths::index_path())?;
-    let by = Secondary::build(&idx);
-    let alpm = alpm_db::open()?;
-    let pac = PacmanIndex::build(&alpm);
-    let queue: Vec<String> = aur_upgrades(&idx, &by, &pac, devel)
-        .into_iter()
-        .map(|u| u.name)
-        .collect();
-    if queue.is_empty() {
-        ui::info("nothing to do");
-        return Ok(0);
+/// Gather the merged repo + AUR upgrade list. Shared by `-Qu` (read-only
+/// rendering) and `-Syu` (feeds the interactive picker). Unprivileged —
+/// reads alpm and the AUR index file only.
+pub fn collect_upgrade_plan(devel: bool) -> Result<Vec<PkgUpgrade>> {
+    let mut plan = invoke::query_repo_upgrades()?;
+    let idx_path = paths::index_path();
+    if idx_path.exists() {
+        let idx = index::load(&idx_path)?;
+        let by = Secondary::build(&idx);
+        let alpm = alpm_db::open()?;
+        let pac = PacmanIndex::build(&alpm);
+        plan.extend(aur_upgrades(&idx, &by, &pac, devel));
     }
-    cmd_install(cfg, &queue, noconfirm, false, true)
+    Ok(plan)
 }
 
 /// Entry point for `-Sc` / `-Scc`.

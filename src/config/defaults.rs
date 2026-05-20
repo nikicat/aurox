@@ -20,5 +20,6 @@ pub fn default_config() -> Config {
         privilege_escalator: "sudo".into(),
         devel: false,
         review_default: "prompt".into(),
+        aur_default_select: false,
     }
 }

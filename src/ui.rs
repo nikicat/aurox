@@ -11,12 +11,14 @@
 //!
 //! Splitting the two lets callers `set_message` without clobbering the label.
 
-use crate::pacman::invoke::PkgUpgrade;
+use crate::config::Config;
+use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
 use crate::pacman::verdiff::{self, BumpKind};
 
 use console::{style, Term};
 use dialoguer::{Confirm, MultiSelect};
 use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
+use std::collections::HashSet;
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -161,69 +163,197 @@ pub fn install_table(label: &str, rows: &[(String, String)]) {
 /// Display an aligned, colorized upgrade table:
 ///
 /// ```text
-/// AUR upgrades (3)
-///     neovim-git       0.10.0.r123-1   ->  0.10.0.r130-1
-///     mypkg            1.0.0-1         ->  1.0.0-2
-///     bigpkg           1.2.3-1         ->  2.0.0-1
+/// Upgrades (5)
+///     core      glibc            2.40-1          ->  2.41-1
+///     extra     neovim           0.10.0-1        ->  0.10.2-1
+///     multilib  wine             9.20-1          ->  9.21-1
+///     aur       paru-bin         2.0.0-1         ->  2.0.1-1
+///     aur       neovim-git       0.10.0.r123-1   ->  0.10.0.r130-1
 /// ```
 ///
-/// Columns are space-padded (no rules/lines). Both versions show their
-/// common prefix dimmed; the diverging suffix is colored by [`BumpKind`]
-/// so a glance distinguishes major (red), minor (yellow), patch (green),
-/// pkgrel (cyan), and epoch (red+bold) bumps.
-pub fn upgrade_table(label: &str, upgrades: &[PkgUpgrade]) {
-    if upgrades.is_empty() {
+/// Rows are grouped by `repo` (canonical Arch order — core → extra →
+/// multilib → other → aur), then severity-descending within group. All four
+/// columns are space-padded uniformly across the whole list so package names
+/// align regardless of which repo they come from. Version cells dim their
+/// common prefix and color the diverging suffix by [`BumpKind`] (epoch/major
+/// red, minor yellow, patch green, pkgrel cyan).
+pub fn upgrade_table(plan: &[PkgUpgrade]) {
+    if plan.is_empty() {
         return;
     }
-    let name_w = upgrades.iter().map(|u| u.name.len()).max().unwrap_or(0);
-    let old_w = upgrades.iter().map(|u| u.old_ver.len()).max().unwrap_or(0);
-    let header = format!("{} ({})", label, upgrades.len());
-
-    let rows = classify_and_sort(upgrades);
+    let ordered = sort_for_display(plan);
+    let (repo_w, name_w, old_w) = col_widths(&ordered);
+    let header = format!("Upgrades ({})", ordered.len());
 
     eprintln!();
-    if color_on() {
+    let colored = color_on();
+    if colored {
         eprintln!("{}", dim(&header));
-        for (kind, u) in &rows {
-            let cut = verdiff::common_prefix_at_boundary(&u.old_ver, &u.new_ver);
-            let (old_pre, old_suf) = u.old_ver.split_at(cut);
-            let (new_pre, new_suf) = u.new_ver.split_at(cut);
-            // Pad after splitting so trailing spaces ride with the (dim) prefix.
-            let old_pad = " ".repeat(old_w.saturating_sub(u.old_ver.len()));
-            eprintln!(
-                "    {name:<name_w$}  {old_pre}{old_suf}{old_pad}  ->  {new_pre}{new_suf}",
-                name = u.name,
-                old_pre = style(old_pre).dim(),
-                old_suf = style(old_suf).red(),
-                old_pad = old_pad,
-                new_pre = style(new_pre).dim(),
-                new_suf = paint_suffix(new_suf, *kind),
-            );
-        }
     } else {
         eprintln!("{header}");
-        for (_, u) in &rows {
-            eprintln!(
-                "    {name:<name_w$}  {old:<old_w$}  ->  {new}",
-                name = u.name,
-                old = u.old_ver,
-                new = u.new_ver,
-            );
-        }
+    }
+    for u in &ordered {
+        eprintln!("    {}", render_row(u, repo_w, name_w, old_w, colored));
     }
     eprintln!();
 }
 
-/// Pair each upgrade with its [`BumpKind`] and sort most-severe first.
-/// Stable: rows with the same severity keep their input order (typically
-/// alphabetical from `pacman -Qu` / AUR).
-fn classify_and_sort(upgrades: &[PkgUpgrade]) -> Vec<(BumpKind, &PkgUpgrade)> {
-    let mut rows: Vec<(BumpKind, &PkgUpgrade)> = upgrades
-        .iter()
-        .map(|u| (verdiff::classify_bump(&u.old_ver, &u.new_ver), u))
-        .collect();
-    rows.sort_by_key(|(kind, _)| *kind);
+/// User's choice from the interactive `-Syu` picker. Pkgnames split by where
+/// the caller needs them: `repo` joins `pacman -Syu`'s subset, `repo_skipped`
+/// becomes the `--ignore=` list, `aur` is the queue for `cmd_install`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct UpgradeSelection {
+    pub repo: Vec<String>,
+    pub repo_skipped: Vec<String>,
+    pub aur: Vec<String>,
+}
+
+impl UpgradeSelection {
+    pub fn is_empty(&self) -> bool {
+        self.repo.is_empty() && self.aur.is_empty()
+    }
+}
+
+/// Render the upgrade plan as a `dialoguer::MultiSelect` and split the user's
+/// selection into the three buckets `UpgradeSelection` carries.
+///
+/// Falls back to the default mask without prompting when `noconfirm` is set
+/// or stdin is not a TTY — same UX rule as [`confirm`]. Default mask is
+/// "repo rows checked, AUR rows per `cfg.aur_default_select`"; the AUR knob
+/// lets users opt into yay/paru parity (everything pre-selected).
+pub fn select_upgrades(
+    plan: &[PkgUpgrade],
+    cfg: &Config,
+    noconfirm: bool,
+) -> std::io::Result<UpgradeSelection> {
+    if plan.is_empty() {
+        return Ok(UpgradeSelection::default());
+    }
+    let ordered = sort_for_display(plan);
+    let defaults: Vec<bool> = ordered.iter().map(|u| default_for(u, cfg)).collect();
+
+    let interactive = !noconfirm && std::io::stdin().is_terminal();
+    let selected: Vec<usize> = if interactive {
+        let (repo_w, name_w, old_w) = col_widths(&ordered);
+        let colored = color_on();
+        let labels: Vec<String> = ordered
+            .iter()
+            .map(|u| render_row(u, repo_w, name_w, old_w, colored))
+            .collect();
+        // Print a count banner above the prompt so the user sees the scope
+        // before navigating; the MultiSelect itself only owns its own area.
+        info(&format!("Upgrades ({})", ordered.len()));
+        MultiSelect::new()
+            .with_prompt("Select upgrades to apply (space toggles, a inverts, enter confirms)")
+            .items(&labels)
+            .defaults(&defaults)
+            .interact()
+            .map_err(std::io::Error::other)?
+    } else {
+        defaults
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &on)| on.then_some(i))
+            .collect()
+    };
+
+    let picked: HashSet<usize> = selected.into_iter().collect();
+    let mut sel = UpgradeSelection::default();
+    for (i, u) in ordered.iter().enumerate() {
+        let is_aur = u.repo == REPO_AUR;
+        match (is_aur, picked.contains(&i)) {
+            (true, true) => sel.aur.push(u.name.clone()),
+            (true, false) => {}
+            (false, true) => sel.repo.push(u.name.clone()),
+            (false, false) => sel.repo_skipped.push(u.name.clone()),
+        }
+    }
+    Ok(sel)
+}
+
+fn default_for(u: &PkgUpgrade, cfg: &Config) -> bool {
+    if u.repo == REPO_AUR {
+        cfg.aur_default_select
+    } else {
+        true
+    }
+}
+
+/// Sort `plan` by (repo group, severity-descending, name) without copying.
+/// The name tiebreaker keeps the table deterministic across runs — alpm's
+/// localdb walk and the `HashMap`-backed foreign-pkg iterator both produce
+/// non-stable input order, so a row's position would otherwise jitter
+/// between invocations.
+fn sort_for_display(plan: &[PkgUpgrade]) -> Vec<&PkgUpgrade> {
+    let mut rows: Vec<&PkgUpgrade> = plan.iter().collect();
+    rows.sort_by(|a, b| {
+        repo_rank(&a.repo)
+            .cmp(&repo_rank(&b.repo))
+            .then_with(|| {
+                verdiff::classify_bump(&a.old_ver, &a.new_ver)
+                    .cmp(&verdiff::classify_bump(&b.old_ver, &b.new_ver))
+            })
+            .then_with(|| a.name.cmp(&b.name))
+    });
     rows
+}
+
+/// Sort key for `repo`. Pinned positions for the three canonical Arch repos
+/// and AUR last; any other configured repo (testing, custom, ...) lands in
+/// between and breaks ties alphabetically.
+fn repo_rank(repo: &str) -> (u8, &str) {
+    match repo {
+        "core" => (0, ""),
+        "extra" => (1, ""),
+        "multilib" => (2, ""),
+        REPO_AUR => (255, ""),
+        other => (10, other),
+    }
+}
+
+fn col_widths(rows: &[&PkgUpgrade]) -> (usize, usize, usize) {
+    let repo_w = rows.iter().map(|u| u.repo.len()).max().unwrap_or(0);
+    let name_w = rows.iter().map(|u| u.name.len()).max().unwrap_or(0);
+    let old_w = rows.iter().map(|u| u.old_ver.len()).max().unwrap_or(0);
+    (repo_w, name_w, old_w)
+}
+
+/// Format one upgrade row at the given column widths. Shared by the static
+/// `upgrade_table` and the interactive picker so both stay visually identical.
+fn render_row(
+    u: &PkgUpgrade,
+    repo_w: usize,
+    name_w: usize,
+    old_w: usize,
+    colored: bool,
+) -> String {
+    if !colored {
+        return format!(
+            "{repo:<repo_w$}  {name:<name_w$}  {old:<old_w$}  ->  {new}",
+            repo = u.repo,
+            name = u.name,
+            old = u.old_ver,
+            new = u.new_ver,
+        );
+    }
+    let kind = verdiff::classify_bump(&u.old_ver, &u.new_ver);
+    let cut = verdiff::common_prefix_at_boundary(&u.old_ver, &u.new_ver);
+    let (old_pre, old_suf) = u.old_ver.split_at(cut);
+    let (new_pre, new_suf) = u.new_ver.split_at(cut);
+    // Pad after splitting so trailing spaces ride with the (dim) prefix.
+    let old_pad = " ".repeat(old_w.saturating_sub(u.old_ver.len()));
+    let repo_pad = " ".repeat(repo_w.saturating_sub(u.repo.len()));
+    format!(
+        "{repo}{repo_pad}  {name:<name_w$}  {old_pre}{old_suf}{old_pad}  ->  {new_pre}{new_suf}",
+        repo = style(&u.repo).color256(244),
+        repo_pad = repo_pad,
+        name = u.name,
+        old_pre = style(old_pre).dim(),
+        old_suf = style(old_suf).red(),
+        old_pad = old_pad,
+        new_pre = style(new_pre).dim(),
+        new_suf = paint_suffix(new_suf, kind),
+    )
 }
 
 fn paint_suffix(s: &str, kind: BumpKind) -> console::StyledObject<&str> {
@@ -833,53 +963,146 @@ mod tests {
         );
     }
 
-    /// Upgrade rows must render most-severe first within each group, with
-    /// stable secondary order. The colored and uncolored branches both iterate
-    /// `classify_and_sort`, so testing it covers both display paths.
+    /// `sort_for_display` is the single source of truth for upgrade-row order.
+    /// Within one repo it must emit most-severe-first, then alphabetical-by-name
+    /// for same-severity rows so the table is deterministic across runs (alpm
+    /// and `HashMap` iterators give non-stable input order). Covers both
+    /// `upgrade_table` and the picker.
     #[test]
-    fn classify_and_sort_orders_by_severity_then_input() {
+    fn sort_for_display_severity_then_name() {
+        // Input is deliberately scrambled — `patch-b` before `patch-a` — so
+        // the assertion would fail if the sort fell back to input order.
         let ups = vec![
             PkgUpgrade {
-                name: "patch-a".into(),
-                old_ver: "1.0.0-1".into(),
-                new_ver: "1.0.1-1".into(),
-            },
-            PkgUpgrade {
-                name: "major".into(),
-                old_ver: "1.0-1".into(),
-                new_ver: "2.0-1".into(),
-            },
-            PkgUpgrade {
-                name: "pkgrel".into(),
-                old_ver: "1.0-1".into(),
-                new_ver: "1.0-2".into(),
-            },
-            PkgUpgrade {
-                name: "epoch".into(),
-                old_ver: "1:1.0-1".into(),
-                new_ver: "2:1.0-1".into(),
-            },
-            PkgUpgrade {
+                repo: "extra".into(),
                 name: "patch-b".into(),
                 old_ver: "2.3.4-1".into(),
                 new_ver: "2.3.5-1".into(),
             },
             PkgUpgrade {
+                repo: "extra".into(),
+                name: "major".into(),
+                old_ver: "1.0-1".into(),
+                new_ver: "2.0-1".into(),
+            },
+            PkgUpgrade {
+                repo: "extra".into(),
+                name: "pkgrel".into(),
+                old_ver: "1.0-1".into(),
+                new_ver: "1.0-2".into(),
+            },
+            PkgUpgrade {
+                repo: "extra".into(),
+                name: "epoch".into(),
+                old_ver: "1:1.0-1".into(),
+                new_ver: "2:1.0-1".into(),
+            },
+            PkgUpgrade {
+                repo: "extra".into(),
+                name: "patch-a".into(),
+                old_ver: "1.0.0-1".into(),
+                new_ver: "1.0.1-1".into(),
+            },
+            PkgUpgrade {
+                repo: "extra".into(),
                 name: "minor".into(),
                 old_ver: "1.0-1".into(),
                 new_ver: "1.1-1".into(),
             },
         ];
-        let sorted: Vec<&str> = classify_and_sort(&ups)
+        let sorted: Vec<&str> = sort_for_display(&ups)
             .iter()
-            .map(|(_, u)| u.name.as_str())
+            .map(|u| u.name.as_str())
             .collect();
-        // Severity order: Epoch, Major, Minor, Patch, PkgRel. Within Patch
-        // the two rows preserve input order (patch-a before patch-b).
         assert_eq!(
             sorted,
             ["epoch", "major", "minor", "patch-a", "patch-b", "pkgrel"]
         );
+    }
+
+    /// Group ordering: core → extra → multilib → (other repos, alphabetical)
+    /// → aur. Severity inside each group still applies.
+    #[test]
+    fn sort_for_display_groups_then_severity() {
+        let ups = vec![
+            PkgUpgrade {
+                repo: "aur".into(),
+                name: "aur-major".into(),
+                old_ver: "1.0-1".into(),
+                new_ver: "2.0-1".into(),
+            },
+            PkgUpgrade {
+                repo: "extra".into(),
+                name: "extra-patch".into(),
+                old_ver: "1.0.0-1".into(),
+                new_ver: "1.0.1-1".into(),
+            },
+            PkgUpgrade {
+                repo: "core".into(),
+                name: "core-pkgrel".into(),
+                old_ver: "1.0-1".into(),
+                new_ver: "1.0-2".into(),
+            },
+            PkgUpgrade {
+                repo: "extra".into(),
+                name: "extra-major".into(),
+                old_ver: "1.0-1".into(),
+                new_ver: "2.0-1".into(),
+            },
+            PkgUpgrade {
+                repo: "multilib".into(),
+                name: "ml-minor".into(),
+                old_ver: "1.0-1".into(),
+                new_ver: "1.1-1".into(),
+            },
+            PkgUpgrade {
+                repo: "testing".into(),
+                name: "testing-patch".into(),
+                old_ver: "1.0.0-1".into(),
+                new_ver: "1.0.1-1".into(),
+            },
+        ];
+        let sorted: Vec<&str> = sort_for_display(&ups)
+            .iter()
+            .map(|u| u.name.as_str())
+            .collect();
+        assert_eq!(
+            sorted,
+            [
+                "core-pkgrel",
+                "extra-major",
+                "extra-patch",
+                "ml-minor",
+                "testing-patch",
+                "aur-major",
+            ]
+        );
+    }
+
+    /// AUR rows default off (opt-in), repo rows default on. Toggling the
+    /// config knob flips the AUR side without touching repo behavior.
+    #[test]
+    fn default_for_respects_aur_knob() {
+        use crate::config::defaults::default_config;
+        let cfg_off = default_config();
+        let mut cfg_on = cfg_off.clone();
+        cfg_on.aur_default_select = true;
+        let repo = PkgUpgrade {
+            repo: "extra".into(),
+            name: "vim".into(),
+            old_ver: "1-1".into(),
+            new_ver: "1-2".into(),
+        };
+        let aur = PkgUpgrade {
+            repo: REPO_AUR.into(),
+            name: "paru-bin".into(),
+            old_ver: "1-1".into(),
+            new_ver: "1-2".into(),
+        };
+        assert!(default_for(&repo, &cfg_off));
+        assert!(default_for(&repo, &cfg_on));
+        assert!(!default_for(&aur, &cfg_off));
+        assert!(default_for(&aur, &cfg_on));
     }
 
     /// Empty version cells (provides-only matches) must not break the
@@ -902,22 +1125,25 @@ mod tests {
     fn upgrade_table_smoke() {
         let ups = vec![
             PkgUpgrade {
+                repo: "core".into(),
                 name: "short".into(),
                 old_ver: "1.0-1".into(),
                 new_ver: "1.0-2".into(),
             },
             PkgUpgrade {
+                repo: "extra".into(),
                 name: "much-longer-name".into(),
                 old_ver: "1.2.3-1".into(),
                 new_ver: "2.0.0-1".into(),
             },
             PkgUpgrade {
+                repo: "aur".into(),
                 name: "epochpkg".into(),
                 old_ver: "1:1.0-1".into(),
                 new_ver: "2:1.0-1".into(),
             },
         ];
-        upgrade_table("Test upgrades", &ups);
-        upgrade_table("Empty", &[]);
+        upgrade_table(&ups);
+        upgrade_table(&[]);
     }
 }
