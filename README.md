@@ -97,6 +97,18 @@ cargo test
 
 CI runs all of the above on an `archlinux:latest` container.
 
+A `.pre-commit-config.yaml` is checked in to catch the cheap failures
+(`cargo fmt --check`, `taplo fmt --check`, `taplo lint`) before they round-trip
+through CI. One-time setup per clone:
+
+```sh
+cargo install prek    # or: pacman -S prek (once it lands in extra)
+prek install
+```
+
+The hook stays sub-second; `cargo clippy` and `cargo test` are deliberately
+left out — run them yourself before pushing.
+
 ## License
 
 [MIT](LICENSE).
