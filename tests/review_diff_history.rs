@@ -14,11 +14,7 @@ use tempfile::TempDir;
 /// (oldest → newest), with one commit per entry. Each commit's `.SRCINFO`
 /// declares the entry's `(pkgver, pkgrel[, epoch])`. Returns `(bare path,
 /// commit OIDs in order)`.
-fn build_history(
-    root: &Path,
-    pkgbase: &str,
-    versions: &[Version<'_>],
-) -> (PathBuf, Vec<ObjectId>) {
+fn build_history(root: &Path, pkgbase: &str, versions: &[Version<'_>]) -> (PathBuf, Vec<ObjectId>) {
     let src = root.join("src");
     let bare = root.join("bare");
     std::fs::create_dir_all(&src).unwrap();

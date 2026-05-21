@@ -653,7 +653,10 @@ mod tests {
         sel.sort();
         assert_eq!(
             sel,
-            vec!["test-split-core".to_string(), "test-split-extras".to_string()],
+            vec![
+                "test-split-core".to_string(),
+                "test-split-extras".to_string()
+            ],
             "sibling pkgname appearing in pkgbase.depends must join the install selection",
         );
     }
@@ -693,10 +696,7 @@ mod tests {
         assert_eq!(r.targets, vec!["bisq".to_string(), "bisq".to_string()]);
         let mut dp = r.direct_pkgnames.clone();
         dp.sort();
-        assert_eq!(
-            dp,
-            vec!["bisq-cli".to_string(), "bisq-daemon".to_string()],
-        );
+        assert_eq!(dp, vec!["bisq-cli".to_string(), "bisq-daemon".to_string()],);
         let mut sel = r.selections.get("bisq").cloned().unwrap_or_default();
         sel.sort();
         assert_eq!(

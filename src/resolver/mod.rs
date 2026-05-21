@@ -570,14 +570,7 @@ mod tests {
         pac.installed
             .insert("brave-bin".into(), "1:1.90.121-1".into());
         let cfg = default_config();
-        let plan = resolve(
-            &cfg,
-            &idx,
-            Some(&by),
-            &pac,
-            &["brave-bin".to_string()],
-        )
-        .unwrap();
+        let plan = resolve(&cfg, &idx, Some(&by), &pac, &["brave-bin".to_string()]).unwrap();
         assert_eq!(plan.aur_strata, vec![vec!["brave-bin".to_string()]]);
     }
 
@@ -587,10 +580,7 @@ mod tests {
     #[test]
     fn installed_transitive_aur_dep_is_still_dropped() {
         let idx = IndexFile {
-            entries: vec![
-                entry("client", &[], &["helper"]),
-                entry("helper", &[], &[]),
-            ],
+            entries: vec![entry("client", &[], &["helper"]), entry("helper", &[], &[])],
             ..IndexFile::empty()
         };
         let by = Secondary::build(&idx);

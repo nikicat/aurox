@@ -201,7 +201,9 @@ fn read_blob(mirror: &MirrorRepo, tree: &gix::Tree<'_>, name: &str) -> Result<Op
         .repo
         .find_object(oid)
         .map_err(|e| Error::Gix(format!("find {name} blob: {e}")))?;
-    Ok(Some(String::from_utf8_lossy(blob.data.as_slice()).into_owned()))
+    Ok(Some(
+        String::from_utf8_lossy(blob.data.as_slice()).into_owned(),
+    ))
 }
 
 fn print_unified(old: &str, new: &str) {
@@ -303,10 +305,16 @@ mod highlight {
             let src = "pkgname=foo\npkgver=1.2.3\n\nbuild() {\n    cd \"$srcdir/$pkgname-$pkgver\"  # comment\n    make\n}\n";
             let out = render(src, true);
             assert!(out.contains("\u{1b}["), "expected ANSI escapes: {out:?}");
-            assert!(out.ends_with("\u{1b}[0m\n"), "missing final reset+nl: {out:?}");
+            assert!(
+                out.ends_with("\u{1b}[0m\n"),
+                "missing final reset+nl: {out:?}"
+            );
             // Strip the trailing reset before comparing, since strip_ansi_codes
             // leaves the surrounding text alone.
-            assert_eq!(strip_ansi_codes(&out).trim_end_matches('\n'), src.trim_end_matches('\n'));
+            assert_eq!(
+                strip_ansi_codes(&out).trim_end_matches('\n'),
+                src.trim_end_matches('\n')
+            );
         }
 
         #[test]
@@ -332,7 +340,10 @@ mod highlight {
         fn utf8_in_pkgdesc_does_not_panic() {
             let src = "pkgdesc=\"héllo wörld — 漢字\"\n";
             let out = render(src, true);
-            assert_eq!(strip_ansi_codes(&out).trim_end_matches('\n'), src.trim_end_matches('\n'));
+            assert_eq!(
+                strip_ansi_codes(&out).trim_end_matches('\n'),
+                src.trim_end_matches('\n')
+            );
         }
     }
 }

@@ -267,9 +267,7 @@ fn run_aur_pipeline(
 
     // Phase 2: makepkg approved pkgbases, install per-stratum so later
     // strata's makepkg finds earlier strata's deps in localdb.
-    for (stratum_idx, (stratum, preps)) in
-        plan.aur_strata.iter().zip(prep_strata).enumerate()
-    {
+    for (stratum_idx, (stratum, preps)) in plan.aur_strata.iter().zip(prep_strata).enumerate() {
         if plan.aur_strata.len() > 1 {
             ui::info(&format!(
                 "build stratum {}/{}: {}",
@@ -394,17 +392,11 @@ fn prepare_one<'a>(
         .pkgnames
         .iter()
         .find_map(|p| pac.installed_version(&p.name));
-    let disposition = match review::review(
-        mirror,
-        pkgbase,
-        &new_ver,
-        installed_ver,
-        &wt,
-        noconfirm,
-    )? {
-        review::Outcome::Approved => Disposition::Build,
-        review::Outcome::Skipped => Disposition::Skipped,
-    };
+    let disposition =
+        match review::review(mirror, pkgbase, &new_ver, installed_ver, &wt, noconfirm)? {
+            review::Outcome::Approved => Disposition::Build,
+            review::Outcome::Skipped => Disposition::Skipped,
+        };
     Ok(Prep {
         pkgbase,
         wt,

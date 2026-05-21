@@ -320,13 +320,7 @@ fn col_widths(rows: &[&PkgUpgrade]) -> (usize, usize, usize) {
 
 /// Format one upgrade row at the given column widths. Shared by the static
 /// `upgrade_table` and the interactive picker so both stay visually identical.
-fn render_row(
-    u: &PkgUpgrade,
-    repo_w: usize,
-    name_w: usize,
-    old_w: usize,
-    colored: bool,
-) -> String {
+fn render_row(u: &PkgUpgrade, repo_w: usize, name_w: usize, old_w: usize, colored: bool) -> String {
     if !colored {
         return format!(
             "{repo:<repo_w$}  {name:<name_w$}  {old:<old_w$}  ->  {new}",
