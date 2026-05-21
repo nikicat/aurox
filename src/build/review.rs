@@ -13,7 +13,6 @@ use crate::index::srcinfo;
 use crate::mirror::worktree::Worktree;
 use crate::mirror::MirrorRepo;
 use crate::ui;
-use console::style;
 use dialoguer::Select;
 use gix::ObjectId;
 use std::process::Command;
@@ -120,30 +119,29 @@ fn edit_pkgbuild(wt: &Worktree) -> Result<()> {
 }
 
 /// Show a line-diff of `PKGBUILD` between `base` and the freshly-materialized
-/// worktree's commit. Listing every other changed path is left to the user —
-/// they have a real linked worktree, so plain `git diff` works there.
+/// worktree's commit. Delegates to the user's `git diff` (so their configured
+/// pager / external differ — delta, diff-so-fancy, difftastic, etc. — kicks
+/// in automatically when stdout is a TTY). Listing every other changed path
+/// is left to the user — they have a real linked worktree where plain
+/// `git diff` works.
 fn show_diff(mirror: &MirrorRepo, wt: &Worktree, base: ObjectId) -> Result<()> {
-    let old_tree = mirror
-        .repo
-        .find_commit(base)
-        .map_err(|e| Error::Gix(format!("find_commit {base}: {e}")))?
-        .tree()
-        .map_err(|e| Error::Gix(format!("old tree: {e}")))?;
-    let new_tree = mirror
-        .repo
-        .find_commit(wt.head_oid)
-        .map_err(|e| Error::Gix(format!("find_commit {}: {e}", wt.head_oid)))?
-        .tree()
-        .map_err(|e| Error::Gix(format!("new tree: {e}")))?;
-
-    let old_text = read_blob(mirror, &old_tree, "PKGBUILD")?.unwrap_or_default();
-    let new_text = read_blob(mirror, &new_tree, "PKGBUILD")?.unwrap_or_default();
-    if old_text == new_text {
-        ui::note("PKGBUILD unchanged");
-        return Ok(());
+    // `git diff` exits 0 when there are no differences and 1 when there are
+    // — both are success. Any other status (or a spawn failure) is a real
+    // error worth surfacing.
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(&mirror.path)
+        .arg("diff")
+        .arg(base.to_string())
+        .arg(wt.head_oid.to_string())
+        .args(["--", "PKGBUILD"])
+        .status()
+        .map_err(|e| Error::other(format!("spawn git diff: {e}")))?;
+    match status.code() {
+        Some(0 | 1) => Ok(()),
+        Some(c) => Err(Error::other(format!("git diff exited {c}"))),
+        None => Err(Error::other("git diff terminated by signal".to_string())),
     }
-    print_unified(&old_text, &new_text);
-    Ok(())
 }
 
 /// Walk the AUR branch back from `head_oid` looking for the commit whose
@@ -204,17 +202,6 @@ fn read_blob(mirror: &MirrorRepo, tree: &gix::Tree<'_>, name: &str) -> Result<Op
     Ok(Some(
         String::from_utf8_lossy(blob.data.as_slice()).into_owned(),
     ))
-}
-
-fn print_unified(old: &str, new: &str) {
-    use similar_minimal::diff;
-    for op in diff(old, new) {
-        match op {
-            similar_minimal::Op::Keep(line) => println!(" {line}"),
-            similar_minimal::Op::Add(line) => println!("{}", style(format!("+{line}")).green()),
-            similar_minimal::Op::Remove(line) => println!("{}", style(format!("-{line}")).red()),
-        }
-    }
 }
 
 mod highlight {
@@ -345,61 +332,5 @@ mod highlight {
                 src.trim_end_matches('\n')
             );
         }
-    }
-}
-
-mod similar_minimal {
-    //! Tiny LCS-based unified-diff renderer (just enough for PKGBUILD review).
-    //! We avoid pulling the full `similar` crate for this one use.
-
-    pub enum Op {
-        Keep(String),
-        Add(String),
-        Remove(String),
-    }
-
-    #[allow(clippy::many_single_char_names)] // standard LCS variable naming
-    pub fn diff(a: &str, b: &str) -> Vec<Op> {
-        let a: Vec<&str> = a.lines().collect();
-        let b: Vec<&str> = b.lines().collect();
-        let n = a.len();
-        let m = b.len();
-        // LCS table.
-        let mut lcs = vec![vec![0u32; m + 1]; n + 1];
-        for i in 0..n {
-            for j in 0..m {
-                lcs[i + 1][j + 1] = if a[i] == b[j] {
-                    lcs[i][j] + 1
-                } else {
-                    lcs[i + 1][j].max(lcs[i][j + 1])
-                };
-            }
-        }
-        // Walk back to produce ops.
-        let mut out = Vec::new();
-        let (mut i, mut j) = (n, m);
-        while i > 0 && j > 0 {
-            if a[i - 1] == b[j - 1] {
-                out.push(Op::Keep(a[i - 1].to_string()));
-                i -= 1;
-                j -= 1;
-            } else if lcs[i][j - 1] >= lcs[i - 1][j] {
-                out.push(Op::Add(b[j - 1].to_string()));
-                j -= 1;
-            } else {
-                out.push(Op::Remove(a[i - 1].to_string()));
-                i -= 1;
-            }
-        }
-        while i > 0 {
-            out.push(Op::Remove(a[i - 1].to_string()));
-            i -= 1;
-        }
-        while j > 0 {
-            out.push(Op::Add(b[j - 1].to_string()));
-            j -= 1;
-        }
-        out.reverse();
-        out
     }
 }
