@@ -35,7 +35,7 @@ cargo install --path . --locked
 | `gitaur -Syu`           | `pacman -Syu`, then AUR upgrades                              |
 | `gitaur -Ss <regex>`    | Search the AUR by name / desc / provides                      |
 | `gitaur -Si <pkg>`      | Show package info                                             |
-| `gitaur -Sc` / `-Scc`   | Clean built worktrees; `-Scc` also drops the build state DB   |
+| `gitaur -Sc` / `-Scc`   | Remove built worktrees + pass `-Sc`/`-Scc` through to `pacman` |
 | `gitaur -Rns <pkg>`     | Forwarded to `pacman` unchanged                               |
 
 Global flags: `--devel` (include `-git`/`-svn`/`-hg`/`-bzr` in `-Syu`), `--noconfirm`, `--asdeps`, `--color {auto,always,never}`.
@@ -72,9 +72,8 @@ review_default       = "prompt"    # or "skip" / "always-show"
 ```
 ~/.local/state/gitaur/
 ├── aur/              bare clone of the AUR mirror (~2 GiB)
-├── pkgs/<pkgbase>/   per-pkgbase git worktree, kept until -Sc
-├── index.bin         rkyv-archived index, mmap'd at load (~60–80 MB)
-└── state.db          SQLite: last-built commit OID per pkgbase
+├── pkgs/<pkgbase>/   per-pkgbase git worktree + cached .pkg.tar.zst, kept until -Sc
+└── index.bin         rkyv-archived index, mmap'd at load (~60–80 MB)
 
 ~/.config/gitaur/config.toml  optional
 ```
@@ -85,7 +84,7 @@ review_default       = "prompt"    # or "skip" / "always-show"
 - **Incremental refresh.** `git fetch` reports changed refs; only those are re-indexed.
 - **Zero-copy index.** `index.bin` is a `rkyv` archive, mmap'd directly — no parse step on load.
 - **One sudo prompt per install.** Repo deps go in via a single batched `pacman -S`; built `.pkg.tar.zst`s go in via a single batched `pacman -U` at the very end. No keepalive loop.
-- **Idempotent builds.** A pkgbase whose state DB OID matches the branch tip and whose `.pkg.tar.zst` is still on disk is skipped, so re-running after declining the install just replays the install step.
+- **Idempotent builds.** A pkgbase whose worktree already holds a `.pkg.tar.zst` at the AUR index's exact `[epoch:]pkgver-pkgrel` for every required pkgname is skipped, so re-running after declining the install just replays the install step. No sidecar DB — the artifact filename is the cache key.
 
 ## Development
 
