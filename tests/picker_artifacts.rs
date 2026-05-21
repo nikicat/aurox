@@ -11,11 +11,8 @@
 //! plain widths, so the clear count matches what was drawn.
 //!
 //! This test drives the headless `picker_e2e` example inside a real PTY,
-//! optionally wrapped in `podman` for a pinned `$TERM`/locale/size, prints
-//! sentinel lines before the picker, scrolls past the visible area, and
-//! asserts the sentinels are still on screen afterwards. Runs only with
-//! `cargo test -- --ignored` because it shells out to `cargo build` and
-//! optionally `podman`.
+//! prints sentinel lines before the picker, scrolls past the visible area,
+//! and asserts the sentinels are still on screen afterwards.
 
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
@@ -41,18 +38,8 @@ const SENTINEL_COUNT: usize = 5;
 const SCROLL_KEYS: usize = 10;
 
 #[test]
-#[ignore = "spawns cargo/podman + PTY; run with `cargo test -- --ignored`"]
 fn picker_redraw_preserves_lines_above() {
     let example = ensure_example_built();
-    let Some((program, args)) = resolve_runner(&example) else {
-        eprintln!(
-            "SKIP: GITAUR_E2E_PICKER=podman selected but `podman` or the \
-             `gitaur-test:latest` image is unavailable; run \
-             tests/container/run.sh --rebuild first, or unset \
-             GITAUR_E2E_PICKER to fall back to host PTY."
-        );
-        return;
-    };
 
     let pty = NativePtySystem::default()
         .openpty(PtySize {
@@ -63,10 +50,7 @@ fn picker_redraw_preserves_lines_above() {
         })
         .expect("openpty");
 
-    let mut cmd = CommandBuilder::new(&program);
-    for a in &args {
-        cmd.arg(a);
-    }
+    let mut cmd = CommandBuilder::new(&example);
     cmd.env("PICKER_E2E_SENTINELS", SENTINEL_COUNT.to_string());
     cmd.env("TERM", "xterm-256color");
     cmd.env("NO_COLOR", ""); // make sure nothing in the chain forces it off
@@ -133,60 +117,6 @@ fn ensure_example_built() -> PathBuf {
     let path = target_dir.join("debug/examples/picker_e2e");
     assert!(path.exists(), "missing built example: {}", path.display());
     path
-}
-
-/// Decide whether to run the example directly or inside `podman`. Default
-/// is host PTY (no extra setup). Set `GITAUR_E2E_PICKER=podman` to require
-/// the container path (returns `None` if podman or the image isn't there,
-/// so the caller can skip cleanly).
-fn resolve_runner(example: &std::path::Path) -> Option<(String, Vec<String>)> {
-    match std::env::var("GITAUR_E2E_PICKER").as_deref() {
-        Ok("podman") => {
-            if !podman_image_present() {
-                return None;
-            }
-            let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            // Mount the repo so the just-built example is visible inside
-            // the container at the same relative path.
-            let inside_path = format!(
-                "/work/{}",
-                example
-                    .strip_prefix(&repo)
-                    .expect("example under manifest dir")
-                    .display()
-            );
-            let args = vec![
-                "run".into(),
-                "--rm".into(),
-                "-i".into(),
-                "-t".into(),
-                "-v".into(),
-                format!("{}:/work:ro", repo.display()),
-                "-w".into(),
-                "/work".into(),
-                "-e".into(),
-                format!("PICKER_E2E_SENTINELS={SENTINEL_COUNT}"),
-                "gitaur-test:latest".into(),
-                inside_path,
-            ];
-            Some(("podman".into(), args))
-        }
-        _ => Some((example.to_string_lossy().into_owned(), Vec::new())),
-    }
-}
-
-fn podman_image_present() -> bool {
-    if std::process::Command::new("podman")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        return false;
-    }
-    std::process::Command::new("podman")
-        .args(["image", "exists", "gitaur-test:latest"])
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 /// Spawn a thread that pulls bytes off the PTY master into a channel. Set
