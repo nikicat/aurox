@@ -11,93 +11,29 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::secondary::Secondary;
-use crate::index::{self, IndexEntry, IndexFile};
+use crate::index::{self, IndexFile};
 use crate::mirror::{self, MirrorRepo};
 use crate::pacman::alpm_db::{self, PacmanIndex};
-use crate::pacman::invoke::PkgUpgrade;
-use crate::pacman::{invoke, vercmp};
+use crate::pacman::invoke;
 use crate::paths;
 use crate::resolver::{self, Plan};
 use crate::ui;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use tracing::{debug, info, instrument, warn};
 
 pub mod install;
 pub mod makepkg;
+pub mod print;
 pub mod review;
+pub mod upgrade;
+
+pub use upgrade::{cmd_query_upgrades, collect_upgrade_plan};
 
 /// One built pkgbase's set of `.pkg.tar.zst` outputs.
 struct BuiltPkg {
     pkgbase: String,
     files: Vec<PathBuf>,
-}
-
-/// Render the resolved [`Plan`] to stderr as aligned `name  version` tables
-/// — one group per source — mirroring the style of [`ui::upgrade_table`] used
-/// by `-Su`. Versions are looked up live from `pac` (sync DBs) and `idx`
-/// (AUR index), so the plan answers "which exact version would land?" for
-/// every row before the user confirms.
-fn print_plan(plan: &Plan, idx: &IndexFile, pac: &PacmanIndex) {
-    if plan.direct_repo.is_empty() && plan.transitive_repo.is_empty() && plan.aur_strata.is_empty()
-    {
-        ui::info("plan: nothing to do");
-        return;
-    }
-    if !plan.direct_repo.is_empty() {
-        ui::install_table(
-            "Repo packages (explicit)",
-            &rows_for_repo(&plan.direct_repo, pac),
-        );
-    }
-    if !plan.transitive_repo.is_empty() {
-        ui::install_table(
-            "Repo dependencies",
-            &rows_for_repo(&plan.transitive_repo, pac),
-        );
-    }
-    if !plan.aur_strata.is_empty() {
-        let total = plan.aur_strata.len();
-        if total == 1 {
-            ui::install_table("AUR build order", &rows_for_aur(&plan.aur_strata[0], idx));
-        } else {
-            for (i, stratum) in plan.aur_strata.iter().enumerate() {
-                ui::install_table(
-                    &format!("AUR build stratum {}/{total}", i + 1),
-                    &rows_for_aur(stratum, idx),
-                );
-            }
-        }
-    }
-}
-
-/// Pair each repo pkgname with its sync-repo version. A name that only
-/// matched via a virtual `provides` won't carry a version of its own (pacman
-/// will choose a concrete provider at install time); render an empty version
-/// cell rather than guessing.
-fn rows_for_repo(names: &[String], pac: &PacmanIndex) -> Vec<(String, String)> {
-    names
-        .iter()
-        .map(|n| (n.clone(), pac.sync_version(n).unwrap_or("").to_string()))
-        .collect()
-}
-
-/// Pair each AUR pkgbase with its index version (`[epoch:]pkgver-pkgrel`).
-/// All pkgnames in a split pkgbase share that version, so the pkgbase row
-/// is unambiguous even when only a subset of pkgnames will be installed.
-fn rows_for_aur(pkgbases: &[String], idx: &IndexFile) -> Vec<(String, String)> {
-    pkgbases
-        .iter()
-        .map(|pb| {
-            let ver = idx
-                .entries
-                .iter()
-                .find(|e| e.pkgbase == *pb)
-                .map(IndexEntry::version)
-                .unwrap_or_default();
-            (pb.clone(), ver)
-        })
-        .collect()
 }
 
 /// Entry point for `gitaur -S <targets>`.
@@ -163,7 +99,7 @@ pub fn cmd_install(
     // `.pkg.tar.zst` Explicit instead of `--asdeps`.
     plan.direct_targets.extend(expanded.direct_pkgnames);
 
-    print_plan(&plan, idx, &pac);
+    print::plan(&plan, idx, &pac);
 
     if plan.direct_repo.is_empty() && plan.transitive_repo.is_empty() && plan.aur_strata.is_empty()
     {
@@ -308,7 +244,7 @@ fn run_aur_pipeline(
         }
     }
 
-    print_final_summary(&report);
+    print::final_summary(&report);
     Ok(u8::from(report.had_failures()))
 }
 
@@ -400,20 +336,20 @@ fn commit_stratum(
 }
 
 /// Per-pkgbase outcome aggregated across all strata, used to drive both the
-/// dep-skip logic and the final summary.
+/// dep-skip logic and the final summary (see `print::final_summary`).
 #[derive(Default)]
-struct RunReport {
+pub(super) struct RunReport {
     /// Successfully built (or reused from cache) and installed by `pacman -U`.
-    installed: Vec<String>,
+    pub(super) installed: Vec<String>,
     /// makepkg or the stratum's `pacman -U` returned non-zero. Value is the
     /// stringified error so the summary can quote it back.
-    failed: HashMap<String, String>,
+    pub(super) failed: HashMap<String, String>,
     /// User chose "skip" at the PKGBUILD review prompt.
-    skipped_user: Vec<String>,
+    pub(super) skipped_user: Vec<String>,
     /// Auto-skipped because a pkgbase earlier in the build graph failed.
     /// Value is the immediate blocker — usually enough to debug since the
     /// blocker itself shows up in `failed`.
-    skipped_dep: HashMap<String, String>,
+    pub(super) skipped_dep: HashMap<String, String>,
 }
 
 impl RunReport {
@@ -439,38 +375,6 @@ fn blocking_dep<'a>(
         }
     }
     None
-}
-
-/// Print a per-pkgbase outcome summary at the end of a multi-pkgbase run.
-/// Skips itself for the trivial single-pkgbase happy path where the failure
-/// message above already says everything.
-fn print_final_summary(report: &RunReport) {
-    let total = report.installed.len()
-        + report.failed.len()
-        + report.skipped_user.len()
-        + report.skipped_dep.len();
-    if total < 2 {
-        return;
-    }
-    ui::info("build summary");
-    if !report.installed.is_empty() {
-        ui::note(&format!(
-            "installed ({}): {}",
-            report.installed.len(),
-            report.installed.join(" ")
-        ));
-    }
-    for pb in &report.skipped_user {
-        ui::note(&format!("skipped {pb} (user)"));
-    }
-    let dep_sorted: BTreeMap<&String, &String> = report.skipped_dep.iter().collect();
-    for (pb, blocker) in dep_sorted {
-        ui::warn(&format!("skipped {pb} (blocked by {blocker})"));
-    }
-    let failed_sorted: BTreeMap<&String, &String> = report.failed.iter().collect();
-    for (pb, msg) in failed_sorted {
-        ui::error(&format!("failed {pb}: {msg}"));
-    }
 }
 
 /// One pkgbase's prepared state, produced in phase 1 and consumed in phase 2.
@@ -658,68 +562,6 @@ fn install_stratum(
     Ok(())
 }
 
-/// Scan the localdb for foreign pkgs with a newer version in the AUR index.
-///
-/// `devel=true` forces every VCS pkgbase (`-git`/`-svn`/`-hg`/`-bzr`) into
-/// the list regardless of vercmp, since their `pkgver` is only refreshed by
-/// `makepkg`. Otherwise VCS pkgs are skipped (their on-disk version always
-/// looks stale).
-fn aur_upgrades(
-    idx: &IndexFile,
-    by: &Secondary,
-    pac: &PacmanIndex,
-    devel: bool,
-) -> Vec<PkgUpgrade> {
-    let mut out = Vec::new();
-    for (name, installed_ver) in pac.foreign() {
-        let Some(entry) = by.lookup(idx, &name) else {
-            warn!(name, "foreign pkg not in AUR index");
-            continue;
-        };
-        let is_vcs = is_vcs_pkg(&entry.pkgbase);
-        if !devel && is_vcs {
-            continue;
-        }
-        let aur_ver = entry.version();
-        let need = (devel && is_vcs) || vercmp::is_outdated(&installed_ver, &aur_ver);
-        if need {
-            out.push(PkgUpgrade {
-                repo: invoke::REPO_AUR.into(),
-                name,
-                old_ver: installed_ver,
-                new_ver: aur_ver,
-            });
-        }
-    }
-    out
-}
-
-/// `gitaur -Qu` — show the union of pacman-repo and AUR upgrade candidates
-/// in one flat, severity-sorted table grouped by `repo` column. Read-only
-/// and unprivileged (no sudo), so safe to call both as the bare `-Qu` and
-/// as a preview before `-Syu` runs.
-#[instrument]
-pub fn cmd_query_upgrades(devel: bool) -> Result<u8> {
-    ui::upgrade_table(&collect_upgrade_plan(devel)?);
-    Ok(0)
-}
-
-/// Gather the merged repo + AUR upgrade list. Shared by `-Qu` (read-only
-/// rendering) and `-Syu` (feeds the interactive picker). Unprivileged —
-/// reads alpm and the AUR index file only.
-pub fn collect_upgrade_plan(devel: bool) -> Result<Vec<PkgUpgrade>> {
-    let mut plan = invoke::query_repo_upgrades()?;
-    let idx_path = paths::index_path();
-    if idx_path.exists() {
-        let idx = index::load(&idx_path)?;
-        let by = Secondary::build(&idx);
-        let alpm = alpm_db::open()?;
-        let pac = PacmanIndex::build(&alpm);
-        plan.extend(aur_upgrades(&idx, &by, &pac, devel));
-    }
-    Ok(plan)
-}
-
 /// Entry point for `-Sc` / `-Scc`. The depth of pacman's own cache cleanup is
 /// already encoded in `argv`; gitaur just wipes its per-pkgbase worktrees
 /// (idempotency cache lives entirely inside them as the produced
@@ -739,26 +581,9 @@ pub fn cmd_clean(cfg: &Config, argv: &[String]) -> Result<u8> {
     Ok(0)
 }
 
-fn is_vcs_pkg(pkgbase: &str) -> bool {
-    pkgbase.ends_with("-git")
-        || pkgbase.ends_with("-svn")
-        || pkgbase.ends_with("-hg")
-        || pkgbase.ends_with("-bzr")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detects_vcs_suffixes() {
-        assert!(is_vcs_pkg("neovim-git"));
-        assert!(is_vcs_pkg("foo-svn"));
-        assert!(is_vcs_pkg("bar-hg"));
-        assert!(is_vcs_pkg("baz-bzr"));
-        assert!(!is_vcs_pkg("neovim"));
-        assert!(!is_vcs_pkg("git-lfs"));
-    }
 
     /// `blocking_dep` is the resilience gate: it answers "should I skip
     /// this pkgbase because something upstream already failed?". A miss

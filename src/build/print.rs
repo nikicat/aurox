@@ -1,0 +1,111 @@
+//! Plan and final-summary presentation helpers for the build pipeline.
+//!
+//! Kept separate from the pipeline itself so the orchestration in
+//! `super` reads as decisions + state mutation, not ui formatting.
+
+use crate::index::{IndexEntry, IndexFile};
+use crate::pacman::alpm_db::PacmanIndex;
+use crate::resolver::Plan;
+use crate::ui;
+use std::collections::BTreeMap;
+
+use super::RunReport;
+
+/// Render the resolved [`Plan`] to stderr as aligned `name  version` tables
+/// — one group per source — mirroring the style of [`ui::upgrade_table`] used
+/// by `-Su`. Versions are looked up live from `pac` (sync DBs) and `idx`
+/// (AUR index), so the plan answers "which exact version would land?" for
+/// every row before the user confirms.
+pub(super) fn plan(plan: &Plan, idx: &IndexFile, pac: &PacmanIndex) {
+    if plan.direct_repo.is_empty() && plan.transitive_repo.is_empty() && plan.aur_strata.is_empty()
+    {
+        ui::info("plan: nothing to do");
+        return;
+    }
+    if !plan.direct_repo.is_empty() {
+        ui::install_table(
+            "Repo packages (explicit)",
+            &rows_for_repo(&plan.direct_repo, pac),
+        );
+    }
+    if !plan.transitive_repo.is_empty() {
+        ui::install_table(
+            "Repo dependencies",
+            &rows_for_repo(&plan.transitive_repo, pac),
+        );
+    }
+    if !plan.aur_strata.is_empty() {
+        let total = plan.aur_strata.len();
+        if total == 1 {
+            ui::install_table("AUR build order", &rows_for_aur(&plan.aur_strata[0], idx));
+        } else {
+            for (i, stratum) in plan.aur_strata.iter().enumerate() {
+                ui::install_table(
+                    &format!("AUR build stratum {}/{total}", i + 1),
+                    &rows_for_aur(stratum, idx),
+                );
+            }
+        }
+    }
+}
+
+/// Pair each repo pkgname with its sync-repo version. A name that only
+/// matched via a virtual `provides` won't carry a version of its own (pacman
+/// will choose a concrete provider at install time); render an empty version
+/// cell rather than guessing.
+fn rows_for_repo(names: &[String], pac: &PacmanIndex) -> Vec<(String, String)> {
+    names
+        .iter()
+        .map(|n| (n.clone(), pac.sync_version(n).unwrap_or("").to_string()))
+        .collect()
+}
+
+/// Pair each AUR pkgbase with its index version (`[epoch:]pkgver-pkgrel`).
+/// All pkgnames in a split pkgbase share that version, so the pkgbase row
+/// is unambiguous even when only a subset of pkgnames will be installed.
+fn rows_for_aur(pkgbases: &[String], idx: &IndexFile) -> Vec<(String, String)> {
+    pkgbases
+        .iter()
+        .map(|pb| {
+            let ver = idx
+                .entries
+                .iter()
+                .find(|e| e.pkgbase == *pb)
+                .map(IndexEntry::version)
+                .unwrap_or_default();
+            (pb.clone(), ver)
+        })
+        .collect()
+}
+
+/// Print a per-pkgbase outcome summary at the end of a multi-pkgbase run.
+/// Skips itself for the trivial single-pkgbase happy path where the failure
+/// message above already says everything.
+pub(super) fn final_summary(report: &RunReport) {
+    let total = report.installed.len()
+        + report.failed.len()
+        + report.skipped_user.len()
+        + report.skipped_dep.len();
+    if total < 2 {
+        return;
+    }
+    ui::info("build summary");
+    if !report.installed.is_empty() {
+        ui::note(&format!(
+            "installed ({}): {}",
+            report.installed.len(),
+            report.installed.join(" ")
+        ));
+    }
+    for pb in &report.skipped_user {
+        ui::note(&format!("skipped {pb} (user)"));
+    }
+    let dep_sorted: BTreeMap<&String, &String> = report.skipped_dep.iter().collect();
+    for (pb, blocker) in dep_sorted {
+        ui::warn(&format!("skipped {pb} (blocked by {blocker})"));
+    }
+    let failed_sorted: BTreeMap<&String, &String> = report.failed.iter().collect();
+    for (pb, msg) in failed_sorted {
+        ui::error(&format!("failed {pb}: {msg}"));
+    }
+}
