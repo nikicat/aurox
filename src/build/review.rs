@@ -15,6 +15,7 @@ use crate::mirror::MirrorRepo;
 use crate::ui;
 use dialoguer::Select;
 use gix::ObjectId;
+use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info, instrument};
 
@@ -23,6 +24,10 @@ use tracing::{debug, info, instrument};
 /// the match almost always sits in the first few commits. Bounded to keep
 /// the walk cheap on a very stale install.
 const MAX_HISTORY_SCAN: usize = 64;
+
+/// `git diff --unified=<N>` value for "view full diff" — large enough to
+/// blanket any realistic PKGBUILD so every unchanged line is shown.
+const FULL_DIFF_CONTEXT: u32 = 99_999;
 
 /// What the user decided about this pkgbase. `Aborted` short-circuits the
 /// whole pipeline (propagated as [`Error::UserAbort`] by the caller), so it
@@ -53,31 +58,46 @@ pub fn review(
         return Ok(Outcome::Approved);
     }
 
+    // Initial render runs once — the loop body dispatches user actions and
+    // re-renders only what the user asked for, so picking "view PKGBUILD"
+    // isn't immediately clobbered by re-printing the diff above the prompt.
+    let base = show(mirror, pkgbase, new_ver, installed_ver, wt)?;
+
+    let items = menu_items(base.is_some());
+
     loop {
-        show(mirror, pkgbase, new_ver, installed_ver, wt)?;
         let choice = Select::new()
             .with_prompt(format!("[{pkgbase}] review"))
-            .items(&["proceed", "view PKGBUILD", "edit", "skip", "abort"])
+            .items(&items)
             .default(0)
             .interact()
             .map_err(|e| Error::other(format!("prompt: {e}")))?;
-        match choice {
-            0 => return Ok(Outcome::Approved),
-            1 => show_pkgbuild(wt)?,
-            2 => edit_pkgbuild(wt)?,
-            3 => return Ok(Outcome::Skipped),
-            _ => return Err(Error::UserAbort),
+        match items[choice] {
+            "proceed" => return Ok(Outcome::Approved),
+            "view PKGBUILD" => show_pkgbuild(wt)?,
+            "view full diff" => show_diff(
+                mirror,
+                wt,
+                base.expect("only present when a diff base was found"),
+                Some(FULL_DIFF_CONTEXT),
+            )?,
+            "edit" => edit_pkgbuild(wt)?,
+            "skip" => return Ok(Outcome::Skipped),
+            "abort" => return Err(Error::UserAbort),
+            _ => unreachable!("menu choice out of range"),
         }
     }
 }
 
+/// Print the default review view and return the diff base, if any, so the
+/// caller can decide whether to offer "view full diff".
 fn show(
     mirror: &MirrorRepo,
     pkgbase: &str,
     new_ver: &str,
     installed_ver: Option<&str>,
     wt: &Worktree,
-) -> Result<()> {
+) -> Result<Option<ObjectId>> {
     let header = match installed_ver {
         None => format!("install: {pkgbase} {new_ver}"),
         Some(v) if v == new_ver => format!("reinstall: {pkgbase} {new_ver}"),
@@ -88,16 +108,19 @@ fn show(
     // Fresh install or reinstall: no historic version to diff against, so the
     // full PKGBUILD is the only meaningful review surface.
     let Some(installed) = installed_ver.filter(|v| *v != new_ver) else {
-        return show_pkgbuild(wt);
+        show_pkgbuild(wt)?;
+        return Ok(None);
     };
 
     if let Some(base) = find_installed_commit(mirror, wt.head_oid, installed)? {
-        show_diff(mirror, wt, base)
+        show_diff(mirror, wt, base, None)?;
+        Ok(Some(base))
     } else {
         ui::note(&format!(
             "no AUR commit in the last {MAX_HISTORY_SCAN} matches installed {installed}; showing full PKGBUILD"
         ));
-        show_pkgbuild(wt)
+        show_pkgbuild(wt)?;
+        Ok(None)
     }
 }
 
@@ -124,17 +147,20 @@ fn edit_pkgbuild(wt: &Worktree) -> Result<()> {
 /// in automatically when stdout is a TTY). Listing every other changed path
 /// is left to the user — they have a real linked worktree where plain
 /// `git diff` works.
-fn show_diff(mirror: &MirrorRepo, wt: &Worktree, base: ObjectId) -> Result<()> {
+///
+/// `context = None` lets git apply its default (and any user `diff.context`
+/// override); `Some(n)` forces a `--unified=n` cap — used by "view full diff"
+/// to drop the unchanged-line elision so reviewers can see every line.
+fn show_diff(
+    mirror: &MirrorRepo,
+    wt: &Worktree,
+    base: ObjectId,
+    context: Option<u32>,
+) -> Result<()> {
     // `git diff` exits 0 when there are no differences and 1 when there are
     // — both are success. Any other status (or a spawn failure) is a real
     // error worth surfacing.
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(&mirror.path)
-        .arg("diff")
-        .arg(base.to_string())
-        .arg(wt.head_oid.to_string())
-        .args(["--", "PKGBUILD"])
+    let status = diff_command(&mirror.path, base, wt.head_oid, context)
         .status()
         .map_err(|e| Error::other(format!("spawn git diff: {e}")))?;
     match status.code() {
@@ -142,6 +168,38 @@ fn show_diff(mirror: &MirrorRepo, wt: &Worktree, base: ObjectId) -> Result<()> {
         Some(c) => Err(Error::other(format!("git diff exited {c}"))),
         None => Err(Error::other("git diff terminated by signal".to_string())),
     }
+}
+
+/// Build the `git diff` command used for review. Split out so tests can
+/// assert the argument shape without spawning git.
+fn diff_command(
+    mirror_path: &Path,
+    base: ObjectId,
+    head: ObjectId,
+    context: Option<u32>,
+) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(mirror_path).arg("diff");
+    if let Some(n) = context {
+        cmd.arg(format!("--unified={n}"));
+    }
+    cmd.arg(base.to_string())
+        .arg(head.to_string())
+        .args(["--", "PKGBUILD"]);
+    cmd
+}
+
+/// Review menu items, ordered so the default (index 0) is "proceed". The
+/// "view full diff" entry only appears when there is a diff base to render
+/// against — on install/reinstall the initial view is already the whole
+/// PKGBUILD, so a full-context diff would be redundant.
+fn menu_items(has_diff: bool) -> Vec<&'static str> {
+    let mut items = vec!["proceed", "view PKGBUILD"];
+    if has_diff {
+        items.push("view full diff");
+    }
+    items.extend_from_slice(&["edit", "skip", "abort"]);
+    items
 }
 
 /// Walk the AUR branch back from `head_oid` looking for the commit whose
@@ -188,6 +246,93 @@ pub fn find_installed_commit(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{diff_command, menu_items, FULL_DIFF_CONTEXT};
+    use gix::hash::Kind;
+    use gix::ObjectId;
+    use std::path::Path;
+
+    fn args_of(cmd: &std::process::Command) -> Vec<String> {
+        cmd.get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn menu_omits_full_diff_when_no_base() {
+        assert_eq!(
+            menu_items(false),
+            ["proceed", "view PKGBUILD", "edit", "skip", "abort"]
+        );
+    }
+
+    #[test]
+    fn menu_inserts_full_diff_next_to_view_pkgbuild() {
+        let items = menu_items(true);
+        assert_eq!(
+            items,
+            [
+                "proceed",
+                "view PKGBUILD",
+                "view full diff",
+                "edit",
+                "skip",
+                "abort"
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_default_index_is_proceed() {
+        // The Select prompt uses index 0 as the default; both menu shapes
+        // must keep "proceed" there so hitting enter never picks a destructive
+        // or surprising action.
+        assert_eq!(menu_items(false)[0], "proceed");
+        assert_eq!(menu_items(true)[0], "proceed");
+    }
+
+    #[test]
+    fn diff_command_default_omits_unified_flag() {
+        // No `--unified=N` means git falls back to its default (and the user's
+        // `diff.context` config), matching the pre-refactor behavior.
+        let zero = ObjectId::null(Kind::Sha1);
+        let cmd = diff_command(Path::new("/tmp/m"), zero, zero, None);
+        let args = args_of(&cmd);
+        assert!(
+            !args.iter().any(|a| a.starts_with("--unified")),
+            "expected no --unified flag, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn diff_command_full_context_passes_large_unified() {
+        let zero = ObjectId::null(Kind::Sha1);
+        let cmd = diff_command(Path::new("/tmp/m"), zero, zero, Some(FULL_DIFF_CONTEXT));
+        let args = args_of(&cmd);
+        assert!(
+            args.iter().any(|a| a == "--unified=99999"),
+            "expected --unified=99999, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn diff_command_targets_pkgbuild_in_mirror() {
+        let zero = ObjectId::null(Kind::Sha1);
+        let cmd = diff_command(Path::new("/var/lib/gitaur/foo.git"), zero, zero, None);
+        let args = args_of(&cmd);
+        assert_eq!(args.first().map(String::as_str), Some("-C"));
+        assert_eq!(
+            args.get(1).map(String::as_str),
+            Some("/var/lib/gitaur/foo.git")
+        );
+        assert_eq!(args.get(2).map(String::as_str), Some("diff"));
+        // Pathspec separator and target file at the tail.
+        let tail: Vec<&str> = args.iter().rev().take(2).map(String::as_str).collect();
+        assert_eq!(tail, ["PKGBUILD", "--"]);
+    }
 }
 
 fn read_blob(mirror: &MirrorRepo, tree: &gix::Tree<'_>, name: &str) -> Result<Option<String>> {
