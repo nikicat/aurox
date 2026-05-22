@@ -310,6 +310,83 @@ walk        = match → diff
   `replaces` doesn't exist but isn't needed — AUR maintainers
   overwhelmingly declare `replaces` at the pkgbase level.
 
+#### Counterpart hint — disambiguating multi-provides pkgbases
+
+The unhinted walk above picks the **first declared** match within each
+tier. That's good enough for pkgname / replaces tiers (a split pkgbase
+with multiple installed siblings labels identically with any of them).
+The Provides tier breaks down when a pkgbase declares several
+`provides=` virtuals and the user has more than one installed.
+
+> Code: `Target` (`src/build.rs`), `ExpandedTargets::counterpart_hints`
+> (`src/resolver/pkgbase_expand.rs`), `Plan::counterpart_hints`
+> (`src/resolver.rs`), `PacmanIndex::counterpart_with_hint`
+> (`src/pacman/alpm_db.rs`).
+
+`gitaur::build::Target` pairs each input with an optional
+`hint: Option<PkgName>` — the pkgname the user thinks they have
+installed. Two sources populate it:
+
+| Source       | Hint                                                                 |
+| ------------ | -------------------------------------------------------------------- |
+| `-S <name>`  | `None` — `expand_pkgbase_targets` derives it from the spec on rewrite |
+| `-Syu` picker | `Some(PkgUpgrade.name)` — the foreign pkgname that triggered the upgrade |
+
+`expand_pkgbase_targets` records `hints[pkgbase] = hint_or_inferred`
+whenever it rewrites a target via the pkgname or provides path
+(bare-pkgbase inputs without an explicit hint stay unhinted because the
+user didn't name a pkgname). `prepare_one` reads
+`plan.counterpart_hints[pkgbase]` and forwards it to
+`PacmanIndex::counterpart_with_hint`.
+
+`counterpart_with_hint` first probes the entry for the hinted pkgname:
+if it matches a pkgname / replaces / provides line *and* is installed,
+that's the counterpart with the appropriate provenance. Otherwise it
+falls back to the unhinted walk — so a stale or unmatched hint doesn't
+silently nullify a real counterpart.
+
+#### Worked example: `dotnet-runtime-7.0` regression
+
+```
+AUR pkgbase = dotnet-core-7.0-bin
+  provides  = aspnet-runtime, dotnet-runtime-7.0   # declaration order
+localdb     = { aspnet-runtime@10.0-1, dotnet-runtime-7.0@7.0.20-1 }
+-Syu row    = PkgUpgrade { name: "dotnet-runtime-7.0", … }
+```
+
+Without a hint, the unhinted walk picks `aspnet-runtime` (first
+declared) — the screen shows "install: dotnet-core-7.0-bin 7.0.20.sdk410-2"
+with no diff, because the new pkgbase's history doesn't carry a commit
+matching aspnet-runtime's 10.0-1.
+
+With the hint plumbed through:
+
+```
+Target { spec: "dotnet-runtime-7.0", hint: Some("dotnet-runtime-7.0") }
+→ expand sees provides hit, records hints["dotnet-core-7.0-bin"] = "dotnet-runtime-7.0"
+→ prepare_one: counterpart_with_hint(entry, Some("dotnet-runtime-7.0"))
+→ counterpart_for_hint: dotnet-runtime-7.0 installed + entry provides it → match
+→ header = "upgrade: dotnet-core-7.0-bin 7.0.20-1 → 7.0.20.sdk410-2  [provides dotnet-runtime-7.0]"
+→ walk = matches commit on the new pkgbase → real diff
+```
+
+#### Ambiguity diagnostics
+
+`counterpart_with_hint` emits two `tracing::warn!` diagnostics that
+make future bugs of this shape visible in the trace:
+
+- **`hint diverged from unhinted lookup`** — the hint changed which
+  pkgname the call returned. Useful as a check that the hint plumbing
+  is doing what it should without changing behaviour invisibly.
+- **`multiple installed pkgs match this pkgbase's provides; picking
+  the first declared`** — fired from the unhinted walk when the
+  Provides tier has 2+ installed candidates. Always shows the picked
+  pkgname and the alternatives so the user can spot the dotnet-runtime
+  shape even outside the `-Syu` picker flow.
+
+Neither warning changes behaviour: the picked counterpart is unchanged.
+They exist so the trace tells the truth about a heuristic-driven choice.
+
 ### Why per-worker `gix::Repository` clones in `full_build`?
 
 `gix::Repository` is `Send` but **not** `Sync` — it carries interior

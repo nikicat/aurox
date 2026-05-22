@@ -241,17 +241,37 @@ impl PacmanIndex {
     /// When `hint` is `None` or doesn't match anything in the entry, falls
     /// through to the unhinted walk — semantics preserved for callers that
     /// don't have a hint.
+    ///
+    /// Emits two diagnostic warnings:
+    ///   * **hint divergence** — when the hint changed the picked pkgname
+    ///     from what the unhinted walk would have returned. The unhinted
+    ///     pick was wrong; the hint rescued it. Future bugs of the
+    ///     dotnet-runtime shape will show up in the trace immediately.
+    ///   * **multi-match** — when the unhinted walk has more than one
+    ///     installed candidate in its provides tier. The pick is arbitrary
+    ///     without a hint to disambiguate; logging the alternatives makes
+    ///     "why did review label X instead of Y?" answerable.
     pub fn counterpart_with_hint<'a>(
         &'a self,
         entry: &'a IndexEntry,
         hint: Option<&PkgName>,
     ) -> Option<InstalledCounterpart<'a>> {
-        if let Some(hint) = hint {
-            if let Some(c) = self.counterpart_for_hint(entry, hint) {
-                return Some(c);
+        let unhinted = self.counterpart_unhinted(entry);
+        let result = hint
+            .and_then(|h| self.counterpart_for_hint(entry, h))
+            .or(unhinted);
+        if let (Some(h), Some(r), Some(u)) = (hint, result, unhinted) {
+            if r.pkgname != u.pkgname {
+                tracing::warn!(
+                    pkgbase = %entry.pkgbase,
+                    hint = %h,
+                    hinted = %r.pkgname,
+                    unhinted = %u.pkgname,
+                    "counterpart hint diverged from unhinted lookup",
+                );
             }
         }
-        self.counterpart_unhinted(entry)
+        result
     }
 
     /// Single-hint probe: if `hint` is installed AND the entry references it
@@ -302,7 +322,13 @@ impl PacmanIndex {
     }
 
     /// The original unhinted walk — extracted so the hinted path can fall
-    /// back to it.
+    /// back to it. Pkgname / Replaces tiers short-circuit on the first
+    /// match (multiple installed siblings of a split pkgbase are normal,
+    /// and any of them produces the same review header). The Provides
+    /// tier instead collects *all* matches before picking, so the call can
+    /// emit a `multi-match` warning when more than one provider is
+    /// installed — the dotnet-runtime shape the hint plumbing exists to
+    /// disambiguate.
     fn counterpart_unhinted<'a>(
         &'a self,
         entry: &'a IndexEntry,
@@ -330,28 +356,38 @@ impl PacmanIndex {
                 });
             }
         }
-        // 3. Provides — pkgname-scoped (more specific) before pkgbase-level.
-        for p in &entry.pkgnames {
-            for prov in &p.provides {
-                let name = strip_version_constraint(prov);
-                if let Some((stored_name, version)) = self.installed.get_key_value(name) {
-                    return Some(InstalledCounterpart {
-                        pkgname: stored_name,
-                        version,
-                        via: MatchedVia::Provides,
-                    });
+        // 3. Provides — collect every installed match across pkgname-scoped
+        //    and pkgbase-level provides, preserving declaration order.
+        //    De-dup by stored pkgname (a name appearing both scoped and at
+        //    pkgbase-level is still one installed candidate).
+        let mut provides_matches: Vec<(&PkgName, &str)> = Vec::new();
+        let scoped_provs = entry.pkgnames.iter().flat_map(|p| &p.provides);
+        for prov in scoped_provs.chain(entry.provides.iter()) {
+            let name = strip_version_constraint(prov);
+            if let Some((stored_name, version)) = self.installed.get_key_value(name) {
+                if !provides_matches.iter().any(|(n, _)| *n == stored_name) {
+                    provides_matches.push((stored_name, version));
                 }
             }
         }
-        for prov in &entry.provides {
-            let name = strip_version_constraint(prov);
-            if let Some((stored_name, version)) = self.installed.get_key_value(name) {
-                return Some(InstalledCounterpart {
-                    pkgname: stored_name,
-                    version,
-                    via: MatchedVia::Provides,
-                });
-            }
+        if provides_matches.len() > 1 {
+            let alternatives: Vec<&PkgName> =
+                provides_matches.iter().skip(1).map(|(n, _)| *n).collect();
+            tracing::warn!(
+                pkgbase = %entry.pkgbase,
+                picked = %provides_matches[0].0,
+                ?alternatives,
+                "multiple installed pkgs match this pkgbase's provides; \
+                 picking the first declared. Pass `--target <pkgname>` (or use \
+                 the -Syu picker) to disambiguate.",
+            );
+        }
+        if let Some(&(stored_name, version)) = provides_matches.first() {
+            return Some(InstalledCounterpart {
+                pkgname: stored_name,
+                version,
+                via: MatchedVia::Provides,
+            });
         }
         None
     }
@@ -705,5 +741,51 @@ mod tests {
                 .map(|c| c.pkgname.0.clone()),
             idx.counterpart(&e).map(|c| c.pkgname.0.clone()),
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // Multi-match Provides: behaviour exercise (warning is best-effort
+    // tracing output, so the assertion is on the picked pkgname).
+    // ──────────────────────────────────────────────────────────────────
+
+    /// Two installed pkgs match the same pkgbase's `provides`. The unhinted
+    /// walk picks the first declared (dotnet-core-7.0-bin declares
+    /// aspnet-runtime before dotnet-runtime-7.0 in its PKGBUILD); the
+    /// warning is emitted via `tracing::warn!` so the user sees an audit
+    /// trail when the picked counterpart isn't the obviously right one.
+    #[test]
+    fn unhinted_multi_provides_match_picks_first_declared() {
+        let mut idx = PacmanIndex::default();
+        idx.installed
+            .insert("aspnet-runtime".into(), "10.0-1".into());
+        idx.installed
+            .insert("dotnet-runtime-7.0".into(), "7.0.20-1".into());
+        let e = entry(
+            "dotnet-core-7.0-bin",
+            &[(
+                "dotnet-core-7.0-bin",
+                &["aspnet-runtime", "dotnet-runtime-7.0"],
+            )],
+            &[],
+            &[],
+        );
+        let c = idx.counterpart(&e).unwrap();
+        assert_eq!(c.pkgname, "aspnet-runtime");
+        assert_eq!(c.via, MatchedVia::Provides);
+    }
+
+    /// Scoped + pkgbase-level provides referencing the same installed pkg
+    /// shouldn't count as two distinct matches — they're the same candidate
+    /// declared twice. Tests dedup in the collection step.
+    #[test]
+    fn unhinted_dedup_scoped_and_pkgbase_level_provides() {
+        let mut idx = PacmanIndex::default();
+        idx.installed.insert("only-one".into(), "1-1".into());
+        // The same name appears both pkgname-scoped AND pkgbase-level — the
+        // collector should treat them as one match, not two, so no
+        // multi-match warning fires.
+        let e = entry("foo", &[("foo", &["only-one"])], &[], &["only-one"]);
+        let c = idx.counterpart(&e).unwrap();
+        assert_eq!(c.pkgname, "only-one");
     }
 }
