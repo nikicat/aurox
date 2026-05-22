@@ -8,6 +8,7 @@
 //! — i.e. dialoguer's redraw didn't eat the lines above the prompt.
 
 use gitaur::config::Config;
+use gitaur::names::PkgName;
 use gitaur::pacman::invoke::{PkgUpgrade, REPO_AUR};
 use gitaur::ui::{self, ColorMode};
 use std::io::Write;
@@ -41,7 +42,12 @@ fn main() {
     // to completion (Enter was actually consumed) rather than aborting on a
     // dropped stdin.
     println!("picked-repo={}", sel.repo.join(","));
-    println!("picked-aur={}", sel.aur.join(","));
+    // `Vec<PkgUpgrade>` isn't `Borrow<str>`, so the std `[T]::join` impl
+    // doesn't apply over the rows directly — collect the typed pkgnames
+    // into their own `Vec<PkgName>`, which is. `&PkgName` doesn't have a
+    // `Borrow<str>` impl either, so cloning is the path of least friction.
+    let aur_names: Vec<PkgName> = sel.aur.iter().map(|u| u.name.clone()).collect();
+    println!("picked-aur={}", aur_names.join(","));
 }
 
 fn synthetic_plan(n: usize) -> Vec<PkgUpgrade> {
@@ -52,7 +58,7 @@ fn synthetic_plan(n: usize) -> Vec<PkgUpgrade> {
             } else {
                 "extra".into()
             },
-            name: format!("pkg-{i:02}"),
+            name: PkgName::from(format!("pkg-{i:02}")),
             old_ver: "1.0.0-1".into(),
             new_ver: "1.0.1-1".into(),
         })

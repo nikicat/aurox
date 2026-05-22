@@ -2,6 +2,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::names::PkgName;
 use crate::pacman::alpm_db;
 use crate::pacman::vercmp;
 use std::process::Command;
@@ -19,7 +20,7 @@ pub const REPO_AUR: &str = "aur";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PkgUpgrade {
     pub repo: String,
-    pub name: String,
+    pub name: PkgName,
     pub old_ver: String,
     pub new_ver: String,
 }
@@ -44,7 +45,7 @@ pub fn query_repo_upgrades() -> Result<Vec<PkgUpgrade>> {
             if vercmp::is_outdated(&installed, &avail) {
                 upgrades.push(PkgUpgrade {
                     repo: db.name().to_string(),
-                    name: ipkg.name().to_string(),
+                    name: PkgName::new(ipkg.name()),
                     old_ver: installed,
                     new_ver: avail,
                 });

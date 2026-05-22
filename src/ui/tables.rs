@@ -3,6 +3,7 @@
 
 use super::{color_on, dim};
 use crate::config::Config;
+use crate::names::PkgName;
 use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
 use crate::pacman::verdiff::{self, BumpKind};
 
@@ -106,11 +107,18 @@ pub fn upgrade_table(plan: &[PkgUpgrade]) {
 /// User's choice from the interactive `-Syu` picker. Pkgnames split by where
 /// the caller needs them: `repo` joins `pacman -Syu`'s subset, `repo_skipped`
 /// becomes the `--ignore=` list, `aur` is the queue for `cmd_install`.
+///
+/// `aur` carries the full [`PkgUpgrade`] (not just pkgname) so the user's
+/// installed-version + intent survive the picker → install boundary. The
+/// install pipeline uses the foreign pkgname as the counterpart hint for
+/// review labelling — without it, asking to install a pkgbase whose entry
+/// declares many `provides=` (e.g. .NET's shared `aspnet-runtime` virtual)
+/// would have to guess which installed pkg is the one the user meant.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct UpgradeSelection {
-    pub repo: Vec<String>,
-    pub repo_skipped: Vec<String>,
-    pub aur: Vec<String>,
+    pub repo: Vec<PkgName>,
+    pub repo_skipped: Vec<PkgName>,
+    pub aur: Vec<PkgUpgrade>,
 }
 
 impl UpgradeSelection {
@@ -217,10 +225,13 @@ pub fn select_upgrades(
     for (i, u) in ordered.iter().enumerate() {
         let is_aur = u.repo == REPO_AUR;
         match (is_aur, picked.contains(&i)) {
-            (true, true) => sel.aur.push(u.name.clone()),
+            (true, true) => sel.aur.push((*u).clone()),
             (true, false) => {}
             (false, true) => sel.repo.push(u.name.clone()),
             (false, false) => sel.repo_skipped.push(u.name.clone()),
+            // (sel.repo / repo_skipped are typed `Vec<PkgName>`; the
+            //  pacman -Syu --ignore boundary in `run_repo_upgrade` joins
+            //  them via slice::join which routes through `Borrow<str>`.)
         }
     }
     Ok(sel)
@@ -384,10 +395,7 @@ mod tests {
                 new_ver: "1.1-1".into(),
             },
         ];
-        let sorted: Vec<&str> = sort_for_display(&ups)
-            .iter()
-            .map(|u| u.name.as_str())
-            .collect();
+        let sorted: Vec<&PkgName> = sort_for_display(&ups).iter().map(|u| &u.name).collect();
         assert_eq!(
             sorted,
             ["epoch", "major", "minor", "patch-a", "patch-b", "pkgrel"]
@@ -436,10 +444,7 @@ mod tests {
                 new_ver: "1.0.1-1".into(),
             },
         ];
-        let sorted: Vec<&str> = sort_for_display(&ups)
-            .iter()
-            .map(|u| u.name.as_str())
-            .collect();
+        let sorted: Vec<&PkgName> = sort_for_display(&ups).iter().map(|u| &u.name).collect();
         assert_eq!(
             sorted,
             [

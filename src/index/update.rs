@@ -5,6 +5,7 @@ use crate::index::schema::{IndexEntry, IndexFile};
 use crate::index::srcinfo;
 use crate::mirror::fetch::RefUpdate;
 use crate::mirror::MirrorRepo;
+use crate::names::PkgBase;
 use gix::ObjectId;
 use std::collections::HashMap;
 use tracing::{debug, info, instrument, warn};
@@ -16,7 +17,7 @@ pub fn incremental_update(
     updates: &[RefUpdate],
     idx: &mut IndexFile,
 ) -> Result<()> {
-    let mut by_base: HashMap<String, usize> = idx
+    let mut by_base: HashMap<PkgBase, usize> = idx
         .entries
         .iter()
         .enumerate()
@@ -33,9 +34,11 @@ pub fn incremental_update(
             .unwrap_or(&u.refname)
             .to_string();
 
-        // Ref deleted: drop the entry if we had one.
+        // Ref deleted: drop the entry if we had one. `by_base`'s `Borrow<str>`
+        // impl lets us look up by the raw branch name without allocating a
+        // PkgBase just for the probe.
         let Some(new_oid) = u.new_oid else {
-            if let Some(i) = by_base.remove(&branch) {
+            if let Some(i) = by_base.remove(branch.as_str()) {
                 idx.entries.swap_remove(i);
                 deleted += 1;
                 by_base = idx

@@ -1,5 +1,6 @@
 //! XDG-aware path helpers for gitaur state and config files.
 
+use crate::names::PkgBase;
 use std::cell::RefCell;
 use std::path::PathBuf;
 
@@ -39,9 +40,10 @@ pub fn aur_repo_path() -> PathBuf {
     state_dir().join("aur")
 }
 
-/// Per-pkgbase worktree directory used during builds.
-pub fn pkg_worktree(name: &str) -> PathBuf {
-    state_dir().join("pkgs").join(name)
+/// Per-pkgbase worktree directory used during builds. `PathBuf::join`
+/// consumes `&PkgBase` via its `AsRef<Path>` impl — no string downgrade.
+pub fn pkg_worktree(pkgbase: &PkgBase) -> PathBuf {
+    state_dir().join("pkgs").join(pkgbase)
 }
 
 /// Path to the mmap-loaded rkyv index file.

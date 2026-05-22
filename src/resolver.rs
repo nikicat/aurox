@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::secondary::{self, Secondary};
 use crate::index::IndexFile;
+use crate::names::{PkgBase, PkgName, PkgTarget};
 use crate::pacman::alpm_db::PacmanIndex;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use tracing::{debug, info, instrument};
@@ -16,6 +17,12 @@ pub use classify::{classify, Source};
 pub use pkgbase_expand::{expand_pkgbase_targets, ExpandedTargets};
 
 /// Resolved install plan partitioned by source.
+///
+/// Field types use the typed [`PkgBase`]/[`PkgName`] newtypes wherever the
+/// identity is unambiguous — pkgbase-keyed maps, pkgbase strata, pkgname
+/// selections. `direct_repo` / `transitive_repo` / `direct_targets` stay
+/// `String` because their contents are deliberately mixed (virtual provides,
+/// version-suffixed names, freeform pacman targets).
 #[derive(Debug, Default, Clone)]
 pub struct Plan {
     /// Direct targets the user named that resolve to a sync repo. Installed
@@ -29,14 +36,18 @@ pub struct Plan {
     /// Stratum N is built and `pacman -U`'d before stratum N+1 begins.
     /// Plain runtime `depends` don't constrain build order — they only need
     /// to resolve in the eventual install transaction.
-    pub aur_strata: Vec<Vec<String>>,
+    pub aur_strata: Vec<Vec<PkgBase>>,
     /// AUR pkgbase → AUR pkgbase makedeps (the same edges fed to
     /// `topo::strata`). Lets the build pipeline propagate failures: if A
     /// fails, anything with A in its closure is skipped instead of being
     /// attempted with a missing dep.
-    pub aur_make_edges: HashMap<String, Vec<String>>,
-    /// User-requested top-level targets (pkgnames, not pkgbases).
-    pub direct_targets: HashSet<String>,
+    pub aur_make_edges: HashMap<PkgBase, Vec<PkgBase>>,
+    /// User-requested top-level targets — pre-classification (could be
+    /// pkgname / pkgbase / virtual / version-suffixed), so typed as
+    /// [`PkgTarget`]. Used to flip a `.pkg.tar.zst`'s install reason
+    /// from `--asdeps` to Explicit when the built pkgname matches a
+    /// user target — see [`crate::names::PkgTargetSetExt::contains_pkgname`].
+    pub direct_targets: HashSet<PkgTarget>,
     /// Per-pkgbase pkgname subset for split-package targets where the user
     /// chose to install only some pkgnames. makepkg has no flag to limit
     /// which pkgnames it builds (`package_*()` is all-or-nothing for a
@@ -44,13 +55,13 @@ pub struct Plan {
     /// `.pkg.tar.zst`; this map drives the *install* filter only — only
     /// listed pkgnames are fed into the final `pacman -U`. Pkgbases absent
     /// from the map default to "install everything".
-    pub pkgname_selections: HashMap<String, Vec<String>>,
+    pub pkgname_selections: HashMap<PkgBase, Vec<PkgName>>,
 }
 
 impl Plan {
     /// Flatten all AUR pkgbases in build order. Convenience for code paths
     /// that don't care about stratum boundaries (counts, displays, …).
-    pub fn aur_order(&self) -> Vec<String> {
+    pub fn aur_order(&self) -> Vec<PkgBase> {
         self.aur_strata.iter().flatten().cloned().collect()
     }
 }
@@ -69,7 +80,7 @@ pub fn resolve(
     targets: &[String],
 ) -> Result<Plan> {
     let mut plan = Plan::default();
-    let mut visited_aur: BTreeSet<String> = BTreeSet::new();
+    let mut visited_aur: BTreeSet<PkgBase> = BTreeSet::new();
     let mut missing: Vec<String> = Vec::new();
     // Separate graphs:
     //   * `all_edges` covers runtime + build-time deps; used for cycle
@@ -77,16 +88,23 @@ pub fn resolve(
     //   * `make_edges` covers only build-time deps (makedepends +
     //     checkdepends) that resolve to AUR pkgbases; drives strata so
     //     each pkg's build-time AUR deps are installed before it runs.
-    let mut all_edges: HashMap<String, Vec<String>> = HashMap::new();
-    let mut make_edges: HashMap<String, Vec<String>> = HashMap::new();
-    let mut pkgname_to_pkgbase: HashMap<String, String> = HashMap::new();
+    //
+    // Keys are typed `PkgBase` (the graph node identity); values stay
+    // `Vec<String>` because they're raw dep expressions before pkgname →
+    // pkgbase resolution. Post-resolution `make_edges_resolved` has
+    // `Vec<PkgBase>` on both sides.
+    let mut all_edges: HashMap<PkgBase, Vec<String>> = HashMap::new();
+    let mut make_edges: HashMap<PkgBase, Vec<String>> = HashMap::new();
+    let mut pkgname_to_pkgbase: HashMap<PkgName, PkgBase> = HashMap::new();
 
     let direct_set: HashSet<String> = targets
         .iter()
         .map(|t| secondary::strip_version_constraint(t).to_string())
         .collect();
     for t in targets {
-        plan.direct_targets.insert(t.clone());
+        // Widen the raw CLI/picker string into a typed `PkgTarget` — the
+        // boundary where unclassified user input enters the typed graph.
+        plan.direct_targets.insert(PkgTarget::from(t.as_str()));
     }
 
     let mut queue: Vec<(String, bool)> = targets.iter().map(|t| (t.clone(), true)).collect();
@@ -157,12 +175,14 @@ pub fn resolve(
 
     // Rewrite make_edges entries from pkgnames → AUR pkgbases. Drop entries
     // pointing at repo/installed targets (irrelevant for build ordering).
-    let make_edges_resolved: HashMap<String, Vec<String>> = make_edges
+    // `HashMap<PkgName, PkgBase>::get(&str)` via `Borrow<str>` saves us
+    // a PkgName allocation per dep lookup.
+    let make_edges_resolved: HashMap<PkgBase, Vec<PkgBase>> = make_edges
         .into_iter()
         .map(|(pkgbase, deps)| {
-            let resolved: Vec<String> = deps
+            let resolved: Vec<PkgBase> = deps
                 .into_iter()
-                .filter_map(|d| pkgname_to_pkgbase.get(&d).cloned())
+                .filter_map(|d| pkgname_to_pkgbase.get(d.as_str()).cloned())
                 .filter(|pb| pb != &pkgbase) // self-edges from split pkgs
                 .collect();
             (pkgbase, resolved)

@@ -128,10 +128,15 @@ fn print_info(e: &IndexEntry) {
     // Show the split-pkg list whenever the entry actually has more than one
     // pkgname (or the single pkgname differs from pkgbase). Cheap join over
     // names only — provides aren't part of the `-Si` summary.
-    let names: Vec<&str> = e.pkgnames.iter().map(|p| p.name.as_str()).collect();
-    let trivial = names.len() == 1 && names[0] == e.pkgbase;
-    if !names.is_empty() && !trivial {
-        println!("Split pkgs      : {}", names.join(" "));
+    let trivial = e.pkgnames.len() == 1 && e.pkgbase.matches_pkgname(&e.pkgnames[0].name);
+    if !e.pkgnames.is_empty() && !trivial {
+        // Render via `Display` directly — no Vec<&str> staging area. Avoids
+        // routing each pkgname through `as_str()` just to feed `join(" ")`.
+        print!("Split pkgs      :");
+        for p in &e.pkgnames {
+            print!(" {}", p.name);
+        }
+        println!();
     }
     println!(
         "Version         : {}",

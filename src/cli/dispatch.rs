@@ -89,7 +89,22 @@ fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8
             }
             run_repo_upgrade(cfg, &sel)?;
             if !sel.aur.is_empty() {
-                let code = build::cmd_install(cfg, &sel.aur, noconfirm, false, true)?;
+                // PkgUpgrade carries name + old_ver but the install pipeline
+                // only needs the typed pkgname — the counterpart helper
+                // re-looks up the installed version (the pacman localdb is the
+                // source of truth, not the picker's snapshot, in case some
+                // other tool reshuffled state between -Sy and -S). Picker
+                // structure ends at this boundary.
+                // cmd_install takes raw `Vec<String>` targets (the same shape
+                // it gets from direct `-S foo` argv); downgrade each typed
+                // `PkgName` here via `into_inner` so the explicit boundary
+                // stays visible.
+                let names: Vec<String> = sel
+                    .aur
+                    .iter()
+                    .map(|p| p.name.clone().into_inner())
+                    .collect();
+                let code = build::cmd_install(cfg, &names, noconfirm, false, true)?;
                 if code != 0 {
                     return Ok(code);
                 }

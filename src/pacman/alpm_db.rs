@@ -6,9 +6,46 @@
 //! and parallelisable.
 
 use crate::error::{Error, Result};
+use crate::index::schema::IndexEntry;
+use crate::index::secondary::strip_version_constraint;
+use crate::names::PkgName;
 use alpm::Alpm;
 use std::collections::HashMap;
 use tracing::{debug, instrument};
+
+/// "What does the user currently have installed that this AUR entry will
+/// displace?" — resolved across pkgname, `replaces`, and `provides`, with
+/// provenance preserved so callers can render the right label.
+///
+/// `pkgname` is the localdb pkgname (typed [`PkgName`]); `version` is the
+/// pacman-recorded `pkgver-pkgrel` of that pkg (never the virtual version
+/// from a `provides=name=X` suffix); `via` describes how the AUR entry
+/// matched it. Lifetimes: `pkgname` borrows from the [`IndexEntry`],
+/// `version` borrows from the [`PacmanIndex`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InstalledCounterpart<'a> {
+    pub pkgname: &'a PkgName,
+    pub version: &'a str,
+    pub via: MatchedVia,
+}
+
+/// How the AUR entry referenced its installed counterpart. Priority for
+/// resolution is `Pkgname` > `Replaces` > `Provides` (see
+/// [`PacmanIndex::counterpart`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchedVia {
+    /// One of the entry's own pkgnames is installed under that exact name.
+    /// Canonical and split-pkg cases.
+    Pkgname,
+    /// `entry.replaces` names an installed pkg — strongest rename signal
+    /// because the maintainer explicitly declared this build supersedes it.
+    Replaces,
+    /// A `provides` entry (pkgname-scoped or pkgbase-level) names an
+    /// installed pkg. Weaker heuristic, but how AUR pkgbase renames
+    /// typically manifest in practice (e.g. `dotnet-core-7.0-bin` providing
+    /// `dotnet-runtime-7.0`).
+    Provides,
+}
 
 /// Open the system alpm DB with sync repos registered from `pacman.conf`.
 ///
@@ -28,30 +65,36 @@ pub fn open() -> Result<Alpm> {
 /// O(1) per query, and safe to call from rayon workers.
 #[derive(Debug, Default)]
 pub struct PacmanIndex {
-    /// pkgname → installed version (from localdb).
-    pub installed: HashMap<String, String>,
+    /// pkgname → installed version (from localdb). Keys are typed
+    /// `PkgName`; values stay `String` until the deferred Version newtype
+    /// refactor lands (see `names.rs`'s Phase B TODO).
+    pub installed: HashMap<PkgName, String>,
     /// virtual provide name → installed pkgnames declaring it. Used to mark
     /// a dependency as already-satisfied — if any provider is installed,
     /// `pacman -S --needed` would no-op, so the plan must drop it instead
-    /// of pretending to install a virtual.
-    pub installed_providers: HashMap<String, Vec<String>>,
+    /// of pretending to install a virtual. Keys stay `String` because
+    /// `provides=foo.so` virtual names aren't pkgnames in their own right.
+    pub installed_providers: HashMap<String, Vec<PkgName>>,
     /// pkgname → version available in some sync repo. Repo precedence is
     /// pacman's: the first DB declared in `pacman.conf` wins on duplicates.
-    pub sync_versions: HashMap<String, String>,
+    pub sync_versions: HashMap<PkgName, String>,
     /// virtual provide name → sync-repo pkgnames declaring it. When a
     /// dependency is a virtual name we pick a concrete provider so the plan
     /// shows the package pacman would actually install, with its version.
-    pub sync_providers: HashMap<String, Vec<String>>,
+    pub sync_providers: HashMap<String, Vec<PkgName>>,
 }
 
 impl PacmanIndex {
     /// Snapshot `&Alpm` into owned hash tables. Single pass over each DB.
+    /// `PkgName` wraps each pkg name at the alpm boundary — this is the
+    /// single entry point that promotes raw `&str` from libalpm into the
+    /// typed identity used by the rest of the crate.
     #[instrument(skip(alpm))]
     pub fn build(alpm: &Alpm) -> Self {
-        let mut installed: HashMap<String, String> = HashMap::new();
-        let mut installed_providers: HashMap<String, Vec<String>> = HashMap::new();
+        let mut installed: HashMap<PkgName, String> = HashMap::new();
+        let mut installed_providers: HashMap<String, Vec<PkgName>> = HashMap::new();
         for p in alpm.localdb().pkgs() {
-            let name = p.name().to_string();
+            let name = PkgName::new(p.name());
             installed.insert(name.clone(), p.version().to_string());
             for prov in p.provides() {
                 installed_providers
@@ -60,11 +103,11 @@ impl PacmanIndex {
                     .push(name.clone());
             }
         }
-        let mut sync_versions: HashMap<String, String> = HashMap::new();
-        let mut sync_providers: HashMap<String, Vec<String>> = HashMap::new();
+        let mut sync_versions: HashMap<PkgName, String> = HashMap::new();
+        let mut sync_providers: HashMap<String, Vec<PkgName>> = HashMap::new();
         for db in alpm.syncdbs() {
             for p in db.pkgs() {
-                let name = p.name().to_string();
+                let name = PkgName::new(p.name());
                 // `entry().or_insert` so the first DB pacman.conf lists wins,
                 // matching pacman's own repo precedence.
                 sync_versions
@@ -93,7 +136,10 @@ impl PacmanIndex {
         }
     }
 
-    /// Installed version of `name`, or `None` if not installed.
+    /// Installed version of `name`, or `None` if not installed. `name`
+    /// arrives as `&str` because lookups originate from many sources
+    /// (CLI args, .SRCINFO deps, `provides` strings) — `Borrow<str>` on
+    /// the typed key makes the lookup work without a temporary `PkgName`.
     pub fn installed_version(&self, name: &str) -> Option<&str> {
         self.installed.get(name).map(String::as_str)
     }
@@ -131,31 +177,107 @@ impl PacmanIndex {
     /// dep instead of staging a redundant install of a different concrete pkg.
     /// On a sync-providers tie we pick the first one we saw (DB declaration
     /// order from `pacman.conf`); pacman would prompt, we don't.
-    pub fn resolve_concrete(&self, name: &str) -> Option<(&str, bool)> {
+    pub fn resolve_concrete(&self, name: &str) -> Option<(&PkgName, bool)> {
         if let Some((n, _)) = self.installed.get_key_value(name) {
-            return Some((n.as_str(), true));
+            return Some((n, true));
         }
         if let Some(provs) = self.installed_providers.get(name) {
             if let Some(p) = provs.first() {
-                return Some((p.as_str(), true));
+                return Some((p, true));
             }
         }
         if let Some((n, _)) = self.sync_versions.get_key_value(name) {
-            return Some((n.as_str(), false));
+            return Some((n, false));
         }
         if let Some(provs) = self.sync_providers.get(name) {
             if let Some(p) = provs.first() {
-                return Some((p.as_str(), false));
+                return Some((p, false));
+            }
+        }
+        None
+    }
+
+    /// Resolve the installed pkg an [`IndexEntry`] would displace, classified
+    /// by how the AUR entry referenced it.
+    ///
+    /// Resolution order (highest priority first):
+    ///   1. **Pkgname** — any `entry.pkgnames[*].name` present in localdb.
+    ///      Canonical case and split pkgs (Bisq shape) land here.
+    ///   2. **Replaces** — any bare name in `entry.replaces` present in
+    ///      localdb. The maintainer's explicit "this build supersedes that
+    ///      pkg" declaration.
+    ///   3. **Provides** — any bare name in `entry.pkgnames[*].provides`
+    ///      (scoped) or `entry.provides` (pkgbase-level) present in localdb.
+    ///      The implicit transition path AUR pkgbase renames usually take
+    ///      (e.g. `dotnet-core-7.0-bin` providing `dotnet-runtime-7.0`).
+    ///
+    /// Within each tier the first hit wins, in the entry's declaration
+    /// order — `Vec` ordering is stable across runs, so the choice is
+    /// deterministic. Names with a version constraint suffix
+    /// (`provides = libfoo=1.2`) go through [`strip_version_constraint`]
+    /// before lookup; the returned `version` is **always** the pacman
+    /// localdb version of the matched pkgname, never the virtual version
+    /// baked into the suffix.
+    ///
+    /// Returns `None` when nothing in the entry matches an installed pkg —
+    /// the caller renders this as a fresh install.
+    pub fn counterpart<'a>(&'a self, entry: &'a IndexEntry) -> Option<InstalledCounterpart<'a>> {
+        // 1. Direct pkgname match. `installed.get_key_value` lets us
+        //    return a reference to the typed PkgName the localdb owns
+        //    rather than allocating a fresh one.
+        for p in &entry.pkgnames {
+            if let Some((stored_name, version)) = self.installed.get_key_value(&p.name) {
+                return Some(InstalledCounterpart {
+                    pkgname: stored_name,
+                    version,
+                    via: MatchedVia::Pkgname,
+                });
+            }
+        }
+        // 2. Replaces — explicit rename declaration.
+        for r in &entry.replaces {
+            let name = strip_version_constraint(r);
+            if let Some((stored_name, version)) = self.installed.get_key_value(name) {
+                return Some(InstalledCounterpart {
+                    pkgname: stored_name,
+                    version,
+                    via: MatchedVia::Replaces,
+                });
+            }
+        }
+        // 3. Provides — pkgname-scoped (more specific) before pkgbase-level.
+        for p in &entry.pkgnames {
+            for prov in &p.provides {
+                let name = strip_version_constraint(prov);
+                if let Some((stored_name, version)) = self.installed.get_key_value(name) {
+                    return Some(InstalledCounterpart {
+                        pkgname: stored_name,
+                        version,
+                        via: MatchedVia::Provides,
+                    });
+                }
+            }
+        }
+        for prov in &entry.provides {
+            let name = strip_version_constraint(prov);
+            if let Some((stored_name, version)) = self.installed.get_key_value(name) {
+                return Some(InstalledCounterpart {
+                    pkgname: stored_name,
+                    version,
+                    via: MatchedVia::Provides,
+                });
             }
         }
         None
     }
 
     /// pkgnames installed locally but not present in any syncdb (foreign).
-    pub fn foreign(&self) -> Vec<(String, String)> {
+    /// Result is a typed `(PkgName, version)` list — the version string
+    /// stays raw until the deferred Version newtype refactor lands.
+    pub fn foreign(&self) -> Vec<(PkgName, String)> {
         self.installed
             .iter()
-            .filter(|(name, _)| !self.sync_versions.contains_key(name.as_str()))
+            .filter(|(name, _)| !self.sync_versions.contains_key::<PkgName>(name))
             .map(|(n, v)| (n.clone(), v.clone()))
             .collect()
     }
@@ -164,6 +286,31 @@ impl PacmanIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::schema::Pkgname;
+
+    /// Build an `IndexEntry` with the fields `counterpart` actually reads
+    /// (pkgnames, replaces, provides). Everything else stays at default —
+    /// `counterpart` ignores it.
+    fn entry(
+        pkgbase: &str,
+        pkgnames: &[(&str, &[&str])],
+        replaces: &[&str],
+        provides: &[&str],
+    ) -> IndexEntry {
+        IndexEntry {
+            pkgbase: pkgbase.into(),
+            pkgnames: pkgnames
+                .iter()
+                .map(|(n, provs)| Pkgname {
+                    name: (*n).into(),
+                    provides: provs.iter().map(|p| (*p).into()).collect(),
+                })
+                .collect(),
+            replaces: replaces.iter().map(|s| (*s).into()).collect(),
+            provides: provides.iter().map(|s| (*s).into()).collect(),
+            ..IndexEntry::default()
+        }
+    }
 
     #[test]
     fn lookups_use_owned_hashes() {
@@ -218,10 +365,157 @@ mod tests {
             .or_default()
             .push("rustup".into());
 
-        assert_eq!(idx.resolve_concrete("rust"), Some(("rust", true)));
-        assert_eq!(idx.resolve_concrete("cargo"), Some(("rust", true)));
-        assert_eq!(idx.resolve_concrete("pacman"), Some(("pacman", false)));
-        assert_eq!(idx.resolve_concrete("libalpm.so"), Some(("pacman", false)));
+        // `resolve_concrete` now returns the typed `&PkgName` (not `&str`);
+        // construct the expected key once so the assertions read the same
+        // way they would when comparing strings.
+        let rust = PkgName::from("rust");
+        let pacman = PkgName::from("pacman");
+        assert_eq!(idx.resolve_concrete("rust"), Some((&rust, true)));
+        assert_eq!(idx.resolve_concrete("cargo"), Some((&rust, true)));
+        assert_eq!(idx.resolve_concrete("pacman"), Some((&pacman, false)));
+        assert_eq!(idx.resolve_concrete("libalpm.so"), Some((&pacman, false)));
         assert_eq!(idx.resolve_concrete("nonexistent"), None);
+    }
+
+    /// Canonical case: pkgbase pkgname matches localdb directly. Provenance
+    /// is `Pkgname` and the version comes from pacman.
+    #[test]
+    fn counterpart_matches_by_pkgname() {
+        let mut idx = PacmanIndex::default();
+        idx.installed.insert("foo".into(), "1.2.3-1".into());
+        let e = entry("foo", &[("foo", &[])], &[], &[]);
+        let c = idx.counterpart(&e).expect("foo is installed");
+        assert_eq!(c.pkgname, "foo");
+        assert_eq!(c.version, "1.2.3-1");
+        assert_eq!(c.via, MatchedVia::Pkgname);
+    }
+
+    /// Split pkgbase with only one sibling installed: pkgname match still
+    /// wins, and the matched name is the installed sibling — not the pkgbase.
+    #[test]
+    fn counterpart_picks_first_installed_split_sibling() {
+        let mut idx = PacmanIndex::default();
+        idx.installed.insert("bisq-cli".into(), "1.9-2".into());
+        let e = entry(
+            "bisq",
+            &[
+                ("bisq-desktop", &["bisq"]),
+                ("bisq-cli", &[]),
+                ("bisq-daemon", &[]),
+            ],
+            &[],
+            &[],
+        );
+        let c = idx.counterpart(&e).expect("bisq-cli is installed");
+        assert_eq!(c.pkgname, "bisq-cli");
+        assert_eq!(c.version, "1.9-2");
+        assert_eq!(c.via, MatchedVia::Pkgname);
+    }
+
+    /// `entry.replaces` ranks above `entry.provides` even when both could
+    /// match: the explicit declaration is the more reliable signal.
+    #[test]
+    fn counterpart_prefers_replaces_over_provides() {
+        let mut idx = PacmanIndex::default();
+        idx.installed.insert("old-foo".into(), "0.9-1".into());
+        let e = entry(
+            "foo-ng",
+            &[("foo-ng", &["old-foo"])], // also provides it
+            &["old-foo"],                // and replaces it
+            &[],
+        );
+        let c = idx.counterpart(&e).expect("old-foo is installed");
+        assert_eq!(c.pkgname, "old-foo");
+        assert_eq!(c.via, MatchedVia::Replaces);
+    }
+
+    /// Pkgname wins over both replaces and provides, even if the user has
+    /// the legacy pkg installed alongside the new pkgbase (transitional).
+    #[test]
+    fn counterpart_prefers_pkgname_over_replaces_and_provides() {
+        let mut idx = PacmanIndex::default();
+        idx.installed.insert("foo-ng".into(), "2.0-1".into());
+        idx.installed.insert("old-foo".into(), "0.9-1".into());
+        let e = entry("foo-ng", &[("foo-ng", &["old-foo"])], &["old-foo"], &[]);
+        let c = idx.counterpart(&e).expect("foo-ng is installed");
+        assert_eq!(c.pkgname, "foo-ng");
+        assert_eq!(c.via, MatchedVia::Pkgname);
+    }
+
+    /// The dotnet case: AUR pkgbase ships its own pkgname which `provides`
+    /// the legacy name the user has installed. Matched via Provides; the
+    /// version reflects the installed legacy pkg.
+    #[test]
+    fn counterpart_matches_pkgname_scoped_provides() {
+        let mut idx = PacmanIndex::default();
+        idx.installed
+            .insert("dotnet-runtime-7.0".into(), "7.0.15-1".into());
+        let e = entry(
+            "dotnet-core-7.0-bin",
+            &[(
+                "dotnet-core-7.0-bin",
+                &["dotnet-runtime-7.0", "dotnet-sdk-7.0"],
+            )],
+            &[],
+            &[],
+        );
+        let c = idx
+            .counterpart(&e)
+            .expect("dotnet-runtime-7.0 is installed");
+        assert_eq!(c.pkgname, "dotnet-runtime-7.0");
+        assert_eq!(c.version, "7.0.15-1");
+        assert_eq!(c.via, MatchedVia::Provides);
+    }
+
+    /// Pkgbase-level provides are inherited by every pkgname — match still
+    /// resolves via the entry's top-level `provides` slot.
+    #[test]
+    fn counterpart_matches_pkgbase_level_provides() {
+        let mut idx = PacmanIndex::default();
+        idx.installed.insert("virt-name".into(), "3.0-1".into());
+        let e = entry("foo", &[("foo", &[])], &[], &["virt-name"]);
+        let c = idx.counterpart(&e).expect("virt-name is installed");
+        assert_eq!(c.pkgname, "virt-name");
+        assert_eq!(c.via, MatchedVia::Provides);
+    }
+
+    /// `provides = name=1.2` must strip the virtual version before lookup;
+    /// the returned version comes from pacman (the installed pkgname's
+    /// real version), not from the suffix.
+    #[test]
+    fn counterpart_strips_version_constraint_on_provides() {
+        let mut idx = PacmanIndex::default();
+        idx.installed.insert("libfoo".into(), "9.9-1".into());
+        let e = entry("bar", &[("bar", &["libfoo=1.2"])], &[], &[]);
+        let c = idx.counterpart(&e).expect("libfoo is installed");
+        assert_eq!(c.pkgname, "libfoo");
+        assert_eq!(c.version, "9.9-1"); // real version, not the virtual "1.2"
+        assert_eq!(c.via, MatchedVia::Provides);
+    }
+
+    /// No pkgname / replaces / provides match anything installed → fresh
+    /// install path, caller renders "install: …".
+    #[test]
+    fn counterpart_returns_none_when_nothing_installed() {
+        let idx = PacmanIndex::default();
+        let e = entry(
+            "foo",
+            &[("foo", &["virt"])],
+            &["old-foo"],
+            &["pkgbase-virt"],
+        );
+        assert!(idx.counterpart(&e).is_none());
+    }
+
+    /// Scoped provides (more specific) beats pkgbase-level provides when
+    /// both could match.
+    #[test]
+    fn counterpart_prefers_scoped_provides_over_pkgbase_level() {
+        let mut idx = PacmanIndex::default();
+        idx.installed.insert("scoped".into(), "1-1".into());
+        idx.installed.insert("toplevel".into(), "2-1".into());
+        let e = entry("foo", &[("foo", &["scoped"])], &[], &["toplevel"]);
+        let c = idx.counterpart(&e).expect("scoped is installed");
+        assert_eq!(c.pkgname, "scoped");
     }
 }

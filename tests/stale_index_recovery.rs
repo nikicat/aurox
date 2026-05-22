@@ -16,6 +16,7 @@
 use gitaur::config::defaults::default_config;
 use gitaur::index::{self, IndexFile};
 use gitaur::mirror;
+use gitaur::names::PkgBase;
 use gitaur::paths;
 use gitaur::testing::{git, ScopedStateRoot};
 use std::path::Path;
@@ -104,9 +105,9 @@ fn cmd_refresh_rebuilds_when_existing_index_is_unreadable() {
     let idx = index::load(&idx_path).expect("rebuilt index must be loadable");
     assert_eq!(idx.format_version, IndexFile::FORMAT_VERSION);
     assert_eq!(idx.entries.len(), 2, "both fixture branches indexed");
-    let mut bases: Vec<&str> = idx.entries.iter().map(|e| e.pkgbase.as_str()).collect();
+    let mut bases: Vec<&PkgBase> = idx.entries.iter().map(|e| &e.pkgbase).collect();
     bases.sort_unstable();
-    assert_eq!(bases, vec!["bisq", "cower"]);
+    assert_eq!(bases, vec![&PkgBase::from("bisq"), &PkgBase::from("cower")]);
 
     // Per-pkgname provides survived the rebuild — sanity for the schema
     // change that prompted this recovery path in the first place.

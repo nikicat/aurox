@@ -1,0 +1,15 @@
+# Legacy half of the provides-rename pair (dotnet-runtime-7.0 shape).
+# Stands in for an old AUR pkg the user installed under its original name —
+# `gitaur -S` here seeds a "foreign" install of that name in the localdb so
+# the partner fixture (test-provides-rename-new) can later trigger the
+# Provides counterpart path in `PacmanIndex::counterpart`.
+pkgname=test-provides-rename-legacy
+pkgver=1.0
+pkgrel=1
+pkgdesc='gitaur test fixture: legacy half of a provides-rename pair'
+arch=('any')
+license=('MIT')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}

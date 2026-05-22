@@ -20,6 +20,7 @@ use crate::error::{Error, Result};
 use crate::index::schema::IndexEntry;
 use crate::index::secondary::{self, Secondary};
 use crate::index::IndexFile;
+use crate::names::{PkgBase, PkgName};
 use crate::pacman::alpm_db::PacmanIndex;
 use std::collections::HashMap;
 use tracing::{debug, instrument};
@@ -27,7 +28,7 @@ use tracing::{debug, instrument};
 /// Selector callback: given a pkgbase and its full pkgname list, return the
 /// subset to install as explicit. Boxed via `&mut dyn` at call sites so the
 /// signature stays one line and so test/UI variants compose without generics.
-pub type PkgnameSelector<'a> = dyn FnMut(&str, &[String]) -> Result<Vec<String>> + 'a;
+pub type PkgnameSelector<'a> = dyn FnMut(&PkgBase, &[PkgName]) -> Result<Vec<PkgName>> + 'a;
 
 /// Outcome of [`expand_pkgbase_targets`].
 ///
@@ -43,12 +44,16 @@ pub struct ExpandedTargets {
     /// Rewritten target list ready for [`super::resolve`]. May contain the
     /// pkgbase string for rewritten entries; pacman / `by_name` passthroughs
     /// keep their original form (with any version constraint suffix).
+    /// Stays `Vec<String>` because the contents are deliberately mixed —
+    /// passthroughs can be virtual names, version-constrained pkgnames, or
+    /// pacman targets, none of which fits cleanly under `PkgName` or
+    /// `PkgBase`.
     pub targets: Vec<String>,
     /// pkgbase → user-selected pkgnames, populated only when the user kept a
     /// **proper subset** of a split pkgbase. The build pipeline uses this
     /// for the install-side `pacman -U` filter. Pkgbases absent from the
     /// map default to "install every built pkgname".
-    pub selections: HashMap<String, Vec<String>>,
+    pub selections: HashMap<PkgBase, Vec<PkgName>>,
     /// pkgnames the user effectively named — extracted from the selector
     /// (for pkgbase hits) or the provider attribution (for provides hits).
     /// `cmd_install` merges this into `Plan.direct_targets` so
@@ -56,7 +61,7 @@ pub struct ExpandedTargets {
     /// Explicit rather than `--asdeps`. Empty for pkgname / pacman /
     /// no-index passthroughs — those keep the resolver's existing
     /// "targets become direct" behaviour.
-    pub direct_pkgnames: Vec<String>,
+    pub direct_pkgnames: Vec<PkgName>,
 }
 
 /// Rewrite `targets`, expanding bare pkgbase / provides references so the
@@ -101,16 +106,20 @@ pub fn expand_pkgbase_targets(
                 out.targets.push(t.clone());
                 continue;
             }
-            let chosen = chosen_with_sibling_deps(entry, bare);
+            let bare_name = PkgName::from(bare);
+            let chosen = chosen_with_sibling_deps(entry, &bare_name);
             debug!(
                 pkgbase = %entry.pkgbase,
-                pkgname = bare,
+                pkgname = %bare_name,
                 chosen = chosen.len(),
                 "rewrote split-pkg pkgname target to pkgbase with selection",
             );
             extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
-            out.targets.push(entry.pkgbase.clone());
-            out.direct_pkgnames.push(bare.to_string());
+            // `out.targets` is `Vec<String>` (mixed bag — see docstring);
+            // `into_inner` on the clone is the dedicated PkgBase→String
+            // downgrade, used only at this resolver/string boundary.
+            out.targets.push(entry.pkgbase.clone().into_inner());
+            out.direct_pkgnames.push(bare_name);
             continue;
         }
         // Virtual name (`-S bisq` where `bisq-desktop` declares
@@ -126,7 +135,7 @@ pub fn expand_pkgbase_targets(
             debug!(
                 pkgbase = %entry.pkgbase,
                 virtual_name = bare,
-                pkgname,
+                pkgname = %pkgname,
                 "rewrote provides target to providing pkgbase",
             );
             // A pkgbase-level `provides` makes every pkgname a provider, so
@@ -134,7 +143,7 @@ pub fn expand_pkgbase_targets(
             // built pkgname reaches `pacman -U`. Only pkgname-scoped
             // provides yield a true single-pkgname subset.
             let scoped = entry.pkgnames.iter().any(|p| {
-                p.name == pkgname
+                &p.name == pkgname
                     && p.provides
                         .iter()
                         .any(|x| secondary::strip_version_constraint(x) == bare)
@@ -143,8 +152,8 @@ pub fn expand_pkgbase_targets(
                 let chosen = chosen_with_sibling_deps(entry, pkgname);
                 extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
             }
-            out.targets.push(entry.pkgbase.clone());
-            out.direct_pkgnames.push(pkgname.to_string());
+            out.targets.push(entry.pkgbase.clone().into_inner());
+            out.direct_pkgnames.push(pkgname.clone());
             continue;
         }
         // Bare pkgbase (`-S commit-mono-font`): defer to the selector.
@@ -155,8 +164,8 @@ pub fn expand_pkgbase_targets(
         }
         let entry_idx = by.by_pkgbase[bare] as usize;
         let entry = &idx.entries[entry_idx];
-        let pkgname_strs: Vec<String> = entry.pkgnames.iter().map(|p| p.name.clone()).collect();
-        let chosen = select(&entry.pkgbase, &pkgname_strs)?;
+        let pkgnames: Vec<PkgName> = entry.pkgnames.iter().map(|p| p.name.clone()).collect();
+        let chosen = select(&entry.pkgbase, &pkgnames)?;
         if chosen.is_empty() {
             return Err(Error::other(format!(
                 "no pkgnames selected for pkgbase `{}`",
@@ -185,7 +194,7 @@ pub fn expand_pkgbase_targets(
         if chosen.len() < entry.pkgnames.len() {
             extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
         }
-        out.targets.push(entry.pkgbase.clone());
+        out.targets.push(entry.pkgbase.clone().into_inner());
         out.direct_pkgnames.extend(chosen);
     }
     Ok(out)
@@ -196,11 +205,11 @@ pub fn expand_pkgbase_targets(
 /// pkgnames of the same split pkgbase (`-S bisq-cli bisq-daemon`); each
 /// must extend the selection rather than overwrite it.
 fn extend_selection(
-    selections: &mut HashMap<String, Vec<String>>,
-    pkgbase: &str,
-    additions: &[String],
+    selections: &mut HashMap<PkgBase, Vec<PkgName>>,
+    pkgbase: &PkgBase,
+    additions: &[PkgName],
 ) {
-    let bucket = selections.entry(pkgbase.to_string()).or_default();
+    let bucket = selections.entry(pkgbase.clone()).or_default();
     for a in additions {
         if !bucket.iter().any(|s| s == a) {
             bucket.push(a.clone());
@@ -213,29 +222,36 @@ fn extend_selection(
 /// flattened into a single list — without per-pkgname attribution, we
 /// can't tell which sibling owns which dep, so any sibling appearing in
 /// the pool is conservatively pulled into the install selection.
-fn sibling_runtime_deps<'a>(entry: &'a IndexEntry, pkgname: &str) -> Vec<&'a str> {
-    let siblings: std::collections::HashSet<&str> = entry
+///
+/// Returns owned `PkgName`s — the HashSet ownership lets us probe by
+/// `&str` via `Borrow<str>` (`siblings.get(bare)`) instead of routing the
+/// comparison through a manual deref dance.
+fn sibling_runtime_deps(entry: &IndexEntry, pkgname: &PkgName) -> Vec<PkgName> {
+    let siblings: std::collections::HashSet<PkgName> = entry
         .pkgnames
         .iter()
-        .map(|p| p.name.as_str())
-        .filter(|n| *n != pkgname)
+        .map(|p| p.name.clone())
+        .filter(|n| n != pkgname)
         .collect();
     entry
         .depends
         .iter()
-        .map(|d| secondary::strip_version_constraint(d))
-        .filter(|d| siblings.contains(d))
+        .filter_map(|d| {
+            siblings
+                .get(secondary::strip_version_constraint(d))
+                .cloned()
+        })
         .collect()
 }
 
 /// `pkgname` plus its sibling intra-split runtime deps, deduped. Used by
 /// both the `by_name` and scoped-provides paths to compute the install
 /// selection for a split pkgbase whose target is a single pkgname.
-fn chosen_with_sibling_deps(entry: &IndexEntry, pkgname: &str) -> Vec<String> {
-    let mut chosen = vec![pkgname.to_string()];
+fn chosen_with_sibling_deps(entry: &IndexEntry, pkgname: &PkgName) -> Vec<PkgName> {
+    let mut chosen = vec![pkgname.clone()];
     for sib in sibling_runtime_deps(entry, pkgname) {
-        if !chosen.iter().any(|c| c == sib) {
-            chosen.push(sib.to_string());
+        if !chosen.iter().any(|c| c == &sib) {
+            chosen.push(sib);
         }
     }
     chosen
@@ -321,7 +337,7 @@ mod tests {
     /// Trivial selector — picks every pkgname. Wrapped in `Result` because
     /// the `expand_pkgbase_targets` callback type is `FnMut(...) -> Result<_>`.
     #[allow(clippy::unnecessary_wraps)]
-    fn select_all(_: &str, pkgnames: &[String]) -> Result<Vec<String>> {
+    fn select_all(_: &PkgBase, pkgnames: &[PkgName]) -> Result<Vec<PkgName>> {
         Ok(pkgnames.to_vec())
     }
 
@@ -347,12 +363,12 @@ mod tests {
         );
         assert_eq!(
             r.direct_pkgnames,
-            vec!["bisq-desktop".to_string()],
+            vec![PkgName::from("bisq-desktop")],
             "the providing pkgname is the user's actual direct target",
         );
         assert_eq!(
             r.selections.get("bisq"),
-            Some(&vec!["bisq-desktop".to_string()]),
+            Some(&vec![PkgName::from("bisq-desktop")]),
             "scoped provides must constrain the install-side filter",
         );
     }
@@ -372,7 +388,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.targets, vec!["paru-bin".to_string()]);
-        assert_eq!(r.direct_pkgnames, vec!["paru-bin".to_string()]);
+        assert_eq!(r.direct_pkgnames, vec![PkgName::from("paru-bin")]);
         assert!(
             r.selections.is_empty(),
             "single-pkgname pkgbase means no real subset",
@@ -410,7 +426,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.targets, vec!["bisq-single".to_string()]);
-        assert_eq!(r.direct_pkgnames, vec!["bisq-desktop-single".to_string()]);
+        assert_eq!(
+            r.direct_pkgnames,
+            vec![PkgName::from("bisq-desktop-single")]
+        );
         // Full selection (1/1): no need to record.
         assert!(r.selections.is_empty());
     }
@@ -430,9 +449,9 @@ mod tests {
         assert_eq!(
             r.direct_pkgnames,
             vec![
-                "split-a".to_string(),
-                "split-b".to_string(),
-                "split-c".to_string()
+                PkgName::from("split-a"),
+                PkgName::from("split-b"),
+                PkgName::from("split-c"),
             ],
         );
         assert!(
@@ -444,8 +463,8 @@ mod tests {
     #[test]
     fn split_pkgbase_partial_selection_records_constraint() {
         let (idx, by, pac) = fixture();
-        let mut select = |_pkgbase: &str, _pkgnames: &[String]| -> Result<Vec<String>> {
-            Ok(vec!["split-a".to_string(), "split-c".to_string()])
+        let mut select = |_pkgbase: &PkgBase, _pkgnames: &[PkgName]| -> Result<Vec<PkgName>> {
+            Ok(vec![PkgName::from("split-a"), PkgName::from("split-c")])
         };
         let r = expand_pkgbase_targets(
             &idx,
@@ -458,11 +477,11 @@ mod tests {
         assert_eq!(r.targets, vec!["split-pkg".to_string()]);
         assert_eq!(
             r.direct_pkgnames,
-            vec!["split-a".to_string(), "split-c".to_string()],
+            vec![PkgName::from("split-a"), PkgName::from("split-c")],
         );
         assert_eq!(
             r.selections.get("split-pkg"),
-            Some(&vec!["split-a".to_string(), "split-c".to_string()]),
+            Some(&vec![PkgName::from("split-a"), PkgName::from("split-c")]),
             "partial selection records the install-side filter constraint",
         );
     }
@@ -473,7 +492,7 @@ mod tests {
         // no selector call.
         let (idx, by, pac) = fixture();
         let mut calls = 0;
-        let mut select = |_p: &str, n: &[String]| -> Result<Vec<String>> {
+        let mut select = |_p: &PkgBase, n: &[PkgName]| -> Result<Vec<PkgName>> {
             calls += 1;
             Ok(n.to_vec())
         };
@@ -504,7 +523,7 @@ mod tests {
     #[test]
     fn empty_selection_errors() {
         let (idx, by, pac) = fixture();
-        let mut select = |_p: &str, _n: &[String]| -> Result<Vec<String>> { Ok(vec![]) };
+        let mut select = |_p: &PkgBase, _n: &[PkgName]| -> Result<Vec<PkgName>> { Ok(vec![]) };
         let err = expand_pkgbase_targets(
             &idx,
             Some(&by),
@@ -519,8 +538,8 @@ mod tests {
     #[test]
     fn selector_returning_unrelated_pkgname_errors() {
         let (idx, by, pac) = fixture();
-        let mut select = |_p: &str, _n: &[String]| -> Result<Vec<String>> {
-            Ok(vec!["totally-unrelated".to_string()])
+        let mut select = |_p: &PkgBase, _n: &[PkgName]| -> Result<Vec<PkgName>> {
+            Ok(vec![PkgName::from("totally-unrelated")])
         };
         let err = expand_pkgbase_targets(
             &idx,
@@ -575,7 +594,10 @@ mod tests {
         // install_stratum marks them Explicit.
         assert_eq!(
             r.direct_pkgnames,
-            vec!["otf-commit-mono".to_string(), "ttf-commit-mono".to_string()],
+            vec![
+                PkgName::from("otf-commit-mono"),
+                PkgName::from("ttf-commit-mono"),
+            ],
         );
     }
 
@@ -596,10 +618,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.targets, vec!["bisq".to_string()]);
-        assert_eq!(r.direct_pkgnames, vec!["bisq-cli".to_string()]);
+        assert_eq!(r.direct_pkgnames, vec![PkgName::from("bisq-cli")]);
         assert_eq!(
             r.selections.get("bisq"),
-            Some(&vec!["bisq-cli".to_string()]),
+            Some(&vec![PkgName::from("bisq-cli")]),
             "pkgname-target on split pkgbase must restrict install to that pkgname",
         );
     }
@@ -646,7 +668,7 @@ mod tests {
         assert_eq!(r.targets, vec!["test-split".to_string()]);
         assert_eq!(
             r.direct_pkgnames,
-            vec!["test-split-extras".to_string()],
+            vec![PkgName::from("test-split-extras")],
             "direct_pkgnames stays at the user's explicit choice; sibling deps install --asdeps",
         );
         let mut sel = r.selections.get("test-split").cloned().unwrap_or_default();
@@ -654,8 +676,8 @@ mod tests {
         assert_eq!(
             sel,
             vec![
-                "test-split-core".to_string(),
-                "test-split-extras".to_string()
+                PkgName::from("test-split-core"),
+                PkgName::from("test-split-extras"),
             ],
             "sibling pkgname appearing in pkgbase.depends must join the install selection",
         );

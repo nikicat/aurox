@@ -1,6 +1,7 @@
 //! Interactive prompts (`y/n` + per-pkgname pickers).
 
 use super::note;
+use crate::names::{PkgBase, PkgName};
 
 use dialoguer::{Confirm, MultiSelect};
 use std::io::{BufRead, IsTerminal, Write};
@@ -43,13 +44,13 @@ pub fn confirm(prompt: &str, noconfirm: bool) -> std::io::Result<bool> {
 ///   * the pkgbase has a single pkgname (no real choice — just inform);
 ///   * `noconfirm` is set (auto-select every pkgname).
 pub fn select_pkgnames(
-    pkgbase: &str,
-    pkgnames: &[String],
+    pkgbase: &PkgBase,
+    pkgnames: &[PkgName],
     noconfirm: bool,
-) -> std::io::Result<Vec<String>> {
+) -> std::io::Result<Vec<PkgName>> {
     if pkgnames.len() <= 1 {
         if let Some(only) = pkgnames.first() {
-            if only != pkgbase {
+            if !pkgbase.matches_pkgname(only) {
                 note(&format!("resolved pkgbase `{pkgbase}` → `{only}`"));
             }
         }
@@ -58,6 +59,9 @@ pub fn select_pkgnames(
     if noconfirm {
         return Ok(pkgnames.to_vec());
     }
+    // `dialoguer::MultiSelect::items` takes anything that implements
+    // `ToString`. `PkgName`'s `Display` impl satisfies it without us
+    // materialising a `Vec<String>` mid-call.
     let chosen = MultiSelect::new()
         .with_prompt(format!(
             "[{pkgbase}] split package — pick pkgnames to install \

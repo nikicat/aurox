@@ -7,6 +7,7 @@
 
 use gitaur::config::defaults::default_config;
 use gitaur::index::{self, secondary::Secondary};
+use gitaur::names::PkgBase;
 use gitaur::pacman::alpm_db::{self, PacmanIndex};
 use gitaur::paths;
 use gitaur::resolver;
@@ -18,21 +19,22 @@ fn main() {
     let pac = PacmanIndex::build(&alpm);
     let cfg = default_config();
 
-    let mut ranked: Vec<(String, usize, usize)> = Vec::new();
+    let mut ranked: Vec<(PkgBase, usize, usize)> = Vec::new();
     let total = idx.entries.len();
     for (i, entry) in idx.entries.iter().enumerate() {
         if i % 5000 == 0 {
             eprintln!("scanning {i}/{total}");
         }
-        // python38-* form a giant cyclical cluster.
-        if entry.pkgbase.starts_with("python38-") {
+        // python38-* form a giant cyclical cluster. Dedicated method on
+        // PkgBase rather than reaching into the inner string.
+        if entry.pkgbase.0.starts_with("python38-") {
             continue;
         }
         // Pick the first pkgname as the user-typed target.
         let Some(pkgname) = entry.pkgnames.first() else {
             continue;
         };
-        let targets = vec![pkgname.name.clone()];
+        let targets = vec![pkgname.name.clone().into_inner()];
         let Ok(plan) = resolver::resolve(&cfg, &idx, Some(&by), &pac, &targets) else {
             continue;
         };

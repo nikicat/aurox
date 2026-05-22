@@ -24,6 +24,7 @@
 
 use crate::error::{Error, Result};
 use crate::mirror::MirrorRepo;
+use crate::names::PkgBase;
 use gix::ObjectId;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -44,8 +45,8 @@ pub struct Worktree {
 /// only). Missing or half-state → recovery `worktree prune` + `worktree add
 /// --force`. Either path ends with a working linked worktree that native
 /// `git` recognises.
-#[instrument(skip(mirror))]
-pub fn add_or_reset(mirror: &MirrorRepo, branch: &str, dest: &Path) -> Result<Worktree> {
+#[instrument(skip(mirror), fields(branch = %branch))]
+pub fn add_or_reset(mirror: &MirrorRepo, branch: &PkgBase, dest: &Path) -> Result<Worktree> {
     let refname = format!("refs/heads/{branch}");
     let head_oid = peel_branch(mirror, &refname)?;
 
@@ -59,7 +60,7 @@ pub fn add_or_reset(mirror: &MirrorRepo, branch: &str, dest: &Path) -> Result<Wo
             "--hard".as_ref(),
             refname.as_ref(),
         ])?;
-        debug!(branch, %head_oid, "reset existing worktree to branch tip");
+        debug!(%branch, %head_oid, "reset existing worktree to branch tip");
     } else {
         // First call, or someone deleted half the state by hand. Drop any
         // orphaned admin entry, scrub a stale dest if one is in the way,
@@ -83,7 +84,7 @@ pub fn add_or_reset(mirror: &MirrorRepo, branch: &str, dest: &Path) -> Result<Wo
             dest.as_os_str(),
             refname.as_ref(),
         ])?;
-        debug!(branch, %head_oid, dest = %dest.display(), "linked worktree created");
+        debug!(%branch, %head_oid, dest = %dest.display(), "linked worktree created");
     }
 
     Ok(Worktree {
@@ -194,10 +195,19 @@ fn run_git(args: &[&std::ffi::OsStr]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::PkgBase;
     use crate::testing::git;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use tempfile::TempDir;
+
+    /// `add_or_reset` calls a checkout/reset on a branch whose name happens
+    /// to be the pkgbase in production. In these tests the branch is the
+    /// repo's default `main`, so wrap it in `PkgBase` to satisfy the typed
+    /// signature without pretending it's a real pkgbase.
+    fn branch(name: &str) -> PkgBase {
+        PkgBase::from(name)
+    }
 
     /// Build a tiny bare repo via the system `git` CLI; gix opens it for the
     /// `MirrorRepo` wrapper. Both sides are real, no hand-built admin dirs.
@@ -234,7 +244,7 @@ mod tests {
         };
         let dest = td.path().join("pkgs/foo");
 
-        let wt = add_or_reset(&mirror, "main", &dest).unwrap();
+        let wt = add_or_reset(&mirror, &branch("main"), &dest).unwrap();
 
         // Tracked files materialized.
         assert!(dest.join("PKGBUILD").exists());
@@ -279,13 +289,13 @@ mod tests {
         let mirror = MirrorRepo { path: bare, repo };
         let dest = td.path().join("pkgs/foo");
 
-        add_or_reset(&mirror, "main", &dest).unwrap();
+        add_or_reset(&mirror, &branch("main"), &dest).unwrap();
         // Simulate a previous makepkg run leaving scratch behind.
         fs::create_dir(dest.join("src")).unwrap();
         fs::write(dest.join("src/downloaded.tar.gz"), b"hi").unwrap();
         fs::write(dest.join("foo-1-1-x86_64.pkg.tar.zst"), b"pkg").unwrap();
 
-        add_or_reset(&mirror, "main", &dest).unwrap();
+        add_or_reset(&mirror, &branch("main"), &dest).unwrap();
 
         assert!(
             dest.join("src/downloaded.tar.gz").exists(),
@@ -310,9 +320,9 @@ mod tests {
         let mirror = MirrorRepo { path: bare, repo };
         let dest = td.path().join("pkgs/foo");
 
-        add_or_reset(&mirror, "main", &dest).unwrap();
+        add_or_reset(&mirror, &branch("main"), &dest).unwrap();
         fs::write(dest.join("PKGBUILD"), b"tampered\n").unwrap();
-        add_or_reset(&mirror, "main", &dest).unwrap();
+        add_or_reset(&mirror, &branch("main"), &dest).unwrap();
         assert_eq!(
             fs::read_to_string(dest.join("PKGBUILD")).unwrap(),
             "pkgname=foo\n",
@@ -331,7 +341,7 @@ mod tests {
         let mirror = MirrorRepo { path: bare, repo };
         let dest = td.path().join("pkgs/foo");
 
-        add_or_reset(&mirror, "main", &dest).unwrap();
+        add_or_reset(&mirror, &branch("main"), &dest).unwrap();
         // Mimic the failure mode: a directory we can't traverse.
         let trap = dest.join("pkg/restricted");
         fs::create_dir_all(&trap).unwrap();

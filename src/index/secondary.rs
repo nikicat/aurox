@@ -1,22 +1,59 @@
 //! Secondary lookup tables built after loading the primary index.
 
 use crate::index::schema::{IndexEntry, IndexFile};
+use crate::names::{PkgBase, PkgName, VirtualName};
 use rayon::prelude::*;
 use smallvec::SmallVec;
 use std::collections::HashMap;
 use tracing::{debug, instrument};
 
+/// How AUR classifies a name from pacman's localdb domain.
+///
+/// Pacman and AUR are two distinct identity domains that share string
+/// shape: a single string like `dotnet-runtime-7.0` can be a pacman
+/// `PkgName` (registered install), an AUR `VirtualName` (declared in
+/// some pkg's `provides=`), an AUR primary `PkgName` (a `pkgname=` line),
+/// or an AUR `PkgBase`. The cross-domain question "given this pacman
+/// pkgname, what does AUR call it?" is what `classify_foreign` answers,
+/// and the tagged enum names which identity matched.
+///
+/// `'a` borrows from the [`IndexFile`] passed to `classify_foreign`.
+#[derive(Debug, Clone, Copy)]
+pub enum AurClass<'a> {
+    /// Pacman pkgname matches an AUR pkg's primary pkgname (`pkgname=`
+    /// in some pkgbase's .SRCINFO). Same identity, both domains.
+    AsPkgname(&'a IndexEntry),
+    /// Pacman pkgname matches some AUR pkg's virtual `provides=` line.
+    /// Cross-domain bridge: pacman-side `PkgName` is lexically equal to
+    /// AUR-side `VirtualName`. The dotnet-rename case.
+    AsProvides(&'a IndexEntry),
+    /// Pacman pkgname matches an AUR pkgbase string. Rare — pacman never
+    /// records a pkgbase as a pkg unless someone built and installed an
+    /// AUR pkg whose pkgname happens to equal its pkgbase, which is the
+    /// canonical non-split case (and then `AsPkgname` would match first).
+    AsPkgbase(&'a IndexEntry),
+    /// AUR doesn't know about this name in any of the three identities.
+    NotInAur,
+}
+
 /// Post-load lookup structure: pkgname / provides / pkgbase → index position.
+///
+/// Each map is keyed on the typed identity it serves: [`PkgName`] for
+/// primary pkgnames, [`VirtualName`] for `provides=` declarations,
+/// [`PkgBase`] for mirror branches. The three are deliberately distinct
+/// at the type level — see [`AurClass`] for the cross-domain bridge.
 pub struct Secondary {
     /// pkgname → entries[idx]. Split pkgs map multiple names to the same idx.
-    pub by_name: HashMap<String, u32>,
-    /// `provides` virtual name → set of entry indices.
-    pub by_provides: HashMap<String, SmallVec<[u32; 2]>>,
+    pub by_name: HashMap<PkgName, u32>,
+    /// `provides=` virtual name → set of entry indices. Keys are
+    /// [`VirtualName`] (NOT [`PkgName`]) — they have distinct semantic
+    /// origin (a satisfies-claim, not a registered name).
+    pub by_provides: HashMap<VirtualName, SmallVec<[u32; 2]>>,
     /// pkgbase → entries[idx]. Used as a last-resort lookup so users can write
     /// `-S <pkgbase>` (yay-style) even when no pkgname equals the pkgbase —
     /// e.g. pkgbase `bisq` produces pkgname `bisq-desktop`. Resolution order
     /// elsewhere keeps pkgname / provides preferred over pkgbase.
-    pub by_pkgbase: HashMap<String, u32>,
+    pub by_pkgbase: HashMap<PkgBase, u32>,
 }
 
 impl Secondary {
@@ -24,7 +61,7 @@ impl Secondary {
     #[instrument(skip(idx), fields(entries = idx.entries.len()))]
     pub fn build(idx: &IndexFile) -> Self {
         let mut by_name = HashMap::with_capacity(idx.entries.len() * 2);
-        let mut by_provides: HashMap<String, SmallVec<[u32; 2]>> = HashMap::new();
+        let mut by_provides: HashMap<VirtualName, SmallVec<[u32; 2]>> = HashMap::new();
         let mut by_pkgbase = HashMap::with_capacity(idx.entries.len());
         for (i, e) in idx.entries.iter().enumerate() {
             let i = u32::try_from(i).expect("AUR index entries exceed u32::MAX");
@@ -39,7 +76,14 @@ impl Secondary {
             // into the concrete pkgname.
             for prov in e.all_provides() {
                 let base = strip_version_constraint(prov);
-                by_provides.entry(base.to_string()).or_default().push(i);
+                // Promote the bare `provides=` line to a typed
+                // `VirtualName` at this single boundary. Distinct from
+                // `PkgName` even when lexically identical (the dotnet
+                // case).
+                by_provides
+                    .entry(VirtualName::new(base))
+                    .or_default()
+                    .push(i);
             }
             by_pkgbase.insert(e.pkgbase.clone(), i);
         }
@@ -71,7 +115,7 @@ impl Secondary {
     ///
     /// `None` means no provides match anywhere in the index (the resolver
     /// should fall back to pkgbase / Missing).
-    pub fn provider_of<'a>(&self, idx: &'a IndexFile, name: &str) -> Option<(usize, &'a str)> {
+    pub fn provider_of<'a>(&self, idx: &'a IndexFile, name: &str) -> Option<(usize, &'a PkgName)> {
         let bare = strip_version_constraint(name);
         let &entry_idx = self.by_provides.get(bare)?.first()?;
         let entry = idx.entries.get(entry_idx as usize)?;
@@ -83,7 +127,7 @@ impl Secondary {
                 .iter()
                 .any(|p| strip_version_constraint(p) == bare)
             {
-                return Some((entry_idx as usize, pkg.name.as_str()));
+                return Some((entry_idx as usize, &pkg.name));
             }
         }
         // No pkgname owned it, so the match came from a pkgbase-level
@@ -92,12 +136,66 @@ impl Secondary {
         entry
             .pkgnames
             .first()
-            .map(|p| (entry_idx as usize, p.name.as_str()))
+            .map(|p| (entry_idx as usize, &p.name))
     }
 
-    /// Resolve a reference to its primary entry. Order matches `classify`:
-    /// pkgname → provides → pkgbase. The pkgbase fallback lets `-Si bisq`
-    /// find an entry whose only pkgname is `bisq-desktop`.
+    /// Classify a pacman-domain pkgname against the AUR index. The
+    /// cross-domain bridge: pacman has `name` registered as an installed
+    /// pkg; this function asks "what does AUR call this string?" and
+    /// returns a tagged enum naming which identity matched. See
+    /// [`AurClass`] for the four cases.
+    ///
+    /// The HashMap probes use `Borrow<str>` to compare the underlying
+    /// string across the three identity-distinct maps — this is the
+    /// *one* place that cross-identity claim is made, and it's named
+    /// (`AsProvides`, `AsPkgbase`) in the return value.
+    pub fn classify_foreign<'a>(&self, idx: &'a IndexFile, name: &PkgName) -> AurClass<'a> {
+        if let Some(i) = self.by_name.get(name) {
+            return AurClass::AsPkgname(&idx.entries[*i as usize]);
+        }
+        // Use `Borrow<str>` to probe maps keyed on the other two identities.
+        // `<PkgName as Borrow<str>>::borrow(name)` returns the underlying
+        // string slice the typed wrappers share — the cross-identity
+        // string-match claim is encapsulated here.
+        let s = <PkgName as std::borrow::Borrow<str>>::borrow(name);
+        if let Some(providers) = self.by_provides.get(s) {
+            if let Some(i) = providers.first() {
+                return AurClass::AsProvides(&idx.entries[*i as usize]);
+            }
+        }
+        if let Some(i) = self.by_pkgbase.get(s) {
+            return AurClass::AsPkgbase(&idx.entries[*i as usize]);
+        }
+        AurClass::NotInAur
+    }
+
+    /// Look up an AUR entry by typed [`PkgName`] — `by_name` only, no
+    /// virtual / pkgbase fallback. For when the caller already knows the
+    /// name should be a primary pkgname in AUR's domain (e.g. resolver
+    /// dep lookup). Cross-domain queries against a foreign pkg go
+    /// through [`Self::classify_foreign`] instead.
+    pub fn lookup_pkgname<'a>(&self, idx: &'a IndexFile, name: &PkgName) -> Option<&'a IndexEntry> {
+        let i = self.by_name.get(name)?;
+        idx.entries.get(*i as usize)
+    }
+
+    /// Look up an AUR entry by typed [`PkgBase`] — `by_pkgbase` only.
+    /// Used by the build pipeline once a pkgbase identity is established.
+    pub fn lookup_pkgbase<'a>(
+        &self,
+        idx: &'a IndexFile,
+        pkgbase: &PkgBase,
+    ) -> Option<&'a IndexEntry> {
+        let i = self.by_pkgbase.get(pkgbase)?;
+        idx.entries.get(*i as usize)
+    }
+
+    /// Resolve a reference to its primary entry from raw user input.
+    /// Order matches `classify`: pkgname → provides → pkgbase. The
+    /// pkgbase fallback lets `-Si bisq` find an entry whose only pkgname
+    /// is `bisq-desktop`. `target` is `&str` because CLI argv is by
+    /// definition unclassified — gitaur doesn't know if the user typed
+    /// a pkgname, a virtual, or a pkgbase.
     pub fn lookup<'a>(&self, idx: &'a IndexFile, target: &str) -> Option<&'a IndexEntry> {
         let bare = strip_version_constraint(target);
         if let Some(i) = self.by_name.get(bare) {
@@ -122,7 +220,7 @@ impl Secondary {
 }
 
 fn entry_matches(e: &IndexEntry, r: &regex::Regex) -> bool {
-    e.pkgnames.iter().any(|p| r.is_match(&p.name))
+    e.pkgnames.iter().any(|p| p.name.matches_regex(r))
         || e.pkgdesc.as_deref().is_some_and(|d| r.is_match(d))
         || e.all_provides().any(|p| r.is_match(p))
 }
@@ -296,9 +394,10 @@ mod tests {
             ..IndexFile::empty()
         };
         let s = Secondary::build(&idx);
+        let (entry_idx, pkgname) = s.provider_of(&idx, "virtual").expect("provider lookup");
+        assert_eq!(entry_idx, 0);
         assert_eq!(
-            s.provider_of(&idx, "virtual"),
-            Some((0, "mypkg")),
+            pkgname, "mypkg",
             "first pkgname is the canonical provider for pkgbase-level provides",
         );
     }

@@ -4,6 +4,7 @@
 //! all sudo work can be batched into a single prompt at the end of the run.
 
 use crate::error::{Error, Result};
+use crate::names::PkgName;
 use glob::glob;
 use std::path::{Path, PathBuf};
 
@@ -24,28 +25,36 @@ pub fn find_produced(worktree: &Path) -> Result<Vec<PathBuf>> {
 
 /// Best-effort pkgname extraction from a package filename.
 /// Format: `<pkgname>-<pkgver>-<pkgrel>-<arch>.pkg.tar.{zst,xz}`.
-pub fn extract_pkgname(path: &Path) -> Option<String> {
+pub fn extract_pkgname(path: &Path) -> Option<PkgName> {
     let stem = path.file_name()?.to_str()?;
     let parts: Vec<&str> = stem.split('-').collect();
     if parts.len() < 4 {
         return None;
     }
     let name_parts = &parts[..parts.len() - 3];
-    Some(name_parts.join("-"))
+    Some(PkgName::new(name_parts.join("-")))
 }
 
 /// True iff `path`'s filename is `<pkgname>-<version>-<arch>.pkg.tar.{zst,xz}`
 /// — i.e. an artifact this exact `(pkgname, version)` would produce.
 /// `version` is the pacman-style `[epoch:]pkgver-pkgrel` string; this match
-/// is what powers the build idempotency check.
-pub fn matches_pkg(path: &Path, pkgname: &str, version: &str) -> bool {
+/// is what powers the build idempotency check. `pkgname` is the typed
+/// `PkgName` (matched against the filename prefix via `Display`).
+pub fn matches_pkg(path: &Path, pkgname: &PkgName, version: &str) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     if !(name.ends_with(".pkg.tar.zst") || name.ends_with(".pkg.tar.xz")) {
         return false;
     }
-    let Some(rest) = name.strip_prefix(pkgname).and_then(|r| r.strip_prefix('-')) else {
+    // Match the pkgname prefix via the wrapped String — `PkgName` deliberately
+    // doesn't expose `as_str`, so `strip_prefix` on the inner is the
+    // dedicated read path for filename comparisons.
+    let pkgname_str = pkgname.to_string();
+    let Some(rest) = name
+        .strip_prefix(&pkgname_str)
+        .and_then(|r| r.strip_prefix('-'))
+    else {
         return false;
     };
     let Some(after_ver) = rest.strip_prefix(version).and_then(|r| r.strip_prefix('-')) else {
@@ -66,19 +75,19 @@ mod tests {
     #[test]
     fn extract_simple_pkgname() {
         let p = Path::new("/x/cower-17-2-x86_64.pkg.tar.zst");
-        assert_eq!(extract_pkgname(p).as_deref(), Some("cower"));
+        assert_eq!(extract_pkgname(p), Some(PkgName::new("cower")));
     }
 
     #[test]
     fn extract_split_pkgname() {
         let p = Path::new("/x/mingw-w64-gcc-libs-13.2.0-1-x86_64.pkg.tar.zst");
-        assert_eq!(extract_pkgname(p).as_deref(), Some("mingw-w64-gcc-libs"));
+        assert_eq!(extract_pkgname(p), Some(PkgName::new("mingw-w64-gcc-libs")));
     }
 
     #[test]
     fn extract_xz_suffix() {
         let p = Path::new("/x/foo-1-1-any.pkg.tar.xz");
-        assert_eq!(extract_pkgname(p).as_deref(), Some("foo"));
+        assert_eq!(extract_pkgname(p), Some(PkgName::new("foo")));
     }
 
     #[test]
@@ -87,40 +96,44 @@ mod tests {
         assert!(extract_pkgname(p).is_none());
     }
 
+    fn pn(s: &str) -> PkgName {
+        PkgName::new(s)
+    }
+
     #[test]
     fn matches_pkg_exact() {
         let p = Path::new("/x/cower-17-2-x86_64.pkg.tar.zst");
-        assert!(matches_pkg(p, "cower", "17-2"));
-        assert!(!matches_pkg(p, "cower", "17-1"));
-        assert!(!matches_pkg(p, "cower", "18-2"));
-        assert!(!matches_pkg(p, "cower-bin", "17-2"));
+        assert!(matches_pkg(p, &pn("cower"), "17-2"));
+        assert!(!matches_pkg(p, &pn("cower"), "17-1"));
+        assert!(!matches_pkg(p, &pn("cower"), "18-2"));
+        assert!(!matches_pkg(p, &pn("cower-bin"), "17-2"));
     }
 
     #[test]
     fn matches_pkg_with_epoch() {
         let p = Path::new("/x/foo-2:1.0-1-x86_64.pkg.tar.zst");
-        assert!(matches_pkg(p, "foo", "2:1.0-1"));
-        assert!(!matches_pkg(p, "foo", "1.0-1"));
+        assert!(matches_pkg(p, &pn("foo"), "2:1.0-1"));
+        assert!(!matches_pkg(p, &pn("foo"), "1.0-1"));
     }
 
     #[test]
     fn matches_pkg_split_pkgname() {
         let p = Path::new("/x/mingw-w64-gcc-libs-13.2.0-1-x86_64.pkg.tar.zst");
-        assert!(matches_pkg(p, "mingw-w64-gcc-libs", "13.2.0-1"));
+        assert!(matches_pkg(p, &pn("mingw-w64-gcc-libs"), "13.2.0-1"));
         // Wrong pkgname: matches as prefix but arch slot would contain a '-'.
-        assert!(!matches_pkg(p, "mingw-w64-gcc", "libs-13.2.0"));
+        assert!(!matches_pkg(p, &pn("mingw-w64-gcc"), "libs-13.2.0"));
     }
 
     #[test]
     fn matches_pkg_xz_suffix() {
         let p = Path::new("/x/foo-1.0-1-any.pkg.tar.xz");
-        assert!(matches_pkg(p, "foo", "1.0-1"));
+        assert!(matches_pkg(p, &pn("foo"), "1.0-1"));
     }
 
     #[test]
     fn matches_pkg_rejects_wrong_suffix() {
         let p = Path::new("/x/foo-1.0-1-any.pkg.tar.gz");
-        assert!(!matches_pkg(p, "foo", "1.0-1"));
+        assert!(!matches_pkg(p, &pn("foo"), "1.0-1"));
     }
 
     #[test]

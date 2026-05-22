@@ -88,8 +88,12 @@ pub fn parse(text: &str) -> Result<IndexEntry> {
         return Err(Error::SrcInfo("missing pkgbase".into()));
     }
     if e.pkgnames.is_empty() {
+        // No `pkgname = …` lines → Arch semantics say pkgname defaults to
+        // pkgbase. `PkgBase::canonical_pkgname` is the dedicated method
+        // for this exact case (see its doc-comment for the narrow valid
+        // uses).
         e.pkgnames.push(Pkgname {
-            name: e.pkgbase.clone(),
+            name: e.pkgbase.canonical_pkgname(),
             provides: Vec::new(),
         });
     }
@@ -153,6 +157,7 @@ fn dedup(v: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::PkgName;
 
     const COWER: &str = r"
 pkgbase = cower
@@ -207,8 +212,8 @@ pkgname = bisq-cli
 pkgname = bisq-daemon
 ";
 
-    fn names(e: &IndexEntry) -> Vec<&str> {
-        e.pkgnames.iter().map(|p| p.name.as_str()).collect()
+    fn names(e: &IndexEntry) -> Vec<&PkgName> {
+        e.pkgnames.iter().map(|p| &p.name).collect()
     }
 
     #[test]

@@ -1,0 +1,17 @@
+# New half of the provides-rename pair. Distinct pkgbase and pkgname from
+# its legacy partner; declares `provides=test-provides-rename-legacy` so an
+# `-S` of this pkg with the legacy already installed exercises the
+# Provides arm of `PacmanIndex::counterpart` end-to-end (alpm → counterpart
+# → review trace). No `replaces=` on purpose — testing the implicit
+# transition path, not the explicit one.
+pkgname=test-provides-rename-new
+pkgver=2.0
+pkgrel=1
+pkgdesc='gitaur test fixture: new half of a provides-rename pair'
+arch=('any')
+license=('MIT')
+provides=('test-provides-rename-legacy')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}

@@ -4,6 +4,7 @@
 //! `super` reads as decisions + state mutation, not ui formatting.
 
 use crate::index::{IndexEntry, IndexFile};
+use crate::names::PkgBase;
 use crate::pacman::alpm_db::PacmanIndex;
 use crate::resolver::Plan;
 use crate::ui;
@@ -63,7 +64,7 @@ fn rows_for_repo(names: &[String], pac: &PacmanIndex) -> Vec<(String, String)> {
 /// Pair each AUR pkgbase with its index version (`[epoch:]pkgver-pkgrel`).
 /// All pkgnames in a split pkgbase share that version, so the pkgbase row
 /// is unambiguous even when only a subset of pkgnames will be installed.
-fn rows_for_aur(pkgbases: &[String], idx: &IndexFile) -> Vec<(String, String)> {
+fn rows_for_aur(pkgbases: &[PkgBase], idx: &IndexFile) -> Vec<(String, String)> {
     pkgbases
         .iter()
         .map(|pb| {
@@ -73,7 +74,7 @@ fn rows_for_aur(pkgbases: &[String], idx: &IndexFile) -> Vec<(String, String)> {
                 .find(|e| e.pkgbase == *pb)
                 .map(IndexEntry::version)
                 .unwrap_or_default();
-            (pb.clone(), ver)
+            (pb.to_string(), ver)
         })
         .collect()
 }
@@ -91,6 +92,8 @@ pub(super) fn final_summary(report: &RunReport) {
     }
     ui::info("build summary");
     if !report.installed.is_empty() {
+        // `Vec<PkgBase>::join` uses `Borrow<str>` to concatenate via the
+        // underlying strings — no per-element conversion needed.
         ui::note(&format!(
             "installed ({}): {}",
             report.installed.len(),
@@ -100,11 +103,11 @@ pub(super) fn final_summary(report: &RunReport) {
     for pb in &report.skipped_user {
         ui::note(&format!("skipped {pb} (user)"));
     }
-    let dep_sorted: BTreeMap<&String, &String> = report.skipped_dep.iter().collect();
+    let dep_sorted: BTreeMap<&PkgBase, &PkgBase> = report.skipped_dep.iter().collect();
     for (pb, blocker) in dep_sorted {
         ui::warn(&format!("skipped {pb} (blocked by {blocker})"));
     }
-    let failed_sorted: BTreeMap<&String, &String> = report.failed.iter().collect();
+    let failed_sorted: BTreeMap<&PkgBase, &String> = report.failed.iter().collect();
     for (pb, msg) in failed_sorted {
         ui::error(&format!("failed {pb}: {msg}"));
     }

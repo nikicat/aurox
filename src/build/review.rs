@@ -12,6 +12,8 @@ use crate::error::{Error, Result};
 use crate::index::srcinfo;
 use crate::mirror::worktree::Worktree;
 use crate::mirror::MirrorRepo;
+use crate::names::PkgBase;
+use crate::pacman::alpm_db::{InstalledCounterpart, MatchedVia};
 use crate::ui;
 use dialoguer::Select;
 use gix::ObjectId;
@@ -41,27 +43,42 @@ pub enum Outcome {
     Skipped,
 }
 
-/// Drive the review prompt loop for one pkgbase. `installed_ver` is the
-/// pacman-localdb version of any pkgname in this pkgbase (None when not
-/// installed); `new_ver` is the version the AUR index reports.
-#[instrument(skip(mirror, wt))]
+/// Drive the review prompt loop for one pkgbase. `counterpart` is the
+/// pacman-localdb pkg this build will displace — `None` for a fresh install,
+/// otherwise carrying the installed pkgname, its version, and how the AUR
+/// entry referenced it (pkgname / replaces / provides). `new_ver` is the
+/// version the AUR index reports for this pkgbase.
+#[instrument(skip(mirror, wt), fields(pkgbase = %pkgbase))]
 pub fn review(
     mirror: &MirrorRepo,
-    pkgbase: &str,
+    pkgbase: &PkgBase,
     new_ver: &str,
-    installed_ver: Option<&str>,
+    counterpart: Option<&InstalledCounterpart<'_>>,
     wt: &Worktree,
     noconfirm: bool,
 ) -> Result<Outcome> {
     if noconfirm {
-        info!(pkgbase, "auto-proceeding (noconfirm)");
+        // Carry counterpart provenance in the trace so non-interactive runs
+        // (container smoke tests, CI, scripts) can still verify that the
+        // installed pkg was correctly resolved across pkgname/replaces/provides.
+        // Without this the noconfirm path is opaque — show() never renders.
+        // `?` (Debug) formats `Option<…>` as `Some(…)` / `None` so the absent
+        // case is grep-distinguishable from a present-but-empty one.
+        info!(
+            %pkgbase,
+            new_ver,
+            installed = ?counterpart.map(|c| c.pkgname),
+            installed_version = ?counterpart.map(|c| c.version),
+            via = ?counterpart.map(|c| c.via),
+            "auto-proceeding (noconfirm)"
+        );
         return Ok(Outcome::Approved);
     }
 
     // Initial render runs once — the loop body dispatches user actions and
     // re-renders only what the user asked for, so picking "view PKGBUILD"
     // isn't immediately clobbered by re-printing the diff above the prompt.
-    let base = show(mirror, pkgbase, new_ver, installed_ver, wt)?;
+    let base = show(mirror, pkgbase, new_ver, counterpart, wt)?;
 
     let items = menu_items(base.is_some());
 
@@ -93,21 +110,17 @@ pub fn review(
 /// caller can decide whether to offer "view full diff".
 fn show(
     mirror: &MirrorRepo,
-    pkgbase: &str,
+    pkgbase: &PkgBase,
     new_ver: &str,
-    installed_ver: Option<&str>,
+    counterpart: Option<&InstalledCounterpart<'_>>,
     wt: &Worktree,
 ) -> Result<Option<ObjectId>> {
-    let header = match installed_ver {
-        None => format!("install: {pkgbase} {new_ver}"),
-        Some(v) if v == new_ver => format!("reinstall: {pkgbase} {new_ver}"),
-        Some(v) => format!("upgrade: {pkgbase} {v} → {new_ver}"),
-    };
-    ui::step(&header);
+    ui::step(&header(pkgbase, new_ver, counterpart));
 
-    // Fresh install or reinstall: no historic version to diff against, so the
-    // full PKGBUILD is the only meaningful review surface.
-    let Some(installed) = installed_ver.filter(|v| *v != new_ver) else {
+    // Anything that isn't a real upgrade (fresh install, reinstall of the
+    // canonical pkgname) has no historic version to diff against — show the
+    // full PKGBUILD.
+    let Some(installed) = upgrade_base_version(new_ver, counterpart) else {
         show_pkgbuild(wt)?;
         return Ok(None);
     };
@@ -116,11 +129,85 @@ fn show(
         show_diff(mirror, wt, base, None)?;
         Ok(Some(base))
     } else {
-        ui::note(&format!(
-            "no AUR commit in the last {MAX_HISTORY_SCAN} matches installed {installed}; showing full PKGBUILD"
-        ));
+        let c = counterpart.expect("upgrade_base_version is Some only when counterpart is Some");
+        ui::note(&fallback_note(pkgbase, c));
         show_pkgbuild(wt)?;
         Ok(None)
+    }
+}
+
+/// Label the review screen. Six cases, derived from `counterpart`:
+///
+/// | counterpart                              | label                                                     |
+/// | ---------------------------------------- | --------------------------------------------------------- |
+/// | `None`                                   | `install: {pkgbase} {new}`                                |
+/// | `Some(via=Pkgname, ver==new)`            | `reinstall: {pkgbase} {new}`                              |
+/// | `Some(via=Pkgname)`                      | `upgrade: {pkgbase} {ver} → {new}`                        |
+/// | `Some(via=Replaces)`                     | `upgrade: {pkgbase} {ver} → {new}  [replaces {name}]`     |
+/// | `Some(via=Provides, name==pkgbase)`      | `upgrade: {pkgbase} {ver} → {new}`                        |
+/// | `Some(via=Provides)`                     | `upgrade: {pkgbase} {ver} → {new}  [provides {name}]`     |
+///
+/// The `[…]` annotation appears exactly when the user's installed pkgname
+/// differs from the build target — that's the moment they need to know
+/// "you're not upgrading literally the thing you have installed; this is a
+/// transition." A `Provides` match against a name equal to the pkgbase
+/// (degenerate) doesn't get the annotation because there's nothing to
+/// distinguish for the reader. `Reinstall` is reserved for `Pkgname` matches:
+/// a `Provides`/`Replaces` match with coincidentally-equal versions is still
+/// a transition, not a reinstall, and showing it as a diff is more honest.
+fn header(
+    pkgbase: &PkgBase,
+    new_ver: &str,
+    counterpart: Option<&InstalledCounterpart<'_>>,
+) -> String {
+    let Some(c) = counterpart else {
+        return format!("install: {pkgbase} {new_ver}");
+    };
+    if c.via == MatchedVia::Pkgname && c.version == new_ver {
+        return format!("reinstall: {pkgbase} {new_ver}");
+    }
+    let head = format!("upgrade: {pkgbase} {} → {new_ver}", c.version);
+    match c.via {
+        MatchedVia::Pkgname => head,
+        MatchedVia::Replaces => format!("{head}  [replaces {}]", c.pkgname),
+        MatchedVia::Provides if pkgbase.matches_pkgname(c.pkgname) => head,
+        MatchedVia::Provides => format!("{head}  [provides {}]", c.pkgname),
+    }
+}
+
+/// The installed version to feed [`find_installed_commit`] when this is a
+/// real upgrade, or `None` for install / canonical-reinstall. Pulled out so
+/// `show` keeps a single dispatch and so the rule is unit-testable.
+///
+/// Provides/Replaces matches with `ver == new_ver` still count as upgrades
+/// here: the history walk lets us *try* to show a diff (case A in the design
+/// table — pkgname rename inside the same pkgbase). If the walk misses, we
+/// fall back to full PKGBUILD with a provenance-aware note.
+fn upgrade_base_version<'a>(
+    new_ver: &str,
+    counterpart: Option<&'a InstalledCounterpart<'_>>,
+) -> Option<&'a str> {
+    let c = counterpart?;
+    match c.via {
+        MatchedVia::Pkgname if c.version == new_ver => None,
+        _ => Some(c.version),
+    }
+}
+
+/// The "no diff base found" note. Provenance-aware so a provides/replaces
+/// transition reads naturally — searching the new pkgbase's history for
+/// `dotnet-runtime-7.0`'s version was always going to fail; the user
+/// shouldn't have to puzzle out why.
+fn fallback_note(pkgbase: &PkgBase, c: &InstalledCounterpart<'_>) -> String {
+    match c.via {
+        MatchedVia::Pkgname => format!(
+            "no AUR commit in the last {MAX_HISTORY_SCAN} of {pkgbase} matches installed {} ({}); showing full PKGBUILD",
+            c.pkgname, c.version,
+        ),
+        MatchedVia::Replaces | MatchedVia::Provides => format!(
+            "no AUR commit of {pkgbase} produced installed {} ({}); showing full PKGBUILD",
+            c.pkgname, c.version,
+        ),
     }
 }
 
@@ -250,10 +337,48 @@ pub fn find_installed_commit(
 
 #[cfg(test)]
 mod tests {
-    use super::{diff_command, menu_items, FULL_DIFF_CONTEXT};
+    use super::{
+        diff_command, fallback_note, header, menu_items, upgrade_base_version, FULL_DIFF_CONTEXT,
+        MAX_HISTORY_SCAN,
+    };
+    use crate::names::{PkgBase, PkgName};
+    use crate::pacman::alpm_db::{InstalledCounterpart, MatchedVia};
     use gix::hash::Kind;
     use gix::ObjectId;
     use std::path::Path;
+
+    /// Owning fixture for an `InstalledCounterpart`. `InstalledCounterpart`
+    /// borrows its `pkgname`, so tests need a stable address — `Fixture`
+    /// holds the `PkgName` value and hands out an `InstalledCounterpart`
+    /// borrowing into itself. One `let f = fx(...)` per test, then `f.cp()`.
+    struct Fixture {
+        pkgname: PkgName,
+        version: String,
+        via: MatchedVia,
+    }
+
+    impl Fixture {
+        fn cp(&self) -> InstalledCounterpart<'_> {
+            InstalledCounterpart {
+                pkgname: &self.pkgname,
+                version: &self.version,
+                via: self.via,
+            }
+        }
+    }
+
+    fn fx(pkgname: &str, version: &str, via: MatchedVia) -> Fixture {
+        Fixture {
+            pkgname: PkgName::from(pkgname),
+            version: version.to_owned(),
+            via,
+        }
+    }
+
+    /// Pkgbase literal helper for the `header` / `fallback_note` signature.
+    fn pb(s: &str) -> PkgBase {
+        PkgBase::from(s)
+    }
 
     fn args_of(cmd: &std::process::Command) -> Vec<String> {
         cmd.get_args()
@@ -332,6 +457,145 @@ mod tests {
         // Pathspec separator and target file at the tail.
         let tail: Vec<&str> = args.iter().rev().take(2).map(String::as_str).collect();
         assert_eq!(tail, ["PKGBUILD", "--"]);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // header() — six rows from the design table in the doc-comment above.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn header_install_when_no_counterpart() {
+        assert_eq!(header(&pb("foo"), "1.0-1", None), "install: foo 1.0-1");
+    }
+
+    #[test]
+    fn header_reinstall_when_canonical_pkgname_at_same_version() {
+        let f = fx("foo", "1.0-1", MatchedVia::Pkgname);
+        assert_eq!(
+            header(&pb("foo"), "1.0-1", Some(&f.cp())),
+            "reinstall: foo 1.0-1"
+        );
+    }
+
+    #[test]
+    fn header_upgrade_canonical_pkgname() {
+        let f = fx("foo", "1.0-1", MatchedVia::Pkgname);
+        assert_eq!(
+            header(&pb("foo"), "1.1-1", Some(&f.cp())),
+            "upgrade: foo 1.0-1 → 1.1-1"
+        );
+    }
+
+    /// Split pkgbase: installed pkgname != pkgbase but still matched by
+    /// pkgname. The pkgbase is what we build, so the header keeps it without
+    /// further annotation — the sibling identity is just a detail.
+    #[test]
+    fn header_upgrade_split_sibling_no_annotation() {
+        let f = fx("bisq-cli", "1.9-1", MatchedVia::Pkgname);
+        assert_eq!(
+            header(&pb("bisq"), "2.0-1", Some(&f.cp())),
+            "upgrade: bisq 1.9-1 → 2.0-1"
+        );
+    }
+
+    #[test]
+    fn header_upgrade_via_replaces_annotates() {
+        let f = fx("old-foo", "0.9-1", MatchedVia::Replaces);
+        assert_eq!(
+            header(&pb("foo-ng"), "1.0-1", Some(&f.cp())),
+            "upgrade: foo-ng 0.9-1 → 1.0-1  [replaces old-foo]"
+        );
+    }
+
+    #[test]
+    fn header_upgrade_via_provides_annotates() {
+        let f = fx("dotnet-runtime-7.0", "7.0.15-1", MatchedVia::Provides);
+        assert_eq!(
+            header(&pb("dotnet-core-7.0-bin"), "7.0.20-2", Some(&f.cp())),
+            "upgrade: dotnet-core-7.0-bin 7.0.15-1 → 7.0.20-2  [provides dotnet-runtime-7.0]"
+        );
+    }
+
+    /// Degenerate case: provides match where the installed name equals the
+    /// pkgbase. No annotation, since there's nothing to disambiguate.
+    #[test]
+    fn header_upgrade_via_provides_omits_annotation_when_name_equals_pkgbase() {
+        let f = fx("foo", "1.0-1", MatchedVia::Provides);
+        assert_eq!(
+            header(&pb("foo"), "1.1-1", Some(&f.cp())),
+            "upgrade: foo 1.0-1 → 1.1-1"
+        );
+    }
+
+    /// Reinstall classification is reserved for `Pkgname` matches —
+    /// coincidental version equality across a provides/replaces transition
+    /// is still a transition, and we'd rather show a diff (which falls back
+    /// to full PKGBUILD when history misses) than mislabel it as reinstall.
+    #[test]
+    fn header_does_not_call_provides_transition_a_reinstall() {
+        let f = fx("old-foo", "1.0-1", MatchedVia::Provides);
+        assert_eq!(
+            header(&pb("foo-ng"), "1.0-1", Some(&f.cp())),
+            "upgrade: foo-ng 1.0-1 → 1.0-1  [provides old-foo]"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // upgrade_base_version() — controls whether we attempt a diff at all.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upgrade_base_none_when_no_counterpart() {
+        assert_eq!(upgrade_base_version("1.0-1", None), None);
+    }
+
+    #[test]
+    fn upgrade_base_none_for_canonical_reinstall() {
+        let f = fx("foo", "1.0-1", MatchedVia::Pkgname);
+        assert_eq!(upgrade_base_version("1.0-1", Some(&f.cp())), None);
+    }
+
+    #[test]
+    fn upgrade_base_some_for_canonical_upgrade() {
+        let f = fx("foo", "1.0-1", MatchedVia::Pkgname);
+        assert_eq!(upgrade_base_version("1.1-1", Some(&f.cp())), Some("1.0-1"));
+    }
+
+    /// Even at equal version, a provides/replaces match should attempt a
+    /// diff — the history walk decides the outcome.
+    #[test]
+    fn upgrade_base_some_for_provides_even_at_same_version() {
+        let f = fx("old", "1.0-1", MatchedVia::Provides);
+        assert_eq!(upgrade_base_version("1.0-1", Some(&f.cp())), Some("1.0-1"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // fallback_note() — phrasing depends on provenance.
+    // ──────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fallback_note_pkgname_mentions_history_bound() {
+        let f = fx("foo", "0.5-1", MatchedVia::Pkgname);
+        let note = fallback_note(&pb("foo"), &f.cp());
+        assert!(
+            note.contains(&MAX_HISTORY_SCAN.to_string()),
+            "pkgname-match note should mention the history bound: {note}"
+        );
+        assert!(note.contains("foo (0.5-1)"));
+    }
+
+    #[test]
+    fn fallback_note_provides_does_not_mention_history_bound() {
+        // The mismatch isn't about "we didn't look back far enough" — it's
+        // about lineage. The note should reflect that.
+        let f = fx("old", "0.5-1", MatchedVia::Provides);
+        let note = fallback_note(&pb("new"), &f.cp());
+        assert!(
+            !note.contains(&MAX_HISTORY_SCAN.to_string()),
+            "provides-match note should not mention the history bound: {note}"
+        );
+        assert!(note.contains("old (0.5-1)"));
+        assert!(note.contains("new"));
     }
 }
 

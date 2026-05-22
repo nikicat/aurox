@@ -139,6 +139,177 @@ do via rayon — can't share `&Alpm`. So `PacmanIndex::build(&Alpm)`
 snapshots the local + sync DBs into owned `HashMap`/`HashSet` once;
 classification then becomes pure data, parallelisable, and cheap.
 
+### Resolving the installed counterpart of an AUR entry
+
+> Code: `PacmanIndex::counterpart` (`src/pacman/alpm_db.rs`), consumed by
+> `prepare_one` (`src/build.rs`) and rendered by `review::header`
+> (`src/build/review.rs`).
+
+When `gitaur` is about to build an AUR pkgbase it needs to answer one
+question: **what does the user currently have installed that this build will
+displace?** The label on the review screen ("install" / "reinstall" /
+"upgrade"), the choice of a diff base for the PKGBUILD review, and the
+fallback note all hinge on it. There are four independent pacman/AUR
+mechanisms by which a build can displace an installed pkg, and conflating
+them produced [the dotnet-runtime regression](#dotnet-runtime-case): a
+provides-substitution upgrade was rendered as a fresh install with no diff.
+The fix is one helper that classifies the answer by provenance.
+
+#### Provenance hierarchy
+
+`PacmanIndex::counterpart(entry)` walks the entry in priority order and
+returns the first hit, tagged with how it matched:
+
+| Priority | Source                            | Provenance | Why this rank                                                                 |
+| -------- | --------------------------------- | ---------- | ----------------------------------------------------------------------------- |
+| 1        | `entry.pkgnames[*].name`          | `Pkgname`  | The literal "is the thing I'm building already installed under that name?". Canonical pkgs and split-pkg siblings (Bisq shape) both land here. |
+| 2        | `entry.replaces[*]`               | `Replaces` | An explicit "this build supersedes that pkg" declared by the maintainer. Strongest rename signal short of an actual pkgname match. |
+| 3a       | `entry.pkgnames[*].provides[*]`   | `Provides` | Pkgname-scoped: the providing-pkgname is what `provides=X` is attached to. More specific than pkgbase-level. |
+| 3b       | `entry.provides[*]`               | `Provides` | Pkgbase-level provides (declared before any `pkgname = …` in `.SRCINFO`) — applies to every pkgname implicitly. |
+
+Within each tier the first hit in declaration order wins, so the choice is
+deterministic across runs (`Vec` ordering is stable). Versioned names like
+`provides = libfoo=1.2` go through `strip_version_constraint` before
+lookup; the version on the returned struct is **always** the localdb
+version of the matched pkgname, never the virtual version baked into the
+suffix. `None` means no match → fresh install.
+
+Why `Pkgname > Replaces > Provides`:
+
+- A canonical match (the pkg I'm building is already in your localdb)
+  trumps any rename signal, even one the maintainer explicitly declared.
+  This is the load-bearing case for partial-split reinstalls — if the
+  maintainer left a stale `replaces=` of the pkgname they still ship, we
+  must not classify that as a rename.
+- `Replaces` is an explicit declaration; `Provides` is an implicit
+  transition. When both could match the same legacy pkg, the explicit
+  declaration is the one we cite.
+- Scoped provides (3a) beats pkgbase-level (3b) for the same reason:
+  attribution to a specific pkgname is more informative than a top-level
+  blanket.
+
+#### Header labelling
+
+`review::header(pkgbase, new_ver, counterpart)` is a pure function
+deriving the screen label from the counterpart. The `[…]` annotation
+fires exactly when the user's installed pkgname differs from the pkgbase
+being built — that's when the reader needs to know "this is a transition,
+not an upgrade of literally the thing you have installed."
+
+| `counterpart`                                  | Header                                                            |
+| ---------------------------------------------- | ----------------------------------------------------------------- |
+| `None`                                         | `install: {pkgbase} {new}`                                        |
+| `Some(via=Pkgname, ver==new)`                  | `reinstall: {pkgbase} {new}`                                      |
+| `Some(via=Pkgname)`                            | `upgrade: {pkgbase} {ver} → {new}`                                |
+| `Some(via=Replaces)`                           | `upgrade: {pkgbase} {ver} → {new}  [replaces {name}]`             |
+| `Some(via=Provides, name==pkgbase)`            | `upgrade: {pkgbase} {ver} → {new}`                                |
+| `Some(via=Provides)`                           | `upgrade: {pkgbase} {ver} → {new}  [provides {name}]`             |
+
+"Reinstall" is reserved for `Pkgname` matches. A `Provides` / `Replaces`
+match with coincidentally-equal versions is still a transition between
+two different installed identities, not a reinstall, and `upgrade_base_version`
+keeps trying the history walk for those cases — `find_installed_commit`'s
+fallback to full PKGBUILD is the right outcome if the walk misses, but
+mislabelling it "reinstall" up front hides what's happening.
+
+#### Diff base + fallback note
+
+`find_installed_commit` walks the new pkgbase's bare-mirror branch
+looking for a commit whose `.SRCINFO` declared `counterpart.version`,
+bounded by `MAX_HISTORY_SCAN = 64`. Three outcomes:
+
+| Scenario                                                                                  | Walk result | What the user sees                              |
+| ----------------------------------------------------------------------------------------- | ----------- | ----------------------------------------------- |
+| Canonical / split: same pkgbase lineage as the installed pkg                              | Match       | Real diff against the historic SRCINFO commit.  |
+| Pkgname rename inside the same pkgbase (SRCINFO still has the matching `pkgver-pkgrel`)   | Match       | Real diff — the rename itself shows up in it.   |
+| AUR pkgbase rename or provides transition (different mirror branch entirely — case B)     | Miss        | `fallback_note` (provenance-aware) → full PKGBUILD. |
+| Stale install older than `MAX_HISTORY_SCAN` commits, or VCS pkgbase whose pkgver is dynamic | Miss        | Same fallback, but the note mentions the bound. |
+
+The fallback note is phrased by provenance:
+
+- `Pkgname` miss → "no AUR commit in the last 64 of `{pkgbase}` matches
+  installed `{pkgname}` (`{ver}`)" — bounded walk, *might* be too short.
+- `Replaces` / `Provides` miss → "no AUR commit of `{pkgbase}` produced
+  installed `{pkgname}` (`{ver}`)" — explicitly *not* about the bound;
+  it's a lineage mismatch. The history of `dotnet-core-7.0-bin` was
+  never going to produce a `dotnet-runtime-7.0-*` artifact, and the
+  message says so.
+
+#### Worked examples
+
+**Canonical upgrade.** User has `neovim 0.10.0-1`. AUR pkgbase `neovim` is
+at `0.10.1-1`.
+
+```
+counterpart = Pkgname(neovim, 0.10.0-1)
+header      = "upgrade: neovim 0.10.0-1 → 0.10.1-1"
+walk        = match (same branch, same pkgver in older commit) → diff
+```
+
+**Split pkgbase, one sibling installed.** User has `bisq-cli 2.0-1`.
+Pkgbase `bisq` produces `bisq-cli`, `bisq-daemon`, `bisq-desktop` at
+`2.1-1`; `bisq-desktop` declares `provides = bisq` (scoped).
+
+```
+counterpart = Pkgname(bisq-cli, 2.0-1)        // Pkgname beats Provides
+header      = "upgrade: bisq 2.0-1 → 2.1-1"   // no [...] annotation
+walk        = match → diff against last bisq-cli SRCINFO of 2.0-1
+```
+
+<a name="dotnet-runtime-case"></a>**Provides rename across pkgbases (the
+dotnet case).** User has `dotnet-runtime-7.0 7.0.15-1` from an old AUR
+pkgbase that no longer exists. The current AUR pkgbase
+`dotnet-core-7.0-bin` produces pkgname `dotnet-core-7.0-bin` declaring
+`provides = dotnet-runtime-7.0`.
+
+```
+counterpart = Provides(dotnet-runtime-7.0, 7.0.15-1)
+header      = "upgrade: dotnet-core-7.0-bin 7.0.15-1 → 7.0.20.sdk410-2  [provides dotnet-runtime-7.0]"
+walk        = miss (different lineage)
+            → note: "no AUR commit of dotnet-core-7.0-bin produced installed dotnet-runtime-7.0 (7.0.15-1); showing full PKGBUILD"
+            → full PKGBUILD shown
+```
+
+Before the counterpart helper landed, this scenario rendered as
+`install: dotnet-core-7.0-bin 7.0.20.sdk410-2` with the full PKGBUILD and
+no upgrade context — leaving the user to guess whether they were doing a
+fresh install or an upgrade.
+
+**Explicit `replaces=`.** Maintainer renamed a pkg and declared
+`replaces=old-foo` in the new PKGBUILD. User still has `old-foo`.
+
+```
+counterpart = Replaces(old-foo, 0.9-1)
+header      = "upgrade: foo-ng 0.9-1 → 1.0-1  [replaces old-foo]"
+walk        = miss (different pkgbase) → fallback note + full PKGBUILD
+```
+
+**Transitional state — user has both old and new.** Happens when the
+old pkg lacked `replaces=` so pacman didn't auto-remove it.
+
+```
+localdb     = { foo-ng@2.0-1, old-foo@0.9-1 }
+counterpart = Pkgname(foo-ng, 2.0-1)          // Pkgname wins over Replaces/Provides
+header      = "upgrade: foo-ng 2.0-1 → 2.1-1"
+walk        = match → diff
+```
+
+#### What this design deliberately does not change
+
+- **Picker label** (`-Syu`): keeps showing the foreign pkgname
+  (`dotnet-runtime-7.0`) — that's the name the user typed `pacman -Q`
+  to see. The counterpart provenance is a review-time concern.
+- **`pacman -U`'s removal behaviour**: owned by the PKGBUILD's
+  `replaces=` declaration. Gitaur hands pacman the files; pacman's own
+  rules govern whether the old pkg comes out.
+- **Idempotency check** in `prepare_one`: keys on
+  `entry.pkgnames × new_ver` against the on-disk `.pkg.tar.zst` set.
+  That's a build-artifact question, not an installed-state question,
+  and stays as-is.
+- **Schema bump**: `entry.replaces` is already in v2; per-pkgname
+  `replaces` doesn't exist but isn't needed — AUR maintainers
+  overwhelmingly declare `replaces` at the pkgbase level.
+
 ### Why per-worker `gix::Repository` clones in `full_build`?
 
 `gix::Repository` is `Send` but **not** `Sync` — it carries interior

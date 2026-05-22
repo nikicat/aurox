@@ -9,6 +9,7 @@ pub mod error;
 pub mod index;
 pub mod logging;
 pub mod mirror;
+pub mod names;
 pub mod pacman;
 pub mod paths;
 pub mod resolver;

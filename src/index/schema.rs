@@ -1,5 +1,6 @@
 //! On-disk index schema. Persisted via `rkyv 0.8` zero-copy archive.
 
+use crate::names::{PkgBase, PkgName};
 use rkyv::{Archive, Deserialize, Serialize};
 
 /// One pkgname's metadata inside a pkgbase. Split-package PKGBUILDs override
@@ -14,7 +15,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pkgname {
     /// The pkgname itself.
-    pub name: String,
+    pub name: PkgName,
     /// `provides = …` declared inside this pkgname's section in `.SRCINFO`.
     /// Empty for the common case where a pkgbase declares all its provides
     /// at the top level.
@@ -25,7 +26,7 @@ pub struct Pkgname {
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
 pub struct IndexEntry {
     /// Pkgbase (also the branch name on the mirror).
-    pub pkgbase: String,
+    pub pkgbase: PkgBase,
     /// All pkgnames produced by this pkgbase, with their pkgname-scoped
     /// metadata. Single entry for non-split pkgs (where `pkgbase == name`).
     pub pkgnames: Vec<Pkgname>,
@@ -103,10 +104,13 @@ impl IndexEntry {
 }
 
 impl IndexFile {
-    /// Current format version constant. Bumped to **2** when pkgname-scoped
-    /// provides moved from a flat `e.provides` list to per-`Pkgname` slots.
-    /// v1 archives must be rebuilt via `gitaur -Sy`.
-    pub const FORMAT_VERSION: u32 = 2;
+    /// Current format version constant. Bumped to **3** when `pkgbase` and
+    /// `Pkgname.name` switched from `String` to the typed `PkgBase` / `PkgName`
+    /// newtypes. rkyv archives are distinct per Rust type even when the
+    /// underlying bytes match, so loading a v2 file with v3 types would
+    /// silently mis-shape the deserialized struct without the version
+    /// gate. v1/v2 archives must be rebuilt via `gitaur -Sy`.
+    pub const FORMAT_VERSION: u32 = 3;
 
     /// Empty in-memory index. Used when no on-disk file exists yet.
     pub fn empty() -> Self {

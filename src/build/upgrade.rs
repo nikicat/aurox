@@ -52,13 +52,22 @@ fn aur_upgrades(
 ) -> Vec<PkgUpgrade> {
     let mut out = Vec::new();
     for (name, installed_ver) in pac.foreign() {
-        let Some(entry) = by.lookup(idx, &name) else {
-            if !is_makepkg_split(&name) {
-                warn!(name, "foreign pkg not in AUR index");
+        // Cross-domain classifier: pacman has `name` as a localdb pkgname;
+        // we ask AUR how it relates — own pkgname / provides / pkgbase /
+        // unknown. The provides arm is what surfaces dotnet-style
+        // renames (foreign `dotnet-runtime-7.0` matched by an AUR pkg's
+        // `provides=` declaration).
+        use crate::index::secondary::AurClass;
+        let entry = match by.classify_foreign(idx, &name) {
+            AurClass::AsPkgname(e) | AurClass::AsProvides(e) | AurClass::AsPkgbase(e) => e,
+            AurClass::NotInAur => {
+                if !name.is_makepkg_debug_split() {
+                    warn!(%name, "foreign pkg not in AUR index");
+                }
+                continue;
             }
-            continue;
         };
-        let is_vcs = is_vcs_pkg(&entry.pkgbase);
+        let is_vcs = entry.pkgbase.is_vcs();
         if !devel && is_vcs {
             continue;
         }
@@ -76,43 +85,5 @@ fn aur_upgrades(
     out
 }
 
-fn is_vcs_pkg(pkgbase: &str) -> bool {
-    pkgbase.ends_with("-git")
-        || pkgbase.ends_with("-svn")
-        || pkgbase.ends_with("-hg")
-        || pkgbase.ends_with("-bzr")
-}
-
-/// `-debug` packages are makepkg split outputs tied to a parent pkgbase
-/// (produced by `OPTIONS=(debug)` in `makepkg.conf`), so they never appear
-/// in the AUR index on their own.
-fn is_makepkg_split(name: &str) -> bool {
-    name.ends_with("-debug")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detects_vcs_suffixes() {
-        assert!(is_vcs_pkg("neovim-git"));
-        assert!(is_vcs_pkg("foo-svn"));
-        assert!(is_vcs_pkg("bar-hg"));
-        assert!(is_vcs_pkg("baz-bzr"));
-        assert!(!is_vcs_pkg("neovim"));
-        assert!(!is_vcs_pkg("git-lfs"));
-    }
-
-    #[test]
-    fn detects_makepkg_debug_splits() {
-        assert!(is_makepkg_split("systemd-cron-debug"));
-        assert!(is_makepkg_split("brlaser-debug"));
-        // Explicit split packages declared in `pkgname=(...)` get their own
-        // AUR entries — only the makepkg-generated `-debug` suffix is mute.
-        assert!(!is_makepkg_split("paru-bin"));
-        assert!(!is_makepkg_split("neovim-git"));
-        assert!(!is_makepkg_split("foo-libs"));
-        assert!(!is_makepkg_split("sequoia-keyring-linter"));
-    }
-}
+// `-debug` recognition is on `PkgName::is_makepkg_debug_split` — see
+// `crate::names`. Tests live there too.

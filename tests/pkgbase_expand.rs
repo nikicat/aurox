@@ -19,6 +19,7 @@ use gitaur::error::Result;
 use gitaur::index::build::full_build;
 use gitaur::index::secondary::Secondary;
 use gitaur::mirror::MirrorRepo;
+use gitaur::names::{PkgBase, PkgName, PkgTargetSetExt};
 use gitaur::pacman::alpm_db::PacmanIndex;
 use gitaur::resolver::{expand_pkgbase_targets, resolve};
 use gitaur::testing::git;
@@ -68,10 +69,10 @@ fn pkgbase_only_target_expands_with_pkgbase_target_and_direct_pkgnames() {
     let pac = PacmanIndex::default();
 
     let mut select_called = false;
-    let mut select = |pkgbase: &str, pkgnames: &[String]| -> Result<Vec<String>> {
+    let mut select = |pkgbase: &PkgBase, pkgnames: &[PkgName]| -> Result<Vec<PkgName>> {
         select_called = true;
-        assert_eq!(pkgbase, "bisq");
-        assert_eq!(pkgnames, &["bisq-desktop".to_string()]);
+        assert_eq!(pkgbase, &PkgBase::from("bisq"));
+        assert_eq!(pkgnames, &[PkgName::from("bisq-desktop")]);
         Ok(pkgnames.to_vec())
     };
     let expanded =
@@ -87,7 +88,7 @@ fn pkgbase_only_target_expands_with_pkgbase_target_and_direct_pkgnames() {
     );
     assert_eq!(
         expanded.direct_pkgnames,
-        vec!["bisq-desktop".to_string()],
+        vec![PkgName::from("bisq-desktop")],
         "the chosen pkgname is the user's actual direct target",
     );
     assert!(
@@ -99,9 +100,12 @@ fn pkgbase_only_target_expands_with_pkgbase_target_and_direct_pkgnames() {
     // the caller-side direct_pkgnames merge lets install_stratum recognise
     // bisq-desktop as Explicit.
     let mut plan = resolve(&cfg, &idx, Some(&by), &pac, &expanded.targets).unwrap();
-    plan.direct_targets.extend(expanded.direct_pkgnames);
-    assert_eq!(plan.aur_strata, vec![vec!["bisq".to_string()]]);
-    assert!(plan.direct_targets.contains("bisq-desktop"));
+    plan.direct_targets
+        .extend(expanded.direct_pkgnames.into_iter().map(Into::into));
+    assert_eq!(plan.aur_strata, vec![vec![PkgBase::from("bisq")]]);
+    assert!(plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("bisq-desktop")));
 }
 
 #[test]
@@ -126,12 +130,12 @@ fn split_pkgbase_partial_selection_constrains_build_pipeline() {
     let pac = PacmanIndex::default();
 
     // User picks only two of the three split pkgnames.
-    let mut select = |pkgbase: &str, pkgnames: &[String]| -> Result<Vec<String>> {
-        assert_eq!(pkgbase, "linux-headers-multi");
+    let mut select = |pkgbase: &PkgBase, pkgnames: &[PkgName]| -> Result<Vec<PkgName>> {
+        assert_eq!(pkgbase, &PkgBase::from("linux-headers-multi"));
         assert_eq!(pkgnames.len(), 3);
         Ok(vec![
-            "linux-headers-multi-core".to_string(),
-            "linux-headers-multi-extras".to_string(),
+            PkgName::from("linux-headers-multi-core"),
+            PkgName::from("linux-headers-multi-extras"),
         ])
     };
     let expanded = expand_pkgbase_targets(
@@ -151,29 +155,38 @@ fn split_pkgbase_partial_selection_constrains_build_pipeline() {
     assert_eq!(
         expanded.direct_pkgnames,
         vec![
-            "linux-headers-multi-core".to_string(),
-            "linux-headers-multi-extras".to_string(),
+            PkgName::from("linux-headers-multi-core"),
+            PkgName::from("linux-headers-multi-extras"),
         ],
     );
     assert_eq!(
-        expanded.selections.get("linux-headers-multi"),
+        expanded
+            .selections
+            .get(&PkgBase::from("linux-headers-multi")),
         Some(&vec![
-            "linux-headers-multi-core".to_string(),
-            "linux-headers-multi-extras".to_string(),
+            PkgName::from("linux-headers-multi-core"),
+            PkgName::from("linux-headers-multi-extras"),
         ]),
         "partial selection must be recorded so the install filter can apply it",
     );
 
     let mut plan = resolve(&cfg, &idx, Some(&by), &pac, &expanded.targets).unwrap();
     plan.pkgname_selections = expanded.selections;
-    plan.direct_targets.extend(expanded.direct_pkgnames);
+    plan.direct_targets
+        .extend(expanded.direct_pkgnames.into_iter().map(Into::into));
     assert_eq!(
         plan.aur_strata,
-        vec![vec!["linux-headers-multi".to_string()]]
+        vec![vec![PkgBase::from("linux-headers-multi")]]
     );
-    assert!(plan.direct_targets.contains("linux-headers-multi-core"));
-    assert!(plan.direct_targets.contains("linux-headers-multi-extras"));
-    assert!(!plan.direct_targets.contains("linux-headers-multi-docs"));
+    assert!(plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("linux-headers-multi-core")));
+    assert!(plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("linux-headers-multi-extras")));
+    assert!(!plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("linux-headers-multi-docs")));
     assert_eq!(plan.pkgname_selections.len(), 1);
 }
 
@@ -205,7 +218,7 @@ fn provides_target_rewrites_to_providing_pkgname_with_selection() {
     let pac = PacmanIndex::default();
 
     let mut selector_invoked = false;
-    let mut select = |_p: &str, _n: &[String]| -> Result<Vec<String>> {
+    let mut select = |_p: &PkgBase, _n: &[PkgName]| -> Result<Vec<PkgName>> {
         selector_invoked = true;
         Ok(vec![])
     };
@@ -223,23 +236,35 @@ fn provides_target_rewrites_to_providing_pkgname_with_selection() {
     );
     assert_eq!(
         expanded.direct_pkgnames,
-        vec!["bisq-desktop".to_string()],
+        vec![PkgName::from("bisq-desktop")],
         "the providing pkgname is the user's actual direct target",
     );
     assert_eq!(
-        expanded.selections.get("bisq"),
-        Some(&vec!["bisq-desktop".to_string()]),
+        expanded.selections.get(&PkgBase::from("bisq")),
+        Some(&vec![PkgName::from("bisq-desktop")]),
         "scoped provides records a one-pkgname install-filter constraint",
     );
 
     let mut plan = resolve(&cfg, &idx, Some(&by), &pac, &expanded.targets).unwrap();
     plan.pkgname_selections = expanded.selections;
-    plan.direct_targets.extend(expanded.direct_pkgnames);
-    assert_eq!(plan.aur_strata, vec![vec!["bisq".to_string()]]);
-    assert!(plan.direct_targets.contains("bisq-desktop"));
-    assert!(!plan.direct_targets.contains("bisq-cli"));
-    assert!(!plan.direct_targets.contains("bisq-daemon"));
-    assert_eq!(plan.pkgname_selections.get("bisq").map(Vec::len), Some(1));
+    plan.direct_targets
+        .extend(expanded.direct_pkgnames.into_iter().map(Into::into));
+    assert_eq!(plan.aur_strata, vec![vec![PkgBase::from("bisq")]]);
+    assert!(plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("bisq-desktop")));
+    assert!(!plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("bisq-cli")));
+    assert!(!plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("bisq-daemon")));
+    assert_eq!(
+        plan.pkgname_selections
+            .get(&PkgBase::from("bisq"))
+            .map(Vec::len),
+        Some(1)
+    );
 }
 
 /// Regression for the commit-mono-font case. AUR has both:
@@ -283,7 +308,7 @@ fn pkgname_collision_with_another_pkgbase_does_not_leak_into_plan() {
     let by = Secondary::build(&idx);
     let pac = PacmanIndex::default();
 
-    let mut select = |_pb: &str, pns: &[String]| -> Result<Vec<String>> { Ok(pns.to_vec()) };
+    let mut select = |_pb: &PkgBase, pns: &[PkgName]| -> Result<Vec<PkgName>> { Ok(pns.to_vec()) };
     let expanded = expand_pkgbase_targets(
         &idx,
         Some(&by),
@@ -300,22 +325,30 @@ fn pkgname_collision_with_another_pkgbase_does_not_leak_into_plan() {
     );
     assert_eq!(
         expanded.direct_pkgnames,
-        vec!["otf-commit-mono".to_string(), "ttf-commit-mono".to_string()],
+        vec![
+            PkgName::from("otf-commit-mono"),
+            PkgName::from("ttf-commit-mono"),
+        ],
     );
 
     let mut plan = resolve(&cfg, &idx, Some(&by), &pac, &expanded.targets).unwrap();
-    plan.direct_targets.extend(expanded.direct_pkgnames);
+    plan.direct_targets
+        .extend(expanded.direct_pkgnames.into_iter().map(Into::into));
 
     // The crucial assertion: only one pkgbase in the plan, and it's the
     // right one. Without the fix, `aur_strata` would have *two* entries:
     // commit-mono-font AND otf-commit-mono.
     assert_eq!(
         plan.aur_strata,
-        vec![vec!["commit-mono-font".to_string()]],
+        vec![vec![PkgBase::from("commit-mono-font")]],
         "the unrelated otf-commit-mono pkgbase must NOT leak into the build plan",
     );
-    assert!(plan.direct_targets.contains("otf-commit-mono"));
-    assert!(plan.direct_targets.contains("ttf-commit-mono"));
+    assert!(plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("otf-commit-mono")));
+    assert!(plan
+        .direct_targets
+        .contains_pkgname(&PkgName::from("ttf-commit-mono")));
 }
 
 #[test]
@@ -339,7 +372,7 @@ fn pkgname_target_skips_selector_even_when_pkgbase_could_match() {
     let pac = PacmanIndex::default();
 
     let mut calls = 0;
-    let mut select = |_p: &str, n: &[String]| -> Result<Vec<String>> {
+    let mut select = |_p: &PkgBase, n: &[PkgName]| -> Result<Vec<PkgName>> {
         calls += 1;
         Ok(n.to_vec())
     };

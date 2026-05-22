@@ -2,60 +2,81 @@
 //! with cycle reporting.
 //!
 //! * [`sort`] yields a flat build order (used for cycle detection over the
-//!   full dependency graph, including runtime `depends`).
+//!   full dependency graph, including runtime `depends`). Edge values are
+//!   raw dep strings — pre-resolution they're a mix of pkgnames, virtuals,
+//!   and pkgbases — so the function works in terms of `String` deps with
+//!   `K: Borrow<str>` for in-graph lookups.
 //! * [`strata`] groups nodes into independent layers, used for scheduling
 //!   build/install rounds: every pkg in stratum N has all its edges to nodes
 //!   in strata `< N` only, so the stratum can be built in parallel and then
-//!   `pacman -U`'d before stratum N+1 begins.
+//!   `pacman -U`'d before stratum N+1 begins. Edge values are `K` because
+//!   the graph is fully resolved by then.
 
 use crate::error::{Error, Result};
+use std::borrow::Borrow;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::hash::BuildHasher;
+use std::fmt;
+use std::hash::{BuildHasher, Hash};
 
-fn visit<S: BuildHasher>(
-    node: &str,
-    edges: &HashMap<String, Vec<String>, S>,
-    nodes: &BTreeSet<String>,
-    visited: &mut HashSet<String>,
-    on_stack: &mut HashSet<String>,
-    stack: &mut Vec<String>,
-    order: &mut Vec<String>,
-) -> Result<()> {
-    if visited.contains(node) {
+/// Recursive DFS helper for [`sort`]. Walks via `nodes.get(d.as_str())` so
+/// in-graph deps resolve by `Borrow<str>` to the typed key.
+fn visit<K, S>(
+    node: &K,
+    edges: &HashMap<K, Vec<String>, S>,
+    nodes: &BTreeSet<K>,
+    visited: &mut HashSet<K>,
+    on_stack: &mut HashSet<K>,
+    stack: &mut Vec<K>,
+    order: &mut Vec<K>,
+) -> Result<()>
+where
+    K: Eq + Hash + Ord + Clone + Borrow<str> + fmt::Display,
+    S: BuildHasher,
+{
+    // Use `HashSet::contains::<K>` (turbofish) on the K-keyed methods so the
+    // compiler picks `Borrow<K>` (the blanket `T: Borrow<T>` impl) instead of
+    // `Borrow<str>` — both are in scope on K and would otherwise be
+    // ambiguous, since this fn requires both.
+    if HashSet::<K, _>::contains::<K>(visited, node) {
         return Ok(());
     }
-    if !on_stack.insert(node.to_string()) {
-        let mut path: Vec<String> = stack.clone();
+    if !on_stack.insert(node.clone()) {
+        let mut path: Vec<String> = stack.iter().map(ToString::to_string).collect();
         path.push(node.to_string());
         return Err(Error::Resolve(format!("cycle: {}", path.join(" → "))));
     }
-    stack.push(node.to_string());
+    stack.push(node.clone());
 
-    if let Some(deps) = edges.get(node) {
+    if let Some(deps) = HashMap::<K, Vec<String>, S>::get::<K>(edges, node) {
         for d in deps {
-            if nodes.contains(d) {
-                visit(d, edges, nodes, visited, on_stack, stack, order)?;
+            if let Some(d_k) = nodes.get(d.as_str()) {
+                let d_k = d_k.clone();
+                visit(&d_k, edges, nodes, visited, on_stack, stack, order)?;
             }
         }
     }
 
     stack.pop();
-    on_stack.remove(node);
-    visited.insert(node.to_string());
-    order.push(node.to_string());
+    HashSet::<K, _>::remove::<K>(on_stack, node);
+    visited.insert(node.clone());
+    order.push(node.clone());
     Ok(())
 }
 
 /// Tarjan-style DFS yielding a build order. On cycle, returns
 /// `Err(Error::Resolve(...))` with the offending path.
-pub fn sort<S: BuildHasher>(
-    edges: &HashMap<String, Vec<String>, S>,
-    nodes: &BTreeSet<String>,
-) -> Result<Vec<String>> {
+///
+/// `K` is the node identity (e.g. `PkgBase`); edges values are raw `String`
+/// dep names, looked up against `nodes` via `K: Borrow<str>`.
+pub fn sort<K, S>(edges: &HashMap<K, Vec<String>, S>, nodes: &BTreeSet<K>) -> Result<Vec<K>>
+where
+    K: Eq + Hash + Ord + Clone + Borrow<str> + fmt::Display,
+    S: BuildHasher,
+{
     let mut order = Vec::with_capacity(nodes.len());
-    let mut visited: HashSet<String> = HashSet::new();
-    let mut on_stack: HashSet<String> = HashSet::new();
-    let mut stack: Vec<String> = Vec::new();
+    let mut visited: HashSet<K> = HashSet::new();
+    let mut on_stack: HashSet<K> = HashSet::new();
+    let mut stack: Vec<K> = Vec::new();
 
     for n in nodes {
         visit(
@@ -79,11 +100,16 @@ pub fn sort<S: BuildHasher>(
 /// The `edges` map is interpreted the same way as in [`sort`]: `edges[a]`
 /// lists nodes that must be built **before** `a`. Edges pointing to names
 /// outside `nodes` (e.g. repo-resolved deps) are silently ignored.
-pub fn strata<S: BuildHasher>(
-    edges: &HashMap<String, Vec<String>, S>,
-    nodes: &BTreeSet<String>,
-) -> Result<Vec<Vec<String>>> {
-    let mut remaining: HashMap<String, usize> = nodes
+///
+/// Both edge values and node keys are typed `K` — strata runs on a fully
+/// resolved graph where deps have already been narrowed to in-graph
+/// pkgbases.
+pub fn strata<K, S>(edges: &HashMap<K, Vec<K>, S>, nodes: &BTreeSet<K>) -> Result<Vec<Vec<K>>>
+where
+    K: Eq + Hash + Ord + Clone + fmt::Debug,
+    S: BuildHasher,
+{
+    let mut remaining: HashMap<K, usize> = nodes
         .iter()
         .map(|n| {
             let count = edges
@@ -93,15 +119,15 @@ pub fn strata<S: BuildHasher>(
         })
         .collect();
 
-    let mut out: Vec<Vec<String>> = Vec::new();
+    let mut out: Vec<Vec<K>> = Vec::new();
     while !remaining.is_empty() {
-        let mut ready: Vec<String> = remaining
+        let mut ready: Vec<K> = remaining
             .iter()
             .filter(|(_, deg)| **deg == 0)
             .map(|(n, _)| n.clone())
             .collect();
         if ready.is_empty() {
-            let mut leftover: Vec<String> = remaining.keys().cloned().collect();
+            let mut leftover: Vec<K> = remaining.keys().cloned().collect();
             leftover.sort();
             return Err(Error::Resolve(format!("cycle among: {leftover:?}")));
         }
@@ -169,9 +195,8 @@ mod tests {
 
     #[test]
     fn strata_empty_input() {
-        let out =
-            strata::<std::collections::hash_map::RandomState>(&HashMap::new(), &BTreeSet::new())
-                .unwrap();
+        let empty: HashMap<String, Vec<String>> = HashMap::new();
+        let out = strata(&empty, &BTreeSet::<String>::new()).unwrap();
         assert!(out.is_empty());
     }
 

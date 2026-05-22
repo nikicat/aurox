@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::index::secondary::Secondary;
 use crate::index::{self, IndexFile};
 use crate::mirror::{self, MirrorRepo};
+use crate::names::{PkgBase, PkgName, PkgTarget, PkgTargetSetExt};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke;
 use crate::paths;
@@ -32,7 +33,7 @@ pub use upgrade::{cmd_query_upgrades, collect_upgrade_plan};
 
 /// One built pkgbase's set of `.pkg.tar.zst` outputs.
 struct BuiltPkg {
-    pkgbase: String,
+    pkgbase: PkgBase,
     files: Vec<PathBuf>,
 }
 
@@ -95,9 +96,12 @@ pub fn cmd_install(
     plan.pkgname_selections = expanded.selections;
     // For pkgbase/provides hits the resolver received the pkgbase string, so
     // `plan.direct_targets` only contains the pkgbase. Mark the pkgnames the
-    // user actually chose as direct too, so `install_stratum` flags their
-    // `.pkg.tar.zst` Explicit instead of `--asdeps`.
-    plan.direct_targets.extend(expanded.direct_pkgnames);
+    // user actually chose as direct too, so `install_stratum` flips their
+    // `.pkg.tar.zst` to Explicit (instead of `--asdeps`). The expanded
+    // pkgnames widen into `PkgTarget` — explicit "treat this pkgname as
+    // an unclassified user target for the install-reason check."
+    plan.direct_targets
+        .extend(expanded.direct_pkgnames.into_iter().map(PkgTarget::from));
 
     print::plan(&plan, idx, &pac);
 
@@ -179,12 +183,11 @@ fn run_aur_pipeline(
     asdeps: bool,
 ) -> Result<u8> {
     let mirror = MirrorRepo::open(&paths::aur_repo_path())?;
-    let direct_names: HashSet<&str> = plan
-        .direct_targets
-        .iter()
-        .map(std::string::String::as_str)
-        .collect();
-    let mut transitive_marks: Vec<String> = Vec::new();
+    // `plan.direct_targets` is already `HashSet<PkgTarget>` — pass it
+    // through; `install_stratum` uses `PkgTargetSetExt::contains_pkgname`
+    // to test built pkgs without any string-level cast at the call site.
+    let direct_names = &plan.direct_targets;
+    let mut transitive_marks: Vec<PkgName> = Vec::new();
 
     // Phase 1: open every worktree, run idempotency checks, and prompt the
     // user for review across all strata up front. Skipped pkgbases are
@@ -236,7 +239,9 @@ fn run_aur_pipeline(
 
     if !asdeps && !transitive_marks.is_empty() {
         let mut args = vec!["-D".to_string(), "--asdeps".into()];
-        args.extend(transitive_marks);
+        // pacman argv is `Vec<String>` — downgrade typed `PkgName`s at
+        // this single boundary.
+        args.extend(transitive_marks.into_iter().map(PkgName::into_inner));
         if let Err(e) = invoke::exec_pacman(cfg, &args) {
             // Cosmetic only: pacman will still recompute install reasons on
             // the next `-D`/`-Syu`. Warn instead of failing the run.
@@ -253,7 +258,7 @@ fn run_aur_pipeline(
 fn build_stratum(
     cfg: &Config,
     preps: Vec<Prep<'_>>,
-    make_edges: &HashMap<String, Vec<String>>,
+    make_edges: &HashMap<PkgBase, Vec<PkgBase>>,
     report: &mut RunReport,
 ) -> Vec<BuiltPkg> {
     let mut built: Vec<BuiltPkg> = Vec::with_capacity(preps.len());
@@ -308,9 +313,9 @@ fn commit_stratum(
     idx: &IndexFile,
     built: &[BuiltPkg],
     stratum_idx: usize,
-    direct: &HashSet<&str>,
+    direct: &HashSet<PkgTarget>,
     asdeps_override: bool,
-    transitive_marks: &mut Vec<String>,
+    transitive_marks: &mut Vec<PkgName>,
     report: &mut RunReport,
 ) {
     if built.is_empty() {
@@ -337,19 +342,23 @@ fn commit_stratum(
 
 /// Per-pkgbase outcome aggregated across all strata, used to drive both the
 /// dep-skip logic and the final summary (see `print::final_summary`).
+///
+/// Keys are typed `PkgBase` so the report can't accidentally key on a
+/// pkgname; the `failed` value stays `String` because it carries a
+/// stringified error message, not an identity.
 #[derive(Default)]
 pub(super) struct RunReport {
     /// Successfully built (or reused from cache) and installed by `pacman -U`.
-    pub(super) installed: Vec<String>,
+    pub(super) installed: Vec<PkgBase>,
     /// makepkg or the stratum's `pacman -U` returned non-zero. Value is the
     /// stringified error so the summary can quote it back.
-    pub(super) failed: HashMap<String, String>,
+    pub(super) failed: HashMap<PkgBase, String>,
     /// User chose "skip" at the PKGBUILD review prompt.
-    pub(super) skipped_user: Vec<String>,
+    pub(super) skipped_user: Vec<PkgBase>,
     /// Auto-skipped because a pkgbase earlier in the build graph failed.
     /// Value is the immediate blocker — usually enough to debug since the
     /// blocker itself shows up in `failed`.
-    pub(super) skipped_dep: HashMap<String, String>,
+    pub(super) skipped_dep: HashMap<PkgBase, PkgBase>,
 }
 
 impl RunReport {
@@ -361,17 +370,17 @@ impl RunReport {
 /// Return the first AUR pkgbase makedep of `pkgbase` that has already failed
 /// or been skipped. `None` means `pkgbase` is safe to build.
 fn blocking_dep<'a>(
-    pkgbase: &str,
-    make_edges: &'a HashMap<String, Vec<String>>,
+    pkgbase: &PkgBase,
+    make_edges: &'a HashMap<PkgBase, Vec<PkgBase>>,
     report: &RunReport,
-) -> Option<&'a str> {
+) -> Option<&'a PkgBase> {
     let deps = make_edges.get(pkgbase)?;
     for dep in deps {
         if report.failed.contains_key(dep)
             || report.skipped_dep.contains_key(dep)
             || report.skipped_user.iter().any(|s| s == dep)
         {
-            return Some(dep.as_str());
+            return Some(dep);
         }
     }
     None
@@ -379,10 +388,10 @@ fn blocking_dep<'a>(
 
 /// One pkgbase's prepared state, produced in phase 1 and consumed in phase 2.
 struct Prep<'a> {
-    pkgbase: &'a str,
+    pkgbase: &'a PkgBase,
     wt: mirror::worktree::Worktree,
     new_ver: String,
-    selection: Option<&'a [String]>,
+    selection: Option<&'a [PkgName]>,
     disposition: Disposition,
 }
 
@@ -396,27 +405,27 @@ enum Disposition {
     Skipped,
 }
 
-#[instrument(skip(mirror, idx, pac, selection))]
+#[instrument(skip(mirror, idx, pac, selection), fields(pkgbase = %pkgbase))]
 fn prepare_one<'a>(
     mirror: &MirrorRepo,
     idx: &'a IndexFile,
     pac: &PacmanIndex,
-    pkgbase: &'a str,
-    selection: Option<&'a [String]>,
+    pkgbase: &'a PkgBase,
+    selection: Option<&'a [PkgName]>,
     noconfirm: bool,
 ) -> Result<Prep<'a>> {
     let entry = idx
         .entries
         .iter()
-        .find(|e| e.pkgbase == pkgbase)
+        .find(|e| &e.pkgbase == pkgbase)
         .ok_or_else(|| Error::Build(format!("{pkgbase}: missing from index")))?;
     let dest = paths::pkg_worktree(pkgbase);
     let wt = mirror::worktree::add_or_reset(mirror, pkgbase, &dest)?;
 
     let new_ver = entry.version();
-    let required: Vec<&str> = match selection {
-        Some(sel) => sel.iter().map(String::as_str).collect(),
-        None => entry.pkgnames.iter().map(|p| p.name.as_str()).collect(),
+    let required: Vec<&PkgName> = match selection {
+        Some(sel) => sel.iter().collect(),
+        None => entry.pkgnames.iter().map(|p| &p.name).collect(),
     };
 
     // Idempotency: skip rebuild iff a .pkg.tar.{zst,xz} file at exactly
@@ -436,7 +445,7 @@ fn prepare_one<'a>(
         let kept = filter_by_selection(&existing, selection);
         ui::note(&format!("{pkgbase}: already built {new_ver}"));
         debug!(
-            pkgbase,
+            %pkgbase,
             version = %new_ver,
             files = kept.len(),
             "reusing cached build"
@@ -450,15 +459,21 @@ fn prepare_one<'a>(
         });
     }
 
-    let installed_ver = entry
-        .pkgnames
-        .iter()
-        .find_map(|p| pac.installed_version(&p.name));
-    let disposition =
-        match review::review(mirror, pkgbase, &new_ver, installed_ver, &wt, noconfirm)? {
-            review::Outcome::Approved => Disposition::Build,
-            review::Outcome::Skipped => Disposition::Skipped,
-        };
+    // What the user has installed that this pkgbase will displace. Looks
+    // through pkgname → replaces → provides so renames and split pkgs label
+    // correctly; see `PacmanIndex::counterpart` for the resolution order.
+    let counterpart = pac.counterpart(entry);
+    let disposition = match review::review(
+        mirror,
+        pkgbase,
+        &new_ver,
+        counterpart.as_ref(),
+        &wt,
+        noconfirm,
+    )? {
+        review::Outcome::Approved => Disposition::Build,
+        review::Outcome::Skipped => Disposition::Skipped,
+    };
     Ok(Prep {
         pkgbase,
         wt,
@@ -468,7 +483,7 @@ fn prepare_one<'a>(
     })
 }
 
-#[instrument(skip(cfg, prep), fields(pkgbase = prep.pkgbase, version = %prep.new_ver))]
+#[instrument(skip(cfg, prep), fields(pkgbase = %prep.pkgbase, version = %prep.new_ver))]
 fn run_build(cfg: &Config, prep: &Prep) -> Result<Vec<PathBuf>> {
     ui::step(&format!("makepkg {}", prep.pkgbase));
     makepkg::run(cfg, &prep.wt.path)?;
@@ -482,7 +497,7 @@ fn run_build(cfg: &Config, prep: &Prep) -> Result<Vec<PathBuf>> {
         )));
     }
     info!(
-        pkgbase = prep.pkgbase,
+        pkgbase = %prep.pkgbase,
         version = %prep.new_ver,
         files = outputs.len(),
         "build complete"
@@ -494,13 +509,13 @@ fn run_build(cfg: &Config, prep: &Prep) -> Result<Vec<PathBuf>> {
 /// filter (default for non-split builds and dependency builds). Guards
 /// against stale leftover files (e.g. a prior wider build) when reusing a
 /// cached build.
-fn filter_by_selection(files: &[PathBuf], selection: Option<&[String]>) -> Vec<PathBuf> {
+fn filter_by_selection(files: &[PathBuf], selection: Option<&[PkgName]>) -> Vec<PathBuf> {
     let Some(sel) = selection else {
         return files.to_vec();
     };
     files
         .iter()
-        .filter(|f| install::extract_pkgname(f).is_some_and(|n| sel.iter().any(|s| s == &n)))
+        .filter(|f| install::extract_pkgname(f).is_some_and(|n| sel.contains(&n)))
         .cloned()
         .collect()
 }
@@ -515,9 +530,9 @@ fn install_stratum(
     cfg: &Config,
     idx: &IndexFile,
     built: &[BuiltPkg],
-    direct: &HashSet<&str>,
+    direct: &HashSet<PkgTarget>,
     asdeps_override: bool,
-    transitive_marks: &mut Vec<String>,
+    transitive_marks: &mut Vec<PkgName>,
 ) -> Result<()> {
     if built.is_empty() {
         return Ok(());
@@ -526,7 +541,7 @@ fn install_stratum(
     ui::step(&format!("installing {total} built package(s) with pacman"));
 
     let mut files: Vec<PathBuf> = Vec::new();
-    let mut pending_marks: Vec<String> = Vec::new();
+    let mut pending_marks: Vec<PkgName> = Vec::new();
     for b in built {
         // Look up the index entry to know which pkgnames belong to this
         // pkgbase (split packages have multiple names sharing one pkgbase).
@@ -538,7 +553,10 @@ fn install_stratum(
         for f in &b.files {
             files.push(f.clone());
             let pkgname = install::extract_pkgname(f).unwrap_or_default();
-            let is_direct = !asdeps_override && direct.contains(pkgname.as_str());
+            // `direct` is `HashSet<PkgTarget>`; `contains_pkgname` is the
+            // single Borrow<str> probe site (cross-domain string match
+            // between the user's typed targets and the built pkgname).
+            let is_direct = !asdeps_override && direct.contains_pkgname(&pkgname);
             if !is_direct {
                 pending_marks.push(pkgname);
             }
@@ -585,6 +603,12 @@ pub fn cmd_clean(cfg: &Config, argv: &[String]) -> Result<u8> {
 mod tests {
     use super::*;
 
+    /// Locals so `&pkgbase` lives long enough for `blocking_dep`'s `&PkgBase`
+    /// argument and return value.
+    fn pb(s: &str) -> PkgBase {
+        PkgBase::from(s)
+    }
+
     /// `blocking_dep` is the resilience gate: it answers "should I skip
     /// this pkgbase because something upstream already failed?". A miss
     /// (None) means safe-to-build; a hit returns the *immediate* blocker
@@ -593,29 +617,31 @@ mod tests {
     /// pkgbase landed in `skipped_dep` when it was processed.
     #[test]
     fn blocking_dep_propagates_through_skipped_dep_chain() {
-        let mut edges: HashMap<String, Vec<String>> = HashMap::new();
-        edges.insert("b".into(), vec!["a".into()]);
-        edges.insert("c".into(), vec!["b".into()]);
+        let (a, b, c, standalone) = (pb("a"), pb("b"), pb("c"), pb("standalone"));
+        let mut edges: HashMap<PkgBase, Vec<PkgBase>> = HashMap::new();
+        edges.insert(b.clone(), vec![a.clone()]);
+        edges.insert(c.clone(), vec![b.clone()]);
         let mut report = RunReport::default();
 
         // a failed two strata back; b skipped because of it; now check c.
-        report.failed.insert("a".into(), "boom".into());
-        report.skipped_dep.insert("b".into(), "a".into());
+        report.failed.insert(a.clone(), "boom".into());
+        report.skipped_dep.insert(b.clone(), a.clone());
 
-        assert_eq!(blocking_dep("b", &edges, &report), Some("a"));
-        assert_eq!(blocking_dep("c", &edges, &report), Some("b"));
+        assert_eq!(blocking_dep(&b, &edges, &report), Some(&a));
+        assert_eq!(blocking_dep(&c, &edges, &report), Some(&b));
         // A pkgbase with no edges at all is always safe.
-        assert_eq!(blocking_dep("standalone", &edges, &report), None);
+        assert_eq!(blocking_dep(&standalone, &edges, &report), None);
     }
 
     /// User-initiated skips block dependents identically to failures —
     /// the dep wouldn't be in localdb either way.
     #[test]
     fn blocking_dep_treats_user_skip_as_blocker() {
-        let mut edges: HashMap<String, Vec<String>> = HashMap::new();
-        edges.insert("b".into(), vec!["a".into()]);
+        let (a, b) = (pb("a"), pb("b"));
+        let mut edges: HashMap<PkgBase, Vec<PkgBase>> = HashMap::new();
+        edges.insert(b.clone(), vec![a.clone()]);
         let mut report = RunReport::default();
-        report.skipped_user.push("a".into());
-        assert_eq!(blocking_dep("b", &edges, &report), Some("a"));
+        report.skipped_user.push(a.clone());
+        assert_eq!(blocking_dep(&b, &edges, &report), Some(&a));
     }
 }
