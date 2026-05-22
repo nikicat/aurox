@@ -1,0 +1,27 @@
+# The aspnet-runtime regression target: a pkgbase that declares MULTIPLE
+# `provides=` virtuals, more than one of which is installed in the user's
+# localdb. Without a counterpart hint, `PacmanIndex::counterpart` picks the
+# first declared (legacy-a), which is wrong when the user actually meant
+# legacy-b. This is exactly the dotnet-core-7.0-bin shape: provides both
+# `aspnet-runtime` and `dotnet-runtime-7.0`; user has both installed; runs
+# `gitaur -S dotnet-runtime-7.0`.
+#
+# Declaration order is load-bearing: legacy-a comes first so the unhinted
+# walk would pick it. The smoke test's `-S test-multi-provides-legacy-b`
+# verifies the hint plumbing overrides that default — counterpart_with_hint
+# must return legacy-b, and the trace must show:
+#   * via = Provides (the entry doesn't have legacy-b as a pkgname)
+#   * installed = Some("test-multi-provides-legacy-b") (NOT legacy-a)
+#   * hint divergence warning fires (the hint changed the picked pkgname)
+#   * multi-match warning fires (two installed candidates in Provides tier)
+pkgname=test-multi-provides-new
+pkgver=2.0
+pkgrel=1
+pkgdesc='gitaur test fixture: aspnet-runtime-shape pkgbase with multiple installed provides'
+arch=('any')
+license=('MIT')
+provides=('test-multi-provides-legacy-a' 'test-multi-provides-legacy-b')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}

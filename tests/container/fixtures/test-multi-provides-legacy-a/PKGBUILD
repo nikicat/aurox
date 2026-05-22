@@ -1,0 +1,21 @@
+# First legacy half of the aspnet-runtime shape. Stands in for one of the
+# *several* installed virtuals a renamed pkgbase declares — paired with
+# test-multi-provides-legacy-b to seed two simultaneously-installed
+# counterparts before test-multi-provides-new triggers the multi-match
+# branch in `PacmanIndex::counterpart_with_hint`.
+#
+# By itself it's a trivial install fixture; the regression value comes from
+# its appearance in test-multi-provides-new's `provides=` array next to
+# legacy-b. Declaration order matters: legacy-a is listed first, so the
+# unhinted walk would pick it — and the hint plumbing must override that
+# default when the user types legacy-b.
+pkgname=test-multi-provides-legacy-a
+pkgver=1.0
+pkgrel=1
+pkgdesc='gitaur test fixture: first legacy half of an aspnet-runtime-shape pair'
+arch=('any')
+license=('MIT')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}
