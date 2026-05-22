@@ -1,0 +1,20 @@
+# Older half of the -Syu hint regression. Installed at version 1.0.
+#
+# Companion to test-syu-hint-newer. This is the pkg that:
+#   * Shows up in the `-Syu` upgrade picker (vercmp 1.0 < 2.0).
+#   * Gets selected by the user (or auto-selected via --noconfirm).
+#   * Becomes `PkgUpgrade.name` → `Target.spec` + `Target.hint`.
+#
+# The hint plumbing must steer counterpart resolution toward THIS
+# pkgname (the one the user is upgrading), not toward test-syu-hint-newer
+# (the first-declared provides match in test-syu-hint-new).
+pkgname=test-syu-hint-older
+pkgver=1.0
+pkgrel=1
+pkgdesc='gitaur test fixture: older installed virtual for -Syu hint regression'
+arch=('any')
+license=('MIT')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}

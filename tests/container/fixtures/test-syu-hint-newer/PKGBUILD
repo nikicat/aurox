@@ -1,0 +1,30 @@
+# Newer half of the -Syu hint regression. Installed at version 9.0.
+#
+# Companion to test-syu-hint-older and test-syu-hint-new. Together they
+# reproduce the dotnet-runtime case as the user actually hit it:
+#
+#   * test-syu-hint-newer is installed at 9.0 (NEWER than what the new
+#     pkgbase ships at 2.0). `-Su` does NOT include it in the upgrade
+#     picker (vercmp says it's already past 2.0), so the user never sees
+#     a row for it.
+#   * test-syu-hint-older is installed at 1.0 (OLDER). `-Su` shows it as
+#     an upgrade candidate → 2.0.
+#   * test-syu-hint-new declares `provides=("test-syu-hint-newer"
+#     "test-syu-hint-older")`. Without a counterpart hint, the unhinted
+#     walk in `PacmanIndex::counterpart` picks the FIRST-declared
+#     installed provides (test-syu-hint-newer at 9.0), labelling the
+#     review screen as a downgrade — which is the dotnet-runtime bug.
+#
+# This fixture by itself is just a trivial install. Its load-bearing role
+# is being declared first in test-syu-hint-new's `provides=` array AND
+# being installed at a vercmp-greater version than the new pkgbase.
+pkgname=test-syu-hint-newer
+pkgver=9.0
+pkgrel=1
+pkgdesc='gitaur test fixture: newer-than-new installed virtual for -Syu hint regression'
+arch=('any')
+license=('MIT')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}

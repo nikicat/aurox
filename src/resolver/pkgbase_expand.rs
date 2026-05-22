@@ -112,6 +112,17 @@ pub fn expand_pkgbase_targets(
             out.targets.push(t.spec.clone());
             continue;
         };
+        // Hint recording runs *unconditionally* — the rewrite decision
+        // below may short-circuit (pacman wins, passthrough, …), but the
+        // resolver still classifies the spec via `resolve_target_source`
+        // and can land on an AUR pkgbase even when expand did no rewrite.
+        // The dotnet-runtime regression: a foreign virtual that's installed
+        // hits `pac.is_installed` → passes through → resolver routes to
+        // pkgbase via `by_provides` → without a hint, counterpart picks the
+        // first declared provides (wrong). Record the hint here so it's in
+        // the map regardless of what expand decides next.
+        record_target_hint(by, idx, t, bare, &mut out.counterpart_hints);
+
         // pacman wins outright — never reroute a name pacman can satisfy.
         if pac.is_installed(bare) || pac.in_sync(bare) {
             out.targets.push(t.spec.clone());
@@ -138,13 +149,11 @@ pub fn expand_pkgbase_targets(
                 "rewrote split-pkg pkgname target to pkgbase with selection",
             );
             extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
-            // The user typed a pkgname; that pkgname IS the counterpart hint
-            // (unless an explicit hint was supplied, which wins).
-            record_hint(
-                &mut out.counterpart_hints,
-                &entry.pkgbase,
-                t.hint.clone().unwrap_or_else(|| bare_name.clone()),
-            );
+            // Hint already recorded at the top of the loop by
+            // `record_target_hint` — that function uses the same `by_name`
+            // lookup and the same "spec IS the hint" rule for pkgname
+            // targets, so we don't repeat it here.
+            //
             // `out.targets` is `Vec<String>` (mixed bag — see docstring);
             // `into_inner` on the clone is the dedicated PkgBase→String
             // downgrade, used only at this resolver/string boundary.
@@ -182,15 +191,9 @@ pub fn expand_pkgbase_targets(
                 let chosen = chosen_with_sibling_deps(entry, pkgname);
                 extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
             }
-            // Provides path is the dotnet-runtime case: `bare` is the
-            // virtual the user typed AND the installed pkgname they care
-            // about. An explicit hint (from -Syu) takes precedence; otherwise
-            // the virtual itself is the hint.
-            record_hint(
-                &mut out.counterpart_hints,
-                &entry.pkgbase,
-                t.hint.clone().unwrap_or_else(|| PkgName::from(bare)),
-            );
+            // Hint recorded once at the top by `record_target_hint`. The
+            // dotnet-runtime case (virtual the user typed = installed
+            // pkgname they care about) is its core motivation.
             out.targets.push(entry.pkgbase.clone().into_inner());
             out.direct_pkgnames.push(pkgname.clone());
             continue;
@@ -233,12 +236,10 @@ pub fn expand_pkgbase_targets(
         if chosen.len() < entry.pkgnames.len() {
             extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
         }
-        // User typed a pkgbase — by itself it isn't a counterpart pkgname,
-        // so we only record a hint when one was supplied explicitly (e.g.
-        // -Syu's `Target::hint`).
-        if let Some(hint) = t.hint.clone() {
-            record_hint(&mut out.counterpart_hints, &entry.pkgbase, hint);
-        }
+        // Hint recorded once at the top by `record_target_hint`. For a
+        // bare pkgbase spec there's no derived hint (the pkgbase isn't a
+        // counterpart pkgname); the only thing that ends up in the map
+        // for this branch is an explicit `Target::hint`.
         out.targets.push(entry.pkgbase.clone().into_inner());
         out.direct_pkgnames.extend(chosen);
     }
@@ -253,6 +254,50 @@ pub fn expand_pkgbase_targets(
 /// sibling of the same pkgbase.
 fn record_hint(hints: &mut HashMap<PkgBase, PkgName>, pkgbase: &PkgBase, hint: PkgName) {
     hints.entry(pkgbase.clone()).or_insert(hint);
+}
+
+/// Find which AUR pkgbase a target would route to (by_name / by_provides /
+/// by_pkgbase, in that order — mirroring `resolve_target_source`'s fallback
+/// chain), then record the hint there.
+///
+/// Kept independent of the rewrite-decision branches above because the two
+/// concerns diverge: a target may route to a pkgbase via the resolver
+/// (`by_provides`) without expand itself rewriting (the `pac.is_installed`
+/// passthrough). Doing this lookup once at the top of the loop guarantees
+/// every routable target gets its hint recorded, regardless of which
+/// rewrite branch (if any) the spec ends up in.
+///
+/// Hint precedence: explicit `Target::hint` always wins. Otherwise we
+/// derive one from the spec — but only when the spec is itself a pkgname
+/// or virtual (those identities ARE counterpart pkgnames). A bare pkgbase
+/// spec without an explicit hint yields no derived hint, because the
+/// pkgbase string isn't a counterpart name.
+fn record_target_hint(
+    by: &Secondary,
+    idx: &IndexFile,
+    target: &Target,
+    bare: &str,
+    hints: &mut HashMap<PkgBase, PkgName>,
+) {
+    let (dest_pkgbase, spec_is_counterpart_name) = if let Some(&entry_idx) = by.by_name.get(bare) {
+        (&idx.entries[entry_idx as usize].pkgbase, true)
+    } else if by.by_provides.contains_key(bare) {
+        let Some((entry_idx, _)) = by.provider_of(idx, bare) else {
+            return;
+        };
+        (&idx.entries[entry_idx].pkgbase, true)
+    } else if let Some(&entry_idx) = by.by_pkgbase.get(bare) {
+        (&idx.entries[entry_idx as usize].pkgbase, false)
+    } else {
+        return;
+    };
+    let hint = target
+        .hint
+        .clone()
+        .or_else(|| spec_is_counterpart_name.then(|| PkgName::from(bare)));
+    if let Some(h) = hint {
+        record_hint(hints, dest_pkgbase, h);
+    }
 }
 
 /// Merge `additions` into the per-pkgbase selection list, deduping. Multiple
@@ -828,6 +873,42 @@ mod tests {
         assert_eq!(
             r.counterpart_hints.get(&PkgBase::from("bisq")),
             Some(&PkgName::from("bisq-cli")),
+        );
+    }
+
+    /// Regression for the dotnet-runtime case as the user actually
+    /// experienced it: the foreign virtual (`paru`) is *itself* installed
+    /// (some prior AUR build registered that exact name in localdb), so
+    /// `pac.is_installed(bare)` is true and the `record_target_hint` call
+    /// at the top of the loop is the only thing that runs — the rewrite
+    /// branches all short-circuit. Without that top-of-loop record, the
+    /// hint would never reach `Plan.counterpart_hints` and `counterpart`
+    /// would fall back to the first-declared provides (wrong).
+    ///
+    /// Verifies both that the spec passes through (resolver routes via
+    /// `by_provides` itself) AND that the hint lands on the pkgbase.
+    #[test]
+    fn installed_foreign_virtual_records_hint_despite_pacman_shortcut() {
+        let (idx, by, mut pac) = fixture();
+        // `paru-bin` is the pkgbase; `paru` is its pkgbase-level provides.
+        // Pretend `paru` itself is registered in localdb (foreign install
+        // from some earlier source), mirroring the dotnet-runtime-7.0
+        // shape — the name in `pac.installed` collides with the AUR
+        // pkgbase's `provides`.
+        pac.installed.insert("paru".into(), "1.0-1".into());
+        let r =
+            expand_pkgbase_targets(&idx, Some(&by), &pac, &ts(&["paru"]), &mut select_all).unwrap();
+        // Spec passed through unchanged — `pac.is_installed("paru")` is
+        // true, so expand did NOT rewrite to the pkgbase string. Resolver
+        // routes via `by_provides` in `resolve_target_source`.
+        assert_eq!(r.targets, vec!["paru".to_string()]);
+        // The crucial bit: hint IS recorded despite the passthrough, so
+        // `prepare_one` can pass it to `counterpart_with_hint`.
+        assert_eq!(
+            r.counterpart_hints.get(&PkgBase::from("paru-bin")),
+            Some(&PkgName::from("paru")),
+            "installed foreign virtual must record its hint even though \
+             the spec passes through unchanged",
         );
     }
 }

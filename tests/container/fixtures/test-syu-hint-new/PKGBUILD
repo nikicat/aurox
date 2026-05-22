@@ -1,0 +1,29 @@
+# The new AUR pkgbase whose `provides=` declarations create the
+# multi-counterpart ambiguity. Version 2.0 — newer than
+# test-syu-hint-older (1.0), older than test-syu-hint-newer (9.0).
+#
+# Declaration order in `provides=` is load-bearing: test-syu-hint-newer
+# comes FIRST, so the unhinted walk in `PacmanIndex::counterpart` would
+# pick it (it's installed). The hint plumbing must override that to
+# return test-syu-hint-older — the pkgname the user actually saw in the
+# `-Syu` picker and selected.
+#
+# Without the fix this fixture exercises, the review header reads:
+#   upgrade: test-syu-hint-new 9.0-1 → 2.0-1  [provides test-syu-hint-newer]
+# i.e. a downgrade against the wrong installed pkg, with no diff
+# (the new pkgbase's history doesn't contain 9.0).
+#
+# With the fix, the header correctly reads:
+#   upgrade: test-syu-hint-new 1.0-1 → 2.0-1  [provides test-syu-hint-older]
+# and the hint-divergence warning fires in the trace.
+pkgname=test-syu-hint-new
+pkgver=2.0
+pkgrel=1
+pkgdesc='gitaur test fixture: pkgbase with two installed provides; tests -Syu hint plumbing'
+arch=('any')
+license=('MIT')
+provides=('test-syu-hint-newer' 'test-syu-hint-older')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}
