@@ -53,7 +53,9 @@ fn aur_upgrades(
     let mut out = Vec::new();
     for (name, installed_ver) in pac.foreign() {
         let Some(entry) = by.lookup(idx, &name) else {
-            warn!(name, "foreign pkg not in AUR index");
+            if !is_makepkg_split(&name) {
+                warn!(name, "foreign pkg not in AUR index");
+            }
             continue;
         };
         let is_vcs = is_vcs_pkg(&entry.pkgbase);
@@ -81,6 +83,13 @@ fn is_vcs_pkg(pkgbase: &str) -> bool {
         || pkgbase.ends_with("-bzr")
 }
 
+/// `-debug` packages are makepkg split outputs tied to a parent pkgbase
+/// (produced by `OPTIONS=(debug)` in `makepkg.conf`), so they never appear
+/// in the AUR index on their own.
+fn is_makepkg_split(name: &str) -> bool {
+    name.ends_with("-debug")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +102,17 @@ mod tests {
         assert!(is_vcs_pkg("baz-bzr"));
         assert!(!is_vcs_pkg("neovim"));
         assert!(!is_vcs_pkg("git-lfs"));
+    }
+
+    #[test]
+    fn detects_makepkg_debug_splits() {
+        assert!(is_makepkg_split("systemd-cron-debug"));
+        assert!(is_makepkg_split("brlaser-debug"));
+        // Explicit split packages declared in `pkgname=(...)` get their own
+        // AUR entries — only the makepkg-generated `-debug` suffix is mute.
+        assert!(!is_makepkg_split("paru-bin"));
+        assert!(!is_makepkg_split("neovim-git"));
+        assert!(!is_makepkg_split("foo-libs"));
+        assert!(!is_makepkg_split("sequoia-keyring-linter"));
     }
 }
