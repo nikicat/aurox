@@ -21,5 +21,11 @@ pub fn default_config() -> Config {
         devel: false,
         review_default: "prompt".into(),
         aur_default_select: false,
+        // 256 covers ~2 years of dotnet-core-7.0-bin-shaped pkgs (~10
+        // updates/month). Old default of 64 routinely missed the diff
+        // base on long-untouched installs; bumping the headline cost
+        // (~250ms one-shot) is worth always finding the commit when it
+        // exists in the AUR repo.
+        review_history_scan_max: 256,
     }
 }

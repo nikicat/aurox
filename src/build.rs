@@ -253,7 +253,14 @@ fn run_aur_pipeline(
             let selection = plan.pkgname_selections.get(pkgbase).map(Vec::as_slice);
             let hint = plan.counterpart_hints.get(pkgbase);
             row.push(prepare_one(
-                &mirror, idx, pac, pkgbase, selection, hint, noconfirm,
+                &mirror,
+                idx,
+                pac,
+                pkgbase,
+                selection,
+                hint,
+                cfg.review_history_scan_max,
+                noconfirm,
             )?);
         }
         prep_strata.push(row);
@@ -461,6 +468,7 @@ fn prepare_one<'a>(
     pkgbase: &'a PkgBase,
     selection: Option<&'a [PkgName]>,
     hint: Option<&PkgName>,
+    history_scan_max: usize,
     noconfirm: bool,
 ) -> Result<Prep<'a>> {
     let entry = idx
@@ -519,6 +527,7 @@ fn prepare_one<'a>(
         &new_ver,
         counterpart.as_ref(),
         &wt,
+        history_scan_max,
         noconfirm,
     )? {
         review::Outcome::Approved => Disposition::Build,

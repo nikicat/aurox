@@ -109,7 +109,7 @@ fn finds_middle_commit_for_installed_version() {
     let mirror = MirrorRepo::open(&bare).unwrap();
     let head = oids[2];
 
-    let found = review::find_installed_commit(&mirror, head, Ver::new("1.1-1")).unwrap();
+    let found = review::find_installed_commit(&mirror, head, Ver::new("1.1-1"), 64).unwrap();
     assert_eq!(found, Some(oids[1]));
 }
 
@@ -128,7 +128,7 @@ fn finds_oldest_commit_for_installed_version() {
     let mirror = MirrorRepo::open(&bare).unwrap();
     let head = oids[2];
 
-    let found = review::find_installed_commit(&mirror, head, Ver::new("1.0-1")).unwrap();
+    let found = review::find_installed_commit(&mirror, head, Ver::new("1.0-1"), 64).unwrap();
     assert_eq!(found, Some(oids[0]));
 }
 
@@ -146,7 +146,7 @@ fn returns_none_when_version_not_in_history() {
     let mirror = MirrorRepo::open(&bare).unwrap();
     let head = oids[1];
 
-    let found = review::find_installed_commit(&mirror, head, Ver::new("9.9-9")).unwrap();
+    let found = review::find_installed_commit(&mirror, head, Ver::new("9.9-9"), 64).unwrap();
     assert_eq!(found, None);
 }
 
@@ -167,7 +167,7 @@ fn matches_version_with_epoch_prefix() {
     let mirror = MirrorRepo::open(&bare).unwrap();
     let head = oids[1];
 
-    let found = review::find_installed_commit(&mirror, head, Ver::new("1:0.1-1")).unwrap();
+    let found = review::find_installed_commit(&mirror, head, Ver::new("1:0.1-1"), 64).unwrap();
     assert_eq!(found, Some(oids[0]));
 }
 
@@ -188,6 +188,43 @@ fn picks_head_when_already_at_installed_version() {
     let mirror = MirrorRepo::open(&bare).unwrap();
     let head = oids[1];
 
-    let found = review::find_installed_commit(&mirror, head, Ver::new("1.1-1")).unwrap();
+    let found = review::find_installed_commit(&mirror, head, Ver::new("1.1-1"), 64).unwrap();
     assert_eq!(found, Some(oids[1]));
+}
+
+/// The dotnet-runtime-7.0 regression that motivated the configurable
+/// `review_history_scan_max`: the target version DOES exist in the
+/// pkgbase's history but sits past the search bound. With a too-small
+/// bound the walk misses it; with a large-enough bound it finds it.
+#[test]
+fn bound_governs_how_far_back_we_look() {
+    let dir = TempDir::new().unwrap();
+    // Build a 5-deep history; the matching commit (sdk120) is at depth 4
+    // (oldest), with sdk130, sdk140, sdk150, and sdk160 stacked above.
+    let (bare, oids) = build_history(
+        dir.path(),
+        "dotnet-core-7.0-bin",
+        &[
+            SrcinfoFixture::new("7.0.20.sdk120", "2"),
+            SrcinfoFixture::new("7.0.20.sdk130", "1"),
+            SrcinfoFixture::new("7.0.20.sdk140", "1"),
+            SrcinfoFixture::new("7.0.20.sdk150", "1"),
+            SrcinfoFixture::new("7.0.20.sdk160", "1"),
+        ],
+    );
+    let mirror = MirrorRepo::open(&bare).unwrap();
+    let head = oids[4];
+
+    // Bound = 3 → walk visits sdk160, sdk150, sdk140; misses sdk120.
+    let missed =
+        review::find_installed_commit(&mirror, head, Ver::new("7.0.20.sdk120-2"), 3).unwrap();
+    assert_eq!(
+        missed, None,
+        "bound=3 must NOT reach the depth-4 match — this is the dotnet-runtime regression shape"
+    );
+
+    // Bound = 5 → walk reaches the oldest commit, finds it.
+    let found =
+        review::find_installed_commit(&mirror, head, Ver::new("7.0.20.sdk120-2"), 5).unwrap();
+    assert_eq!(found, Some(oids[0]), "bound=5 must reach the depth-4 match");
 }

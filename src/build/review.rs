@@ -22,11 +22,11 @@ use std::path::Path;
 use std::process::Command;
 use tracing::{debug, info, instrument};
 
-/// How many commits back to scan looking for the AUR commit that produced
-/// `installed_ver`. AUR maintainers bump versions one commit at a time, so
-/// the match almost always sits in the first few commits. Bounded to keep
-/// the walk cheap on a very stale install.
-const MAX_HISTORY_SCAN: usize = 64;
+// History walk bound is now configurable via
+// `Config::review_history_scan_max` — plumbed through `cmd_install` →
+// `prepare_one` → `review::review` → `find_installed_commit`. Old static
+// `MAX_HISTORY_SCAN = 64` constant removed; the fallback notes carry the
+// runtime value so the user always knows what was actually searched.
 
 /// `git diff --unified=<N>` value for "view full diff" — large enough to
 /// blanket any realistic PKGBUILD so every unchanged line is shown.
@@ -56,6 +56,7 @@ pub fn review(
     new_ver: &Ver,
     counterpart: Option<&InstalledCounterpart<'_>>,
     wt: &Worktree,
+    history_scan_max: usize,
     noconfirm: bool,
 ) -> Result<Outcome> {
     if noconfirm {
@@ -79,7 +80,7 @@ pub fn review(
     // Initial render runs once — the loop body dispatches user actions and
     // re-renders only what the user asked for, so picking "view PKGBUILD"
     // isn't immediately clobbered by re-printing the diff above the prompt.
-    let base = show(mirror, pkgbase, new_ver, counterpart, wt)?;
+    let base = show(mirror, pkgbase, new_ver, counterpart, wt, history_scan_max)?;
 
     let items = menu_items(base.is_some());
 
@@ -115,6 +116,7 @@ fn show(
     new_ver: &Ver,
     counterpart: Option<&InstalledCounterpart<'_>>,
     wt: &Worktree,
+    history_scan_max: usize,
 ) -> Result<Option<ObjectId>> {
     ui::step(&header(pkgbase, new_ver, counterpart));
 
@@ -126,12 +128,12 @@ fn show(
         return Ok(None);
     };
 
-    if let Some(base) = find_installed_commit(mirror, wt.head_oid, installed)? {
+    if let Some(base) = find_installed_commit(mirror, wt.head_oid, installed, history_scan_max)? {
         show_diff(mirror, wt, base, None)?;
         Ok(Some(base))
     } else {
         let c = counterpart.expect("upgrade_base_version is Some only when counterpart is Some");
-        ui::note(&fallback_note(pkgbase, c));
+        ui::note(&fallback_note(pkgbase, c, history_scan_max));
         show_pkgbuild(wt)?;
         Ok(None)
     }
@@ -199,14 +201,28 @@ fn upgrade_base_version<'a>(
 /// transition reads naturally — searching the new pkgbase's history for
 /// `dotnet-runtime-7.0`'s version was always going to fail; the user
 /// shouldn't have to puzzle out why.
-fn fallback_note(pkgbase: &PkgBase, c: &InstalledCounterpart<'_>) -> String {
+///
+/// Both tiers now name the actual search bound (`history_scan_max`), so
+/// the user can tell apart "the lineage doesn't include this version
+/// anywhere in AUR history" (where bumping the bound wouldn't help) from
+/// "the history search topped out before reaching the matching commit"
+/// (where bumping `review_history_scan_max` in config IS the fix).
+fn fallback_note(
+    pkgbase: &PkgBase,
+    c: &InstalledCounterpart<'_>,
+    history_scan_max: usize,
+) -> String {
+    let hint = "(raise `review_history_scan_max` in config.toml if the install \
+                predates the search bound)";
     match c.via {
         MatchedVia::Pkgname => format!(
-            "no AUR commit in the last {MAX_HISTORY_SCAN} of {pkgbase} matches installed {} ({}); showing full PKGBUILD",
+            "no AUR commit in the last {history_scan_max} of {pkgbase} matches \
+             installed {} ({}); showing full PKGBUILD {hint}",
             c.pkgname, c.version,
         ),
         MatchedVia::Replaces | MatchedVia::Provides => format!(
-            "no AUR commit of {pkgbase} produced installed {} ({}); showing full PKGBUILD",
+            "no AUR commit in the last {history_scan_max} of {pkgbase} produced \
+             installed {} ({}); showing full PKGBUILD {hint}",
             c.pkgname, c.version,
         ),
     }
@@ -292,9 +308,10 @@ fn menu_items(has_diff: bool) -> Vec<&'static str> {
 
 /// Walk the AUR branch back from `head_oid` looking for the commit whose
 /// `.SRCINFO` declares `installed_ver`. Returns `None` if no such commit is
-/// found within [`MAX_HISTORY_SCAN`] steps — VCS pkgbases never match here
+/// found within `history_scan_max` steps — VCS pkgbases never match here
 /// because their static pkgver is overridden by `pkgver()` at build time,
-/// and very stale installs may sit further back than the bound.
+/// and very stale installs may sit further back than the bound (the
+/// caller's `Config::review_history_scan_max` controls how deep to go).
 ///
 /// Uses `.SRCINFO` rather than parsing `PKGBUILD` ourselves: the AUR ships
 /// the post-bash-expansion `.SRCINFO` alongside every PKGBUILD, and the
@@ -306,6 +323,7 @@ pub fn find_installed_commit(
     mirror: &MirrorRepo,
     head_oid: ObjectId,
     installed_ver: &Ver,
+    history_scan_max: usize,
 ) -> Result<Option<ObjectId>> {
     let head = mirror
         .repo
@@ -316,7 +334,7 @@ pub fn find_installed_commit(
         .first_parent_only()
         .all()
         .map_err(|e| Error::Gix(format!("ancestors {head_oid}: {e}")))?;
-    for info in walk.take(MAX_HISTORY_SCAN) {
+    for info in walk.take(history_scan_max) {
         let info = info.map_err(|e| Error::Gix(format!("walk: {e}")))?;
         let tree = info
             .object()
@@ -340,7 +358,6 @@ pub fn find_installed_commit(
 mod tests {
     use super::{
         diff_command, fallback_note, header, menu_items, upgrade_base_version, FULL_DIFF_CONTEXT,
-        MAX_HISTORY_SCAN,
     };
     use crate::names::{PkgBase, PkgName};
     use crate::pacman::alpm_db::{InstalledCounterpart, MatchedVia};
@@ -348,6 +365,11 @@ mod tests {
     use gix::hash::Kind;
     use gix::ObjectId;
     use std::path::Path;
+
+    /// Default search bound used in the fallback_note assertions — the
+    /// constant from `Config::review_history_scan_max`'s default. Tests
+    /// that exercise the bound itself use literal values inline.
+    const TEST_HISTORY_SCAN: usize = 256;
 
     /// Owning fixture for an `InstalledCounterpart`. `InstalledCounterpart`
     /// borrows its `pkgname`, so tests need a stable address — `Fixture`
@@ -590,26 +612,46 @@ mod tests {
     #[test]
     fn fallback_note_pkgname_mentions_history_bound() {
         let f = fx("foo", "0.5-1", MatchedVia::Pkgname);
-        let note = fallback_note(&pb("foo"), &f.cp());
+        let note = fallback_note(&pb("foo"), &f.cp(), TEST_HISTORY_SCAN);
         assert!(
-            note.contains(&MAX_HISTORY_SCAN.to_string()),
-            "pkgname-match note should mention the history bound: {note}"
+            note.contains(&TEST_HISTORY_SCAN.to_string()),
+            "pkgname-match note should name the history bound: {note}"
         );
         assert!(note.contains("foo (0.5-1)"));
     }
 
+    /// Both tiers must name the bound — the provides path was historically
+    /// silent about it, which made "no AUR commit of dotnet-core-7.0-bin
+    /// produced installed dotnet-runtime-7.0" read as "this lineage never
+    /// included it", when in fact the search had just topped out. Now both
+    /// say "in the last N of …" so the user knows whether bumping
+    /// `review_history_scan_max` would help.
     #[test]
-    fn fallback_note_provides_does_not_mention_history_bound() {
-        // The mismatch isn't about "we didn't look back far enough" — it's
-        // about lineage. The note should reflect that.
+    fn fallback_note_provides_also_names_history_bound() {
         let f = fx("old", "0.5-1", MatchedVia::Provides);
-        let note = fallback_note(&pb("new"), &f.cp());
+        let note = fallback_note(&pb("new"), &f.cp(), TEST_HISTORY_SCAN);
         assert!(
-            !note.contains(&MAX_HISTORY_SCAN.to_string()),
-            "provides-match note should not mention the history bound: {note}"
+            note.contains(&TEST_HISTORY_SCAN.to_string()),
+            "provides-match note must also name the history bound: {note}"
         );
         assert!(note.contains("old (0.5-1)"));
         assert!(note.contains("new"));
+        assert!(
+            note.contains("review_history_scan_max"),
+            "note should point the user at the config knob: {note}"
+        );
+    }
+
+    #[test]
+    fn fallback_note_carries_configured_bound_through() {
+        // The bound is a runtime value — flip it and verify the note
+        // reflects what was actually searched, not a hard-coded constant.
+        let f = fx("foo", "0.5-1", MatchedVia::Pkgname);
+        let note = fallback_note(&pb("foo"), &f.cp(), 99);
+        assert!(
+            note.contains("last 99 of foo"),
+            "note should embed the runtime bound: {note}"
+        );
     }
 }
 

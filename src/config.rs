@@ -38,6 +38,15 @@ pub struct Config {
     /// Flip to `true` to get the yay/paru behavior where every upgrade is
     /// pre-selected.
     pub aur_default_select: bool,
+    /// Max commits `find_installed_commit` walks back through a pkgbase's
+    /// history when looking for the commit that produced the installed
+    /// version (so the review screen can diff against it). Fast-moving
+    /// pkgs (dotnet-core-*-bin, kernel-git, etc.) can have hundreds of
+    /// commits between the user's installed version and HEAD; raise this
+    /// when the review screen keeps falling back to "full PKGBUILD" for
+    /// those. Cost is ~1ms per commit (clone + parse .SRCINFO), so 256
+    /// caps at <300ms even for cold caches.
+    pub review_history_scan_max: usize,
 }
 
 impl Default for Config {
