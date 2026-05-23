@@ -195,14 +195,14 @@ pub fn select_upgrades(
         // would otherwise over-clear every redraw — eating lines above the
         // prompt — when items carry ANSI escapes. Colour is reapplied at
         // render time via [`UpgradePickerTheme`].
-        let plain: Vec<String> = ordered
+        let ascii_rows: Vec<String> = ordered
             .iter()
             .map(|u| render_row(u, repo_w, name_w, old_w, false))
             .collect();
         let theme = UpgradePickerTheme::new(if colored {
             ordered
                 .iter()
-                .zip(&plain)
+                .zip(&ascii_rows)
                 .map(|(u, p)| (p.as_str(), render_row(u, repo_w, name_w, old_w, true)))
                 .collect()
         } else {
@@ -210,7 +210,7 @@ pub fn select_upgrades(
         });
         MultiSelect::with_theme(&theme)
             .with_prompt("Select upgrades to apply (space toggles, a inverts, enter confirms)")
-            .items(&plain)
+            .items(&ascii_rows)
             .defaults(&defaults)
             // Suppress dialoguer's post-interaction "report" line — it would
             // re-list every selected row as a single wrapped line, duplicating

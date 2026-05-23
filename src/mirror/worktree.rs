@@ -180,13 +180,13 @@ fn run_git(args: &[&std::ffi::OsStr]) -> Result<()> {
         .map_err(|e| Error::other(format!("spawn git: {e}")))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        let argv: Vec<String> = args
+        let displayed: Vec<String> = args
             .iter()
             .map(|s| s.to_string_lossy().into_owned())
             .collect();
         return Err(Error::Gix(format!(
             "git {} failed: {}",
-            argv.join(" "),
+            displayed.join(" "),
             stderr.trim(),
         )));
     }

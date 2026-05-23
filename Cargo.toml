@@ -78,6 +78,9 @@ unused_qualifications = "warn"
 # Discarding a `Drop` type with `let _ =` usually means a forgotten guard,
 # lock, or file handle. Explicit `drop(x)` for the rare intentional case.
 let_underscore_drop = "warn"
+# Force `&Foo<'_>` over `&Foo` when `Foo` has a lifetime parameter — keeps
+# borrow scopes visible at call sites, same school as clippy::absolute_paths.
+elided_lifetimes_in_paths = "warn"
 
 [lints.clippy]
 # Baseline groups.
@@ -107,19 +110,15 @@ clone_on_ref_ptr = "warn"
 str_to_string = "warn"
 # Enforce the modern `foo.rs` + `foo/` layout (already in use) over `mod.rs`.
 mod_module_files = "warn"
-# Common pedantic noise we don't care about in a CLI.
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-return_self_not_must_use = "allow"
-struct_excessive_bools = "allow"
-# Don't fight the `_` underscore-bound naming when we're documenting params.
-similar_names = "allow"
+# Common pedantic noise we don't care about in a CLI. Hit counts measured
+# (2026-05) so we know what each allow is actually suppressing: drop any whose
+# count goes to zero on a refactor, and reconsider any that grow large.
+module_name_repetitions = "allow" # 8 hits — flat-API names (MirrorRepo, IndexEntry, bootstrap_clone)
+must_use_candidate = "allow"      # 56 — pure bureaucracy for a binary
+missing_errors_doc = "allow"      # 36 — lib half isn't real public API
+missing_panics_doc = "allow"      # 7 — same shape as above
 # Nursery lints that flag legitimate patterns in a CLI / would force `#[allow]`
 # sprinkles throughout the code without a real quality gain.
-option_if_let_else = "allow"  # rewrite-only, often less readable
-or_fun_call = "allow"         # false-positives on cheap functions
-redundant_pub_crate = "allow" # `pub(crate)` style preference
+option_if_let_else = "allow" # 2 — rewrite-only, often less readable
 # Pinning all transitive crate versions is rarely worth the churn for a CLI.
-multiple_crate_versions = "allow"
+multiple_crate_versions = "allow" # 17 — mostly transitive, not fixable here

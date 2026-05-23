@@ -50,15 +50,17 @@ fn split_ver(v: &str) -> (Option<&str>, &str, Option<&str>) {
 /// differing layer wins, so `1.0-1 → 1.0-2` is [`BumpKind::PkgRel`] even
 /// though pkgrel sits after pkgver in the version string.
 pub fn classify_bump(old: &Ver, new: &Ver) -> BumpKind {
-    let (o_ep, o_pv, o_pr) = split_ver(old.as_str());
-    let (n_ep, n_pv, n_pr) = split_ver(new.as_str());
+    let (old_epoch, old_pkgver, old_pkgrel) = split_ver(old.as_str());
+    let (new_epoch, new_pkgver, new_pkgrel) = split_ver(new.as_str());
 
-    if o_ep != n_ep {
+    if old_epoch != new_epoch {
         return BumpKind::Epoch;
     }
-    if o_pv != n_pv {
-        for (i, (op, np)) in o_pv.split('.').zip(n_pv.split('.')).enumerate() {
-            if op != np {
+    if old_pkgver != new_pkgver {
+        for (i, (old_part, new_part)) in
+            old_pkgver.split('.').zip(new_pkgver.split('.')).enumerate()
+        {
+            if old_part != new_part {
                 return match i {
                     0 => BumpKind::Major,
                     1 => BumpKind::Minor,
@@ -70,7 +72,7 @@ pub fn classify_bump(old: &Ver, new: &Ver) -> BumpKind {
         // (e.g. `1.2 → 1.2.1`). Treat as a patch.
         return BumpKind::Patch;
     }
-    if o_pr != n_pr {
+    if old_pkgrel != new_pkgrel {
         return BumpKind::PkgRel;
     }
     BumpKind::Other

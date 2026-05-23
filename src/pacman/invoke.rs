@@ -67,13 +67,13 @@ pub fn query_repo_upgrades() -> Result<Vec<PkgUpgrade>> {
 #[instrument(skip(cfg))]
 pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
     let escalate = needs_sudo(argv);
-    let (program, args) = if escalate {
+    let (program, spawn_args) = if escalate {
         (cfg.privilege_escalator.as_str(), with_pacman(argv))
     } else {
         ("pacman", argv.to_vec())
     };
-    debug!(program, args = ?args, "spawning pacman");
-    let status = Command::new(program).args(&args).status()?;
+    debug!(program, args = ?spawn_args, "spawning pacman");
+    let status = Command::new(program).args(&spawn_args).status()?;
     let code = status.code().unwrap_or(1);
     info!(code, "pacman exited");
     if status.success() {

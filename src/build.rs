@@ -545,7 +545,7 @@ fn prepare_one<'a>(
 }
 
 #[instrument(skip(cfg, prep), fields(pkgbase = %prep.pkgbase, version = %prep.new_ver))]
-fn run_build(cfg: &Config, prep: &Prep) -> Result<Vec<PathBuf>> {
+fn run_build(cfg: &Config, prep: &Prep<'_>) -> Result<Vec<PathBuf>> {
     ui::step(&format!("makepkg {}", prep.pkgbase));
     makepkg::run(cfg, &prep.wt.path)?;
 
