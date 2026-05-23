@@ -1,0 +1,24 @@
+# Foreign seed for smoke/44. Stand-alone single-pkgname PKGBUILD at
+# v1.0; its `.pkg.tar.zst` gets staged into /srv/foreign-pkgs/ and
+# `pacman -U`'d at test time to mimic the user having installed a
+# google-cloud-cli-bq-like split sibling via some prior source.
+#
+# Pkgname deliberately matches one of test-syu-split-foreign's siblings
+# (the AUR fixture at v2.0). `-Syu`'s upgrade scan finds this pkgname
+# in localdb, classify_foreign returns AsPkgname(test-syu-split-foreign),
+# vercmp 1.0 < 2.0 → the picker row carries
+# `Target::with_hint("test-syu-split-foreign-cli", …)`.
+#
+# This fixture must NOT appear in the mock AUR mirror (the `repo`
+# marker keeps setup-fixtures from pushing it), otherwise `-Syu` would
+# resolve it to its own pkgbase and the split-shortcut bug never fires.
+pkgname=test-syu-split-foreign-cli
+pkgver=1.0
+pkgrel=1
+pkgdesc='gitaur test fixture: foreign-installed sibling of a split pkgbase, seed for smoke/44'
+arch=('any')
+license=('MIT')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}

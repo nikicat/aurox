@@ -124,7 +124,23 @@ pub fn expand_pkgbase_targets(
         record_target_hint(by, idx, t, bare, &mut out.counterpart_hints);
 
         // pacman wins outright — never reroute a name pacman can satisfy.
+        // BUT: when `bare` is a pkgname in a multi-pkgname AUR pkgbase (the
+        // foreign-installed split-pkg case, e.g. `-Syu` picks
+        // `google-cloud-cli-bq` whose pkgbase ships four other pkgnames),
+        // we must STILL record the selection here. Otherwise
+        // `install_stratum`'s `pacman -U` has no filter and installs every
+        // sibling makepkg packaged from the same PKGBUILD. The bisq-cli
+        // regression's twin: that one fired through the rewrite branch,
+        // this one fires through the shortcut.
         if pac.is_installed(bare) || pac.in_sync(bare) {
+            if let Some(&entry_idx) = by.by_name.get(bare) {
+                let entry = &idx.entries[entry_idx as usize];
+                if entry.pkgnames.len() > 1 {
+                    let bare_name = PkgName::from(bare);
+                    let chosen = chosen_with_sibling_deps(entry, &bare_name);
+                    extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
+                }
+            }
             out.targets.push(t.spec.clone());
             continue;
         }
@@ -909,6 +925,58 @@ mod tests {
             Some(&PkgName::from("paru")),
             "installed foreign virtual must record its hint even though \
              the spec passes through unchanged",
+        );
+    }
+
+    /// Regression for the google-cloud-cli bug. `-Syu` rows for a
+    /// foreign-installed pkgname in a split pkgbase hit the
+    /// `pac.is_installed(bare)` shortcut. Twin to
+    /// `installed_foreign_virtual_records_hint_despite_pacman_shortcut`,
+    /// but for the **selection** side of the bookkeeping: without a
+    /// recorded selection, `install_stratum` has no filter and `pacman
+    /// -U`'s every sibling makepkg packaged. With the fix, the shortcut
+    /// branch records the same single-pkgname (+ sibling runtime deps)
+    /// selection that the by_name rewrite branch would have.
+    #[test]
+    fn installed_split_pkgname_records_selection_despite_pacman_shortcut() {
+        let (idx, by, mut pac) = fixture();
+        // bisq-cli is a pkgname of the split pkgbase `bisq` (siblings:
+        // bisq-daemon, bisq-desktop; no intra-split deps in the fixture
+        // → chosen reduces to just bisq-cli). Pretend it's installed
+        // foreign at an outdated version, mirroring the
+        // google-cloud-cli-bq starting state.
+        pac.installed.insert("bisq-cli".into(), "1.0-1".into());
+        let r = expand_pkgbase_targets(&idx, Some(&by), &pac, &ts(&["bisq-cli"]), &mut select_all)
+            .unwrap();
+        // Shortcut fired — spec passes through unchanged.
+        assert_eq!(r.targets, vec!["bisq-cli".to_string()]);
+        // The crucial bit: selection IS recorded against the pkgbase.
+        // Without this, install_stratum installs all three siblings.
+        assert_eq!(
+            r.selections.get(&PkgBase::from("bisq")),
+            Some(&vec![PkgName::from("bisq-cli")]),
+            "shortcut path must record the single-pkgname selection for \
+             a foreign-installed sibling of a split pkgbase",
+        );
+    }
+
+    /// Single-pkgname pkgbase under the shortcut: no selection needed
+    /// (there's nothing to filter against). Guards against a refactor
+    /// that records a degenerate `len==1` selection from the shortcut
+    /// just because it can — `selections` is meaningful only when it
+    /// constrains a *true subset*, and bloating it would muddy the
+    /// `install_stratum` filter's "Some means subset" contract.
+    #[test]
+    fn installed_single_pkgname_records_no_selection_in_shortcut() {
+        let (idx, by, mut pac) = fixture();
+        // `cower` is a trivial single-pkgname pkgbase. Installed foreign.
+        pac.installed.insert("cower".into(), "1.0-1".into());
+        let r = expand_pkgbase_targets(&idx, Some(&by), &pac, &ts(&["cower"]), &mut select_all)
+            .unwrap();
+        assert_eq!(r.targets, vec!["cower".to_string()]);
+        assert!(
+            r.selections.is_empty(),
+            "single-pkgname pkgbase has no real subset to record",
         );
     }
 }

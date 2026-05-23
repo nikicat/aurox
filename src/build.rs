@@ -442,11 +442,18 @@ fn blocking_dep<'a>(
 }
 
 /// One pkgbase's prepared state, produced in phase 1 and consumed in phase 2.
+///
+/// `required` is the concrete list of pkgnames this run must end up with
+/// installed at `new_ver` — derived from `Plan.pkgname_selections` when the
+/// user named a subset, otherwise widened to `entry.pkgnames`. Storing the
+/// resolved list (instead of the upstream `Option`) keeps `select_outputs`
+/// signature uniform and means `run_build` / the cached path filter against
+/// the same source of truth as `prepare_one`'s idempotency check.
 struct Prep<'a> {
     pkgbase: &'a PkgBase,
     wt: mirror::worktree::Worktree,
     new_ver: Version,
-    selection: Option<&'a [PkgName]>,
+    required: Vec<PkgName>,
     disposition: Disposition,
 }
 
@@ -480,9 +487,9 @@ fn prepare_one<'a>(
     let wt = mirror::worktree::add_or_reset(mirror, pkgbase, &dest)?;
 
     let new_ver = entry.version();
-    let required: Vec<&PkgName> = match selection {
-        Some(sel) => sel.iter().collect(),
-        None => entry.pkgnames.iter().map(|p| &p.name).collect(),
+    let required: Vec<PkgName> = match selection {
+        Some(sel) => sel.to_vec(),
+        None => entry.pkgnames.iter().map(|p| p.name.clone()).collect(),
     };
 
     // Idempotency: skip rebuild iff a .pkg.tar.{zst,xz} file at exactly
@@ -499,7 +506,7 @@ fn prepare_one<'a>(
                 .any(|f| install::matches_pkg(f, name, &new_ver))
         });
     if cached {
-        let kept = filter_by_selection(&existing, selection);
+        let kept = select_outputs(&existing, &required, &new_ver);
         ui::note(&format!("{pkgbase}: already built {new_ver}"));
         debug!(
             %pkgbase,
@@ -511,7 +518,7 @@ fn prepare_one<'a>(
             pkgbase,
             wt,
             new_ver,
-            selection,
+            required,
             disposition: Disposition::Cached(kept),
         });
     }
@@ -537,7 +544,7 @@ fn prepare_one<'a>(
         pkgbase,
         wt,
         new_ver,
-        selection,
+        required,
         disposition,
     })
 }
@@ -548,7 +555,7 @@ fn run_build(cfg: &Config, prep: &Prep) -> Result<Vec<PathBuf>> {
     makepkg::run(cfg, &prep.wt.path)?;
 
     let produced = install::find_produced(&prep.wt.path)?;
-    let outputs = filter_by_selection(&produced, prep.selection);
+    let outputs = select_outputs(&produced, &prep.required, &prep.new_ver);
     if outputs.is_empty() {
         return Err(Error::Build(format!(
             "{}: makepkg produced no packages",
@@ -564,17 +571,22 @@ fn run_build(cfg: &Config, prep: &Prep) -> Result<Vec<PathBuf>> {
     Ok(outputs)
 }
 
-/// Keep only `.pkg.tar.zst` whose pkgname is in `selection`. `None` means no
-/// filter (default for non-split builds and dependency builds). Guards
-/// against stale leftover files (e.g. a prior wider build) when reusing a
-/// cached build.
-fn filter_by_selection(files: &[PathBuf], selection: Option<&[PkgName]>) -> Vec<PathBuf> {
-    let Some(sel) = selection else {
-        return files.to_vec();
-    };
+/// Keep only `.pkg.tar.{zst,xz}` whose `(pkgname, version)` matches one of
+/// the required pkgnames at `new_ver`. Two reasons the version match is
+/// load-bearing:
+///   * Stale leftovers from a prior build at an older version — the
+///     worktree is reused across runs, so `find_produced` returns *every*
+///     historic artifact. Without the version gate, `pacman -U` would get
+///     fed both versions of every selected pkgname and the install
+///     transaction would either pick the wrong one or fail outright
+///     (this was the google-cloud-cli 568↔569 dual-version bug).
+///   * Wider prior selection — same worktree, earlier run installed more
+///     siblings; the version match alone wouldn't drop them, so the
+///     pkgname filter keeps the install surface honest.
+fn select_outputs(files: &[PathBuf], required: &[PkgName], new_ver: &Version) -> Vec<PathBuf> {
     files
         .iter()
-        .filter(|f| install::extract_pkgname(f).is_some_and(|n| sel.contains(&n)))
+        .filter(|f| required.iter().any(|n| install::matches_pkg(f, n, new_ver)))
         .cloned()
         .collect()
 }
@@ -702,5 +714,87 @@ mod tests {
         let mut report = RunReport::default();
         report.skipped_user.push(a.clone());
         assert_eq!(blocking_dep(&b, &edges, &report), Some(&a));
+    }
+
+    fn pn(s: &str) -> PkgName {
+        PkgName::from(s)
+    }
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    /// Stale artifacts at an older `pkgver-pkgrel` in the same worktree
+    /// must not leak into the install transaction. Regression for the
+    /// google-cloud-cli 568↔569 dual-version bug: a previous build at
+    /// 568 left .pkg.tar.zst files behind; the current build at 569
+    /// then fed both versions into a single `pacman -U`. The version
+    /// gate in `select_outputs` is what keeps the install honest.
+    #[test]
+    fn select_outputs_drops_stale_artifacts_at_older_version() {
+        let files = vec![
+            p("/wt/google-cloud-cli-bq-568.0.0-1-x86_64.pkg.tar.zst"),
+            p("/wt/google-cloud-cli-bq-569.0.0-1-x86_64.pkg.tar.zst"),
+        ];
+        let required = vec![pn("google-cloud-cli-bq")];
+        let kept = select_outputs(&files, &required, &Version::from("569.0.0-1"));
+        assert_eq!(
+            kept,
+            vec![p("/wt/google-cloud-cli-bq-569.0.0-1-x86_64.pkg.tar.zst")],
+            "older artifact must be filtered out by the version gate",
+        );
+    }
+
+    /// Sibling pkgs that aren't in `required` must be filtered out even
+    /// when their version matches. Mirrors the `bisq-cli` selection
+    /// behaviour but at the outputs layer — the pkgname filter is what
+    /// keeps a split build from installing siblings the user didn't
+    /// ask for.
+    #[test]
+    fn select_outputs_drops_unrequested_siblings_at_matching_version() {
+        let files = vec![
+            p("/wt/google-cloud-cli-569.0.0-1-x86_64.pkg.tar.zst"),
+            p("/wt/google-cloud-cli-bq-569.0.0-1-x86_64.pkg.tar.zst"),
+            p("/wt/google-cloud-cli-gsutil-569.0.0-1-x86_64.pkg.tar.zst"),
+        ];
+        let required = vec![pn("google-cloud-cli-bq")];
+        let kept = select_outputs(&files, &required, &Version::from("569.0.0-1"));
+        assert_eq!(
+            kept,
+            vec![p("/wt/google-cloud-cli-bq-569.0.0-1-x86_64.pkg.tar.zst")],
+        );
+    }
+
+    /// Combined: both axes filter at once. Old version of the requested
+    /// pkgname AND current version of an unrequested sibling are both
+    /// rejected; only `(required_pkgname, new_ver)` matches survive.
+    #[test]
+    fn select_outputs_filters_on_both_pkgname_and_version() {
+        let files = vec![
+            p("/wt/google-cloud-cli-568.0.0-1-x86_64.pkg.tar.zst"),
+            p("/wt/google-cloud-cli-569.0.0-1-x86_64.pkg.tar.zst"),
+            p("/wt/google-cloud-cli-bq-568.0.0-1-x86_64.pkg.tar.zst"),
+            p("/wt/google-cloud-cli-bq-569.0.0-1-x86_64.pkg.tar.zst"),
+            p("/wt/google-cloud-cli-gsutil-569.0.0-1-x86_64.pkg.tar.zst"),
+        ];
+        let required = vec![pn("google-cloud-cli-bq")];
+        let kept = select_outputs(&files, &required, &Version::from("569.0.0-1"));
+        assert_eq!(
+            kept,
+            vec![p("/wt/google-cloud-cli-bq-569.0.0-1-x86_64.pkg.tar.zst")],
+            "only the (required_pkgname, new_ver) artifact survives both filters",
+        );
+    }
+
+    /// Full-selection non-split case: `required` is the entry's entire
+    /// pkgname list, and every artifact at `new_ver` passes through.
+    /// Pins that the version gate doesn't accidentally drop valid
+    /// outputs when there's no subset.
+    #[test]
+    fn select_outputs_passes_every_required_pkg_at_matching_version() {
+        let files = vec![p("/wt/test-trivial-1.0-1-any.pkg.tar.zst")];
+        let required = vec![pn("test-trivial")];
+        let kept = select_outputs(&files, &required, &Version::from("1.0-1"));
+        assert_eq!(kept, files);
     }
 }

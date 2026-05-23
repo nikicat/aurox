@@ -454,6 +454,47 @@ expand-side pkgbase pinning when a pkgname collides across two pkgbases
 sync-repo names (test 11) live one layer up in the resolver and don't
 change the cells above.
 
+#### Install-side selection: which siblings reach `pacman -U`
+
+A split PKGBUILD always packages every pkgname (makepkg has no
+`--pkg=` equivalent to "build only this one"). What gets *installed*
+is a separate decision, made by `Plan.pkgname_selections` and applied
+by `select_outputs` (`src/build.rs`) right before `install_stratum`
+hands files to `pacman -U`. The contract is "pkgbase absent ⇒ install
+every built pkgname; pkgbase present ⇒ install only the listed subset
++ their intra-split runtime deps."
+
+`expand_pkgbase_targets` is the single writer of that map. Three
+branches feed it:
+
+| Input shape                                         | Branch                            | Selection recorded?                        |
+| --------------------------------------------------- | --------------------------------- | ------------------------------------------ |
+| `-S X` where X is a pkgname of split P              | by_name rewrite                   | yes — `[X]` + sibling runtime deps         |
+| `-S V` where V is a scoped `provides` of split P    | by_provides rewrite               | yes (when scoped) — `[provider] + deps`    |
+| `-S V` where V is a pkgbase-level `provides`        | by_provides rewrite               | no (every sibling provides V implicitly)   |
+| `-S P` bare pkgbase                                 | by_pkgbase fallback               | yes (only when user picks a true subset)   |
+| `-Syu` row → spec is foreign-installed pkgname X    | **pacman shortcut**               | yes — same `[X]` + deps as by_name rewrite |
+| `-S X` where X is also in a sync repo               | pacman shortcut                   | yes when X is also an AUR split pkgname    |
+
+The pacman-shortcut row is the regression target for smoke 44 (the
+google-cloud-cli-bq bug). The `pac.is_installed(bare) || pac.in_sync(bare)`
+short-circuit was originally a pure "let pacman handle this" lane, but
+it also fires for foreign-installed pkgnames that happen to be siblings
+of an AUR split pkgbase. Without recording the selection there too,
+`install_stratum` had no filter and `pacman -U`'d every sibling
+makepkg packaged from the same PKGBUILD. Twin to the
+`record_target_hint`-at-the-top-of-the-loop fix (which has its own
+regression in smoke 33): both bookkeeping passes (hint, selection) must
+run on the shortcut path, not only on the rewrite path.
+
+`select_outputs` enforces the selection by `(pkgname, version)` rather
+than pkgname alone. The version gate also kills a separate hazard:
+when a previous build left `.pkg.tar.{zst,xz}` files for an older
+`pkgver-pkgrel` in the same worktree, `find_produced` returns every
+historic artifact and a name-only filter would feed both versions into
+one `pacman -U`. Pinning the filter to `entry.version()` keeps the
+install transaction at exactly one file per required pkgname.
+
 ### Why per-worker `gix::Repository` clones in `full_build`?
 
 `gix::Repository` is `Send` but **not** `Sync` — it carries interior

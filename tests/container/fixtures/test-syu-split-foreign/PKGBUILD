@@ -1,0 +1,40 @@
+# Split pkgbase whose siblings have NO intra-split runtime deps. The
+# google-cloud-cli shape: pkgbase ships several independent CLI splits
+# (-bq, -gsutil, …) and the user upgrades exactly one of them.
+#
+# Companion to test-syu-split-foreign-cli (foreign, single-pkgname, v1.0):
+# that fixture's `.pkg.tar.zst` is `pacman -U`'d as a foreign install at
+# test time, so `-Syu` sees the pkgname in localdb without a sync source
+# and rewrites it onto THIS pkgbase. The picker auto-selects the
+# resulting upgrade row.
+#
+# Regression target: `gitaur -Syu` of a foreign-installed pkgname in a
+# split pkgbase used to install every sibling. expand_pkgbase_targets's
+# pacman shortcut (`pac.is_installed(bare) || pac.in_sync(bare)`) fired
+# before the by_name rewrite branch could record a selection, so
+# `install_stratum` had no filter and `pacman -U`'d every sibling
+# makepkg packaged from this PKGBUILD. The bisq-cli regression's twin
+# at the shortcut layer.
+pkgbase=test-syu-split-foreign
+pkgname=(
+    test-syu-split-foreign-cli
+    test-syu-split-foreign-daemon
+    test-syu-split-foreign-desktop
+)
+pkgver=2.0
+pkgrel=1
+pkgdesc='gitaur test fixture: split pkg (no intra-split deps) for the -Syu shortcut regression'
+arch=('any')
+license=('MIT')
+
+package_test-syu-split-foreign-cli() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/test-syu-split-foreign-cli/marker"
+}
+
+package_test-syu-split-foreign-daemon() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/test-syu-split-foreign-daemon/marker"
+}
+
+package_test-syu-split-foreign-desktop() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/test-syu-split-foreign-desktop/marker"
+}
