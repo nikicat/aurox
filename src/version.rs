@@ -194,13 +194,13 @@ impl From<&alpm::Ver> for Version {
 
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
 impl fmt::Display for Ver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.pad(&self.0)
     }
 }
 
@@ -406,5 +406,17 @@ mod tests {
         assert!(!available.is_outdated(&installed));
         // Identical → not outdated (vercmp == Equal, < returns false).
         assert!(!installed.is_outdated(&installed));
+    }
+
+    #[test]
+    fn display_respects_width_and_alignment() {
+        // The upgrade table relies on `{ver:<W$}` padding to align the old/new
+        // version columns. `Display` must route through `Formatter::pad` (not
+        // `write_str`, which silently drops width/fill/align flags) — otherwise
+        // every row collapses to its natural length and the columns mis-align.
+        assert_eq!(format!("{:<8}", Version::from("1.0-1")), "1.0-1   ");
+        assert_eq!(format!("{:<8}", Ver::new("1.0-1")), "1.0-1   ");
+        assert_eq!(format!("{:>8}", Version::from("1.0-1")), "   1.0-1");
+        assert_eq!(format!("{:*^9}", Ver::new("1.0-1")), "**1.0-1**");
     }
 }

@@ -161,7 +161,7 @@ macro_rules! impl_name_wrapper {
 
         impl fmt::Display for $ty {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str(&self.0)
+                f.pad(&self.0)
             }
         }
 
@@ -333,6 +333,17 @@ mod tests {
             format!("{}", PkgBase::from("dotnet-core-7.0-bin")),
             "dotnet-core-7.0-bin"
         );
+    }
+
+    /// The upgrade table aligns the name column with `{name:<W$}`. `Display`
+    /// must go through `Formatter::pad` (not `write_str`, which drops
+    /// width/fill/align) or the column collapses to natural width.
+    #[test]
+    fn display_respects_width_and_alignment() {
+        assert_eq!(format!("{:<8}", PkgName::from("foo")), "foo     ");
+        assert_eq!(format!("{:<8}", PkgBase::from("foo")), "foo     ");
+        assert_eq!(format!("{:>8}", PkgName::from("foo")), "     foo");
+        assert_eq!(format!("{:*^7}", PkgName::from("foo")), "**foo**");
     }
 
     #[test]
