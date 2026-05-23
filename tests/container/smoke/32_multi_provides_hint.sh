@@ -22,16 +22,17 @@ bootstrap; reset_state
 
 gitaur -Sy
 
-# Seed: install BOTH legacy pkgs. Each is its own pkgbase with no provides
-# declarations — the multi-match scenario requires both to be present in
-# localdb so the new pkgbase's `provides=` array has two installed
-# candidates to choose from.
-gitaur -S --noconfirm test-multi-provides-legacy-a
-assert_exit 0
+# Seed: install BOTH legacy pkgs as FOREIGN — staged .pkg.tar.zst files
+# baked into the test image, applied via pacman -U. They land in localdb but
+# are NOT in any sync repo and NOT an AUR pkgbase, which is the exact shape
+# the resolver's `by_provides` walk is designed for. If we instead made them
+# AUR pkgbases here, the resolver would route the trigger `-S` below
+# straight to the legacy pkgbase (by_name wins over by_provides) and the
+# hint plumbing would never get a chance to fire.
+install_foreign test-multi-provides-legacy-a
 assert_pkg_installed test-multi-provides-legacy-a
 
-gitaur -S --noconfirm test-multi-provides-legacy-b
-assert_exit 0
+install_foreign test-multi-provides-legacy-b
 assert_pkg_installed test-multi-provides-legacy-b
 
 # Trigger: install the new pkgbase by typing the SECOND-declared virtual.

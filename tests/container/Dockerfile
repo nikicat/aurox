@@ -35,6 +35,7 @@ RUN install -d -o builder -g builder \
         /home/builder/.cache/gitaur \
         /srv/local-repo \
         /srv/mock-aur \
+        /srv/foreign-pkgs \
         /work \
     && chown -R builder:builder /home/builder
 

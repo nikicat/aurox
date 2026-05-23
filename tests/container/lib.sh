@@ -97,3 +97,19 @@ assert_pkg_asdep() {
     pacman -Qi "$1" 2>/dev/null | grep -q 'Install Reason.*as a dependency' \
         || { echo "expected $1 as-dep, got: $(pacman -Qi "$1" | grep 'Install Reason')" >&2; return 1; }
 }
+
+# ---------------------------------------------------------------------------
+# Foreign-install seed
+#
+# Install a `repo=foreign` fixture's pre-built artifact via pacman -U. The
+# resulting state — pkgname in localdb but not in any sync DB and not an AUR
+# pkgbase — models the dotnet-runtime case the resolver's `by_provides` walk
+# is designed to handle. Used as a seed in tests that exercise hint-driven
+# counterpart resolution (32, 33).
+install_foreign() {
+    local pkgbase="$1"
+    local pkg
+    pkg=$(ls /srv/foreign-pkgs/"$pkgbase"-*.pkg.tar.zst 2>/dev/null | head -1)
+    [[ -n "$pkg" ]] || { echo "no foreign artifact for $pkgbase under /srv/foreign-pkgs/" >&2; return 1; }
+    sudo pacman -U --noconfirm "$pkg" >/dev/null
+}

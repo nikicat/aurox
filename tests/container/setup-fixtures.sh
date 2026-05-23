@@ -1,22 +1,31 @@
 #!/usr/bin/env bash
 # Materialize fixture PKGBUILDs into:
-#   1. /srv/mock-aur  — a single bare git repo with one `refs/heads/<pkgbase>`
-#                      per AUR fixture. This mimics github.com/archlinux/aur's
-#                      ref layout exactly so gitaur's mirror logic is exercised.
-#   2. /srv/local-repo — a real pacman sync DB built from any fixture marked
-#                       as repo='official' (those packages are built once with
-#                       makepkg, dropped into the dir, indexed via repo-add).
+#   1. /srv/mock-aur    — a single bare git repo with one `refs/heads/<pkgbase>`
+#                         per AUR fixture. This mimics github.com/archlinux/aur's
+#                         ref layout exactly so gitaur's mirror logic is exercised.
+#   2. /srv/local-repo  — a real pacman sync DB built from any `repo=official`
+#                         fixture (built once with makepkg, dropped into the dir,
+#                         indexed via repo-add).
+#   3. /srv/foreign-pkgs — staged `.pkg.tar.zst` files for `repo=foreign`
+#                         fixtures. NOT registered in any sync DB and NOT mirrored
+#                         in /srv/mock-aur — they exist only as artifacts a test
+#                         can `pacman -U` to seed a "foreign install" state
+#                         (in localdb, but not in any sync source). Models the
+#                         dotnet-runtime case: a name that's installed but not
+#                         in any current repo and not an AUR pkgbase, so the
+#                         resolver must walk `by_provides` to find its upgrade.
 #
 # Each fixture lives under tests/container/fixtures/<pkgbase>/ with at minimum
-# a PKGBUILD plus an optional `repo` file ("aur" or "official"). All fixtures
-# are designed to build in well under a second — tests assert behavior, not
-# realistic compilation work.
+# a PKGBUILD plus an optional `repo` file ("aur", "official", or "foreign").
+# All fixtures are designed to build in well under a second — tests assert
+# behavior, not realistic compilation work.
 
 set -euo pipefail
 
 FIXTURES_DIR="${FIXTURES_DIR:-/work/tests/container/fixtures}"
 MOCK_AUR="${MOCK_AUR:-/srv/mock-aur}"
 LOCAL_REPO="${LOCAL_REPO:-/srv/local-repo}"
+FOREIGN_PKGS="${FOREIGN_PKGS:-/srv/foreign-pkgs}"
 
 # ---- mock AUR bare repo ----------------------------------------------------
 # One commit per pkgbase, each on a separate branch named after the pkgbase.
@@ -76,6 +85,24 @@ build_and_register_official() {
     rm -rf "$stage"
 }
 
+# ---- foreign-install artifact stage ---------------------------------------
+# Build the PKGBUILD but DO NOT register in any sync repo and DO NOT push to
+# the mock AUR. Just drop the .pkg.tar.zst into /srv/foreign-pkgs/ where a
+# test can `pacman -U` it to seed a foreign-install state (in localdb, no
+# upstream source). See header comment for why this models the dotnet case.
+build_and_stage_foreign() {
+    local pkgbase="$1"
+    local src="$FIXTURES_DIR/$pkgbase"
+    local stage
+    stage="$(mktemp -d)"
+    cp -r "$src"/* "$stage/"
+    pushd "$stage" >/dev/null
+    makepkg --noconfirm --nodeps --skipinteg
+    cp ./*.pkg.tar.zst "$FOREIGN_PKGS/"
+    popd >/dev/null
+    rm -rf "$stage"
+}
+
 main() {
     init_mock_aur
     for dir in "$FIXTURES_DIR"/*/; do
@@ -86,6 +113,7 @@ main() {
         case "$repo" in
             aur)      add_aur_pkg "$pkgbase" ;;
             official) build_and_register_official "$pkgbase" ;;
+            foreign)  build_and_stage_foreign "$pkgbase" ;;
             *) echo "unknown repo type '$repo' in $dir" >&2; exit 2 ;;
         esac
     done

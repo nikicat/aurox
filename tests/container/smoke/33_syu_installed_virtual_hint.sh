@@ -25,16 +25,25 @@
 source /work/tests/container/lib.sh
 bootstrap; reset_state
 
+# AUR rows are unchecked-by-default in the picker (cfg.aur_default_select).
+# Under --noconfirm that default mask is what runs — so without this we'd
+# upgrade only the repo bucket and the AUR row would silently drop.
+# Enable the yay/paru-style auto-select for this test.
+echo 'aur_default_select = true' >> "$CONFIG_DIR/config.toml"
+
 gitaur -Sy
 
-# Seed: install BOTH legacy halves. Each is its own pkgbase with no
-# provides, so `gitaur -S` registers them in localdb as foreign pkgs.
-gitaur -S --noconfirm test-syu-hint-newer
-assert_exit 0
+# Seed: install BOTH legacy halves as FOREIGN — staged .pkg.tar.zst files
+# baked into the test image, applied via pacman -U. They land in localdb but
+# are NOT in any sync repo and NOT an AUR pkgbase, which mirrors the actual
+# dotnet-runtime starting state (installed via some prior source no longer
+# available). If they were AUR pkgbases instead, `-Syu`'s upgrade detection
+# would never need to walk `by_provides` on test-syu-hint-new and the hint
+# plumbing under test wouldn't be exercised.
+install_foreign test-syu-hint-newer
 assert_pkg_installed test-syu-hint-newer
 
-gitaur -S --noconfirm test-syu-hint-older
-assert_exit 0
+install_foreign test-syu-hint-older
 assert_pkg_installed test-syu-hint-older
 
 # Trigger: full `-Syu` cycle. The picker (with --noconfirm) auto-selects
