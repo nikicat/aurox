@@ -4,6 +4,7 @@
 //! against it.
 
 use gitaur::build::review;
+use gitaur::build::review::HistorySearch;
 use gitaur::mirror::MirrorRepo;
 use gitaur::testing::{git, git_stdout};
 use gitaur::version::Ver;
@@ -110,7 +111,7 @@ fn finds_middle_commit_for_installed_version() {
     let head = oids[2];
 
     let found = review::find_installed_commit(&mirror, head, Ver::new("1.1-1"), 64).unwrap();
-    assert_eq!(found, Some(oids[1]));
+    assert_eq!(found, HistorySearch::Found(oids[1]));
 }
 
 #[test]
@@ -129,7 +130,7 @@ fn finds_oldest_commit_for_installed_version() {
     let head = oids[2];
 
     let found = review::find_installed_commit(&mirror, head, Ver::new("1.0-1"), 64).unwrap();
-    assert_eq!(found, Some(oids[0]));
+    assert_eq!(found, HistorySearch::Found(oids[0]));
 }
 
 #[test]
@@ -147,7 +148,8 @@ fn returns_none_when_version_not_in_history() {
     let head = oids[1];
 
     let found = review::find_installed_commit(&mirror, head, Ver::new("9.9-9"), 64).unwrap();
-    assert_eq!(found, None);
+    // Branch only has 2 commits; walk reaches root well under the bound.
+    assert_eq!(found, HistorySearch::NotInLineage { walked: 2 });
 }
 
 #[test]
@@ -168,7 +170,7 @@ fn matches_version_with_epoch_prefix() {
     let head = oids[1];
 
     let found = review::find_installed_commit(&mirror, head, Ver::new("1:0.1-1"), 64).unwrap();
-    assert_eq!(found, Some(oids[0]));
+    assert_eq!(found, HistorySearch::Found(oids[0]));
 }
 
 #[test]
@@ -189,7 +191,7 @@ fn picks_head_when_already_at_installed_version() {
     let head = oids[1];
 
     let found = review::find_installed_commit(&mirror, head, Ver::new("1.1-1"), 64).unwrap();
-    assert_eq!(found, Some(oids[1]));
+    assert_eq!(found, HistorySearch::Found(oids[1]));
 }
 
 /// The dotnet-runtime-7.0 regression that motivated the configurable
@@ -215,16 +217,35 @@ fn bound_governs_how_far_back_we_look() {
     let mirror = MirrorRepo::open(&bare).unwrap();
     let head = oids[4];
 
-    // Bound = 3 → walk visits sdk160, sdk150, sdk140; misses sdk120.
+    // Bound = 3 → walk visits sdk160, sdk150, sdk140; consumes the full
+    // bound without finding sdk120. `BoundExceeded` distinguishes this
+    // from "branch fully walked".
     let missed =
         review::find_installed_commit(&mirror, head, Ver::new("7.0.20.sdk120-2"), 3).unwrap();
     assert_eq!(
-        missed, None,
-        "bound=3 must NOT reach the depth-4 match — this is the dotnet-runtime regression shape"
+        missed,
+        HistorySearch::BoundExceeded { bound: 3 },
+        "bound=3 must report BoundExceeded — the commit may still exist past the bound"
     );
 
     // Bound = 5 → walk reaches the oldest commit, finds it.
     let found =
         review::find_installed_commit(&mirror, head, Ver::new("7.0.20.sdk120-2"), 5).unwrap();
-    assert_eq!(found, Some(oids[0]), "bound=5 must reach the depth-4 match");
+    assert_eq!(
+        found,
+        HistorySearch::Found(oids[0]),
+        "bound=5 must reach the depth-4 match"
+    );
+
+    // Bound = 100 (way larger than the branch) → walk runs out of
+    // ancestors. `NotInLineage` with the actual walk depth = 4 (sdk160,
+    // sdk150, sdk140, sdk130) so the fallback note can show "4
+    // ancestor(s)" — no false bump-the-bound advice.
+    let exhausted =
+        review::find_installed_commit(&mirror, head, Ver::new("9.9.9.sdkXXX-1"), 100).unwrap();
+    assert_eq!(
+        exhausted,
+        HistorySearch::NotInLineage { walked: 5 },
+        "bound > branch length must report NotInLineage — bumping the bound wouldn't help"
+    );
 }
