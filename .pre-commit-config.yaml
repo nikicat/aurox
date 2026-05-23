@@ -1,13 +1,13 @@
-# Fast formatting + lint gate that mirrors CI's pre-build steps. Heavier
-# checks (cargo clippy, cargo test) stay manual — they cost seconds, not
-# milliseconds, and CI is the real gate.
+# Formatting + lint gate that mirrors CI. cargo clippy is included so the
+# 1.95-only lints CI's older container missed can't slip in again — warm runs
+# are ~2s (incremental cache), cold ~17s after a `cargo clean`.
 #
 # Install once per clone:  prek install
 # Run ad-hoc on everything: prek run --all-files
 # Skip a single commit:    git commit --no-verify
 #
 # `system` language: prek invokes the host's cargo/taplo rather than pulling
-# its own toolchain. rustup-managed components on the host stay authoritative.
+# its own toolchain. rust-toolchain.toml pins the channel for both local and CI.
 repos:
   - repo: local
     hooks:
@@ -31,3 +31,10 @@ repos:
         language: system
         pass_filenames: false
         files: \.toml$
+
+      - id: clippy
+        name: clippy
+        entry: cargo clippy --all-targets --all-features -- -D warnings
+        language: system
+        pass_filenames: false
+        files: \.(rs|toml)$

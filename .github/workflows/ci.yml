@@ -20,8 +20,7 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed \
             base-devel git pkgconf pacman rustup taplo-cli
-          rustup default stable
-          rustup component add rustfmt clippy
+          # rust-toolchain.toml drives channel + components on first cargo call.
 
       - uses: actions/checkout@v6
 
