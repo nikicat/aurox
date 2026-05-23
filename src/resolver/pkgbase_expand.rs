@@ -72,7 +72,7 @@ pub struct ExpandedTargets {
     /// installed pkg as the counterpart.
     ///
     /// Empty for pkgbase-only inputs (`-S commit-mono-font`) where the user
-    /// didn't type a pkgname; pacman / by_name passthroughs don't populate
+    /// didn't type a pkgname; pacman / `by_name` passthroughs don't populate
     /// either (single-pkgname pkgbases get a direct Pkgname match without
     /// help). One hint per pkgbase: when multiple targets rewrite to the
     /// same pkgbase the first one wins, since later ones can only further
@@ -123,143 +123,189 @@ pub fn expand_pkgbase_targets(
         // the map regardless of what expand decides next.
         record_target_hint(by, idx, t, bare, &mut out.counterpart_hints);
 
-        // pacman wins outright — never reroute a name pacman can satisfy.
-        // BUT: when `bare` is a pkgname in a multi-pkgname AUR pkgbase (the
-        // foreign-installed split-pkg case, e.g. `-Syu` picks
-        // `google-cloud-cli-bq` whose pkgbase ships four other pkgnames),
-        // we must STILL record the selection here. Otherwise
-        // `install_stratum`'s `pacman -U` has no filter and installs every
-        // sibling makepkg packaged from the same PKGBUILD. The bisq-cli
-        // regression's twin: that one fired through the rewrite branch,
-        // this one fires through the shortcut.
-        if pac.is_installed(bare) || pac.in_sync(bare) {
-            if let Some(&entry_idx) = by.by_name.get(bare) {
-                let entry = &idx.entries[entry_idx as usize];
-                if entry.pkgnames.len() > 1 {
-                    let bare_name = PkgName::from(bare);
-                    let chosen = chosen_with_sibling_deps(entry, &bare_name);
-                    extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
-                }
-            }
-            out.targets.push(t.spec.clone());
-            continue;
+        // Per-branch deciders return a TargetDecision; no `&mut` flows into
+        // the branches themselves. Order matches the resolver's fallback
+        // chain in `resolve_target_source`.
+        let decision = if pac.is_installed(bare) || pac.in_sync(bare) {
+            decide_pacman_wins(idx, by, t, bare)
+        } else if by.by_name.contains_key(bare) {
+            decide_pkgname(idx, by, t, bare)
+        } else if by.by_provides.contains_key(bare) {
+            decide_virtual(idx, by, bare)
+        } else if by.by_pkgbase.contains_key(bare) {
+            decide_pkgbase(idx, by, bare, select)?
+        } else {
+            TargetDecision::passthrough(t.spec.clone())
+        };
+
+        out.targets.push(decision.spec);
+        if let Some((pkgbase, chosen)) = decision.selection {
+            extend_selection(&mut out.selections, &pkgbase, &chosen);
         }
-        // Pkgname hit. Single-pkgname pkgbases pass through unchanged; multi-
-        // pkgname pkgbases must rewrite to the pkgbase string AND record a
-        // selection, otherwise `install_stratum` has no way to skip the
-        // sibling .pkg.tar.zst files makepkg always produces from a split
-        // PKGBUILD (the bisq-cli regression: `-S bisq-cli` installed
-        // bisq-daemon + bisq-desktop too).
-        if let Some(&entry_idx) = by.by_name.get(bare) {
-            let entry = &idx.entries[entry_idx as usize];
-            if entry.pkgnames.len() == 1 {
-                out.targets.push(t.spec.clone());
-                continue;
-            }
+        out.direct_pkgnames.extend(decision.direct_pkgnames);
+    }
+    Ok(out)
+}
+
+/// What one target rewrites to. Returned by the per-branch `decide_*`
+/// helpers so the main loop applies all three outputs in one place — no
+/// `&mut` flows into the branches.
+struct TargetDecision {
+    /// Pushed into [`ExpandedTargets::targets`]. Either the rewritten
+    /// pkgbase string or the original spec for passthrough cases.
+    spec: String,
+    /// `(pkgbase, chosen)` for [`extend_selection`] when this target
+    /// constrains a split pkgbase's install set; `None` otherwise.
+    selection: Option<(PkgBase, Vec<PkgName>)>,
+    /// Pkgnames to append to [`ExpandedTargets::direct_pkgnames`] — the
+    /// user-named ones we flip from `--asdeps` to Explicit later.
+    direct_pkgnames: Vec<PkgName>,
+}
+
+impl TargetDecision {
+    fn passthrough(spec: String) -> Self {
+        Self {
+            spec,
+            selection: None,
+            direct_pkgnames: vec![],
+        }
+    }
+}
+
+/// pacman wins outright — never reroute a name pacman can satisfy. BUT:
+/// when `bare` is a pkgname in a multi-pkgname AUR pkgbase (the
+/// foreign-installed split-pkg case, e.g. `-Syu` picks
+/// `google-cloud-cli-bq` whose pkgbase ships four other pkgnames), we must
+/// STILL record the selection here. Otherwise `install_stratum`'s `pacman
+/// -U` has no filter and installs every sibling makepkg packaged from the
+/// same PKGBUILD. The bisq-cli regression's twin: that one fired through
+/// the rewrite branch, this one fires through the shortcut.
+fn decide_pacman_wins(idx: &IndexFile, by: &Secondary, t: &Target, bare: &str) -> TargetDecision {
+    let selection = by.by_name.get(bare).and_then(|&entry_idx| {
+        let entry = &idx.entries[entry_idx as usize];
+        (entry.pkgnames.len() > 1).then(|| {
             let bare_name = PkgName::from(bare);
             let chosen = chosen_with_sibling_deps(entry, &bare_name);
-            debug!(
-                pkgbase = %entry.pkgbase,
-                pkgname = %bare_name,
-                chosen = chosen.len(),
-                "rewrote split-pkg pkgname target to pkgbase with selection",
-            );
-            extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
-            // Hint already recorded at the top of the loop by
-            // `record_target_hint` — that function uses the same `by_name`
-            // lookup and the same "spec IS the hint" rule for pkgname
-            // targets, so we don't repeat it here.
-            //
-            // `out.targets` is `Vec<String>` (mixed bag — see docstring);
-            // `into_inner` on the clone is the dedicated PkgBase→String
-            // downgrade, used only at this resolver/string boundary.
-            out.targets.push(entry.pkgbase.clone().into_inner());
-            out.direct_pkgnames.push(bare_name);
-            continue;
-        }
-        // Virtual name (`-S bisq` where `bisq-desktop` declares
-        // `provides = bisq`): pin the resolver to that pkgbase's entry by
-        // passing the pkgbase string — `by_name["bisq-desktop"]` could
-        // alias to an unrelated pkgbase that happens to ship the same
-        // pkgname, and we'd then build the wrong package.
-        if by.by_provides.contains_key(bare) {
-            let (entry_idx, pkgname) = by
-                .provider_of(idx, bare)
-                .expect("by_provides hit must have a provider_of resolution");
-            let entry = &idx.entries[entry_idx];
-            debug!(
-                pkgbase = %entry.pkgbase,
-                virtual_name = bare,
-                pkgname = %pkgname,
-                "rewrote provides target to providing pkgbase",
-            );
-            // A pkgbase-level `provides` makes every pkgname a provider, so
-            // there's no real subset — leave selection unset so every
-            // built pkgname reaches `pacman -U`. Only pkgname-scoped
-            // provides yield a true single-pkgname subset.
-            let scoped = entry.pkgnames.iter().any(|p| {
-                &p.name == pkgname
-                    && p.provides
-                        .iter()
-                        .any(|x| secondary::strip_version_constraint(x) == bare)
-            });
-            if scoped && entry.pkgnames.len() > 1 {
-                let chosen = chosen_with_sibling_deps(entry, pkgname);
-                extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
-            }
-            // Hint recorded once at the top by `record_target_hint`. The
-            // dotnet-runtime case (virtual the user typed = installed
-            // pkgname they care about) is its core motivation.
-            out.targets.push(entry.pkgbase.clone().into_inner());
-            out.direct_pkgnames.push(pkgname.clone());
-            continue;
-        }
-        // Bare pkgbase (`-S commit-mono-font`): defer to the selector.
-        // Single-pkgname pkgbases auto-pick; split pkgbases prompt.
-        if !by.by_pkgbase.contains_key(bare) {
-            out.targets.push(t.spec.clone());
-            continue;
-        }
-        let entry_idx = by.by_pkgbase[bare] as usize;
-        let entry = &idx.entries[entry_idx];
-        let pkgnames: Vec<PkgName> = entry.pkgnames.iter().map(|p| p.name.clone()).collect();
-        let chosen = select(&entry.pkgbase, &pkgnames)?;
-        if chosen.is_empty() {
+            (entry.pkgbase.clone(), chosen)
+        })
+    });
+    TargetDecision {
+        spec: t.spec.clone(),
+        selection,
+        direct_pkgnames: vec![],
+    }
+}
+
+/// Pkgname hit. Single-pkgname pkgbases pass through unchanged; multi-
+/// pkgname pkgbases must rewrite to the pkgbase string AND record a
+/// selection, otherwise `install_stratum` has no way to skip the sibling
+/// `.pkg.tar.zst` files makepkg always produces from a split PKGBUILD (the
+/// bisq-cli regression: `-S bisq-cli` installed bisq-daemon + bisq-desktop
+/// too). Hint recorded earlier by `record_target_hint`.
+fn decide_pkgname(idx: &IndexFile, by: &Secondary, t: &Target, bare: &str) -> TargetDecision {
+    let entry_idx = by.by_name[bare] as usize;
+    let entry = &idx.entries[entry_idx];
+    if entry.pkgnames.len() == 1 {
+        return TargetDecision::passthrough(t.spec.clone());
+    }
+    let bare_name = PkgName::from(bare);
+    let chosen = chosen_with_sibling_deps(entry, &bare_name);
+    debug!(
+        pkgbase = %entry.pkgbase,
+        pkgname = %bare_name,
+        chosen = chosen.len(),
+        "rewrote split-pkg pkgname target to pkgbase with selection",
+    );
+    // `into_inner` on the clone is the dedicated PkgBase→String downgrade,
+    // used only at this resolver/string boundary (`out.targets` is the
+    // mixed-bag `Vec<String>` — see [`ExpandedTargets::targets`]).
+    TargetDecision {
+        spec: entry.pkgbase.clone().into_inner(),
+        selection: Some((entry.pkgbase.clone(), chosen)),
+        direct_pkgnames: vec![bare_name],
+    }
+}
+
+/// Virtual name (`-S bisq` where `bisq-desktop` declares `provides = bisq`):
+/// pin the resolver to the providing pkgbase by passing the pkgbase string
+/// — `by_name["bisq-desktop"]` could alias to an unrelated pkgbase that
+/// happens to ship the same pkgname, and we'd then build the wrong package.
+///
+/// Selection only when the provides is pkgname-scoped: a pkgbase-level
+/// provides makes every pkgname a provider, leaving no real subset.
+fn decide_virtual(idx: &IndexFile, by: &Secondary, bare: &str) -> TargetDecision {
+    let (entry_idx, pkgname) = by
+        .provider_of(idx, bare)
+        .expect("by_provides hit must have a provider_of resolution");
+    let entry = &idx.entries[entry_idx];
+    debug!(
+        pkgbase = %entry.pkgbase,
+        virtual_name = bare,
+        pkgname = %pkgname,
+        "rewrote provides target to providing pkgbase",
+    );
+    let scoped = entry.pkgnames.iter().any(|p| {
+        &p.name == pkgname
+            && p.provides
+                .iter()
+                .any(|x| secondary::strip_version_constraint(x) == bare)
+    });
+    let selection = (scoped && entry.pkgnames.len() > 1).then(|| {
+        let chosen = chosen_with_sibling_deps(entry, pkgname);
+        (entry.pkgbase.clone(), chosen)
+    });
+    TargetDecision {
+        spec: entry.pkgbase.clone().into_inner(),
+        selection,
+        direct_pkgnames: vec![pkgname.clone()],
+    }
+}
+
+/// Bare pkgbase (`-S commit-mono-font`): defer to the selector. Single-
+/// pkgname pkgbases auto-pick; split pkgbases prompt. Validates that the
+/// selector returned a non-empty subset of this pkgbase's pkgnames before
+/// feeding it to the resolver. Hint isn't derived here — a bare pkgbase
+/// spec has nothing to map to a counterpart pkgname; the only hint that
+/// ends up recorded is an explicit `Target::hint`.
+fn decide_pkgbase(
+    idx: &IndexFile,
+    by: &Secondary,
+    bare: &str,
+    select: &mut PkgnameSelector<'_>,
+) -> Result<TargetDecision> {
+    let entry_idx = by.by_pkgbase[bare] as usize;
+    let entry = &idx.entries[entry_idx];
+    let pkgnames: Vec<PkgName> = entry.pkgnames.iter().map(|p| p.name.clone()).collect();
+    let chosen = select(&entry.pkgbase, &pkgnames)?;
+    if chosen.is_empty() {
+        return Err(Error::other(format!(
+            "no pkgnames selected for pkgbase `{}`",
+            entry.pkgbase
+        )));
+    }
+    for c in &chosen {
+        if !entry.pkgnames.iter().any(|p| &p.name == c) {
             return Err(Error::other(format!(
-                "no pkgnames selected for pkgbase `{}`",
+                "selector returned `{c}` which is not a pkgname of `{}`",
                 entry.pkgbase
             )));
         }
-        // Sanity: every chosen pkgname must actually belong to this pkgbase.
-        // Catches a buggy selector returning unrelated strings before we feed
-        // them into the resolver.
-        for c in &chosen {
-            if !entry.pkgnames.iter().any(|p| &p.name == c) {
-                return Err(Error::other(format!(
-                    "selector returned `{c}` which is not a pkgname of `{}`",
-                    entry.pkgbase
-                )));
-            }
-        }
-        debug!(
-            pkgbase = %entry.pkgbase,
-            available = entry.pkgnames.len(),
-            chosen = chosen.len(),
-            "expanded pkgbase target",
-        );
-        // Record selection only when it's a true subset — full selection
-        // is the default and doesn't need to constrain `pacman -U`.
-        if chosen.len() < entry.pkgnames.len() {
-            extend_selection(&mut out.selections, &entry.pkgbase, &chosen);
-        }
-        // Hint recorded once at the top by `record_target_hint`. For a
-        // bare pkgbase spec there's no derived hint (the pkgbase isn't a
-        // counterpart pkgname); the only thing that ends up in the map
-        // for this branch is an explicit `Target::hint`.
-        out.targets.push(entry.pkgbase.clone().into_inner());
-        out.direct_pkgnames.extend(chosen);
     }
-    Ok(out)
+    debug!(
+        pkgbase = %entry.pkgbase,
+        available = entry.pkgnames.len(),
+        chosen = chosen.len(),
+        "expanded pkgbase target",
+    );
+    // Record selection only when it's a true subset — full selection is
+    // the default and doesn't need to constrain `pacman -U`.
+    let selection =
+        (chosen.len() < entry.pkgnames.len()).then(|| (entry.pkgbase.clone(), chosen.clone()));
+    Ok(TargetDecision {
+        spec: entry.pkgbase.clone().into_inner(),
+        selection,
+        direct_pkgnames: chosen,
+    })
 }
 
 /// First-write-wins on the hints map: multiple targets in the same invocation
@@ -272,8 +318,8 @@ fn record_hint(hints: &mut HashMap<PkgBase, PkgName>, pkgbase: &PkgBase, hint: P
     hints.entry(pkgbase.clone()).or_insert(hint);
 }
 
-/// Find which AUR pkgbase a target would route to (by_name / by_provides /
-/// by_pkgbase, in that order — mirroring `resolve_target_source`'s fallback
+/// Find which AUR pkgbase a target would route to (`by_name` / `by_provides` /
+/// `by_pkgbase`, in that order — mirroring `resolve_target_source`'s fallback
 /// chain), then record the hint there.
 ///
 /// Kept independent of the rewrite-decision branches above because the two
@@ -339,7 +385,7 @@ fn extend_selection(
 /// can't tell which sibling owns which dep, so any sibling appearing in
 /// the pool is conservatively pulled into the install selection.
 ///
-/// Returns owned `PkgName`s — the HashSet ownership lets us probe by
+/// Returns owned `PkgName`s — the `HashSet` ownership lets us probe by
 /// `&str` via `Borrow<str>` (`siblings.get(bare)`) instead of routing the
 /// comparison through a manual deref dance.
 fn sibling_runtime_deps(entry: &IndexEntry, pkgname: &PkgName) -> Vec<PkgName> {
@@ -860,10 +906,8 @@ mod tests {
     #[test]
     fn explicit_hint_overrides_inferred_hint() {
         let (idx, by, pac) = fixture();
-        let mut explicit = vec![Target::with_hint("bisq", PkgName::from("bisq-cli"))];
-        // Drop the `mut` warning by reading right away.
-        let r =
-            expand_pkgbase_targets(&idx, Some(&by), &pac, &mut explicit, &mut select_all).unwrap();
+        let explicit = vec![Target::with_hint("bisq", PkgName::from("bisq-cli"))];
+        let r = expand_pkgbase_targets(&idx, Some(&by), &pac, &explicit, &mut select_all).unwrap();
         assert_eq!(
             r.counterpart_hints.get(&PkgBase::from("bisq")),
             Some(&PkgName::from("bisq-cli")),
@@ -936,7 +980,7 @@ mod tests {
     /// recorded selection, `install_stratum` has no filter and `pacman
     /// -U`'s every sibling makepkg packaged. With the fix, the shortcut
     /// branch records the same single-pkgname (+ sibling runtime deps)
-    /// selection that the by_name rewrite branch would have.
+    /// selection that the `by_name` rewrite branch would have.
     #[test]
     fn installed_split_pkgname_records_selection_despite_pacman_shortcut() {
         let (idx, by, mut pac) = fixture();

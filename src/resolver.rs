@@ -74,6 +74,26 @@ impl Plan {
     pub fn aur_order(&self) -> Vec<PkgBase> {
         self.aur_strata.iter().flatten().cloned().collect()
     }
+
+    /// What the plan says about one pkgbase: the pkgbase itself plus the two
+    /// optional per-pkgbase decisions keyed off it (partial-split selection
+    /// and counterpart hint). Borrows from `self`, so the returned value is
+    /// valid for the lifetime of the plan.
+    pub fn pkgbase_plan<'a>(&'a self, pkgbase: &'a PkgBase) -> PkgbasePlan<'a> {
+        PkgbasePlan {
+            pkgbase,
+            selection: self.pkgname_selections.get(pkgbase).map(Vec::as_slice),
+            hint: self.counterpart_hints.get(pkgbase),
+        }
+    }
+}
+
+/// One pkgbase plus the [`Plan`]'s decisions about it. Returned by
+/// [`Plan::pkgbase_plan`]; consumed by `build::prepare_one`.
+pub struct PkgbasePlan<'a> {
+    pub pkgbase: &'a PkgBase,
+    pub selection: Option<&'a [PkgName]>,
+    pub hint: Option<&'a PkgName>,
 }
 
 /// Resolve `targets` against the index + pacman DBs into a [`Plan`].

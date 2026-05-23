@@ -145,7 +145,7 @@ impl Secondary {
     /// returns a tagged enum naming which identity matched. See
     /// [`AurClass`] for the four cases.
     ///
-    /// The HashMap probes use `Borrow<str>` to compare the underlying
+    /// The `HashMap` probes use `Borrow<str>` to compare the underlying
     /// string across the three identity-distinct maps — this is the
     /// *one* place that cross-identity claim is made, and it's named
     /// (`AsProvides`, `AsPkgbase`) in the return value.

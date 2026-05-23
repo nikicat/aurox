@@ -86,8 +86,8 @@ pub struct PkgTarget(pub String);
 /// they share lexical shape: a `dotnet-runtime-7.0` `PkgName` is the
 /// thing pacman has installed under that name; a `dotnet-runtime-7.0`
 /// `VirtualName` is what AUR pkg `dotnet-core-7.0-bin` claims to
-/// satisfy. The cross-domain bridge between the two — "is this PkgName
-/// lexically the same as some pkg's VirtualName?" — lives in
+/// satisfy. The cross-domain bridge between the two — "is this `PkgName`
+/// lexically the same as some pkg's `VirtualName`?" — lives in
 /// [`crate::index::secondary::Secondary::classify_foreign`].
 #[derive(
     Archive, Serialize, Deserialize, Debug, Clone, Default, Hash, PartialEq, Eq, PartialOrd, Ord,
@@ -113,7 +113,7 @@ macro_rules! impl_name_wrapper {
             /// Match the wrapped name against a compiled regex. Routing
             /// this through a typed method (instead of exposing `&str`)
             /// keeps regex matching from looking like a generic "treat
-            /// PkgName as a string" — the call reads as a domain
+            /// the name as a string" — the call reads as a domain
             /// operation, not a downgrade.
             pub fn matches_regex(&self, r: &Regex) -> bool {
                 r.is_match(&self.0)
@@ -227,7 +227,7 @@ impl PkgTarget {
     /// `<`, `>`) plus the version expression after it. Returns the bare
     /// name suitable for lookup against `Secondary` / `PacmanIndex`.
     /// Mirrors [`crate::index::secondary::strip_version_constraint`]; kept
-    /// here so PkgTarget owns its own normalisation rather than callers
+    /// here so `PkgTarget` owns its own normalisation rather than callers
     /// reaching into a different module.
     pub fn bare(&self) -> &str {
         for op in [">=", "<=", "==", ">", "<", "="] {
@@ -262,7 +262,7 @@ pub trait PkgTargetSetExt {
     fn contains_pkgname(&self, pkgname: &PkgName) -> bool;
 }
 
-impl PkgTargetSetExt for std::collections::HashSet<PkgTarget> {
+impl<S: std::hash::BuildHasher> PkgTargetSetExt for std::collections::HashSet<PkgTarget, S> {
     fn contains_pkgname(&self, pkgname: &PkgName) -> bool {
         // The single Borrow<str> probe lives here, documenting the
         // cross-identity claim once.

@@ -151,7 +151,7 @@ impl PacmanIndex {
     /// the typed key makes the lookup work without a temporary `PkgName`.
     /// Returns `&Ver` so the caller can compare via vercmp.
     pub fn installed_version(&self, name: &str) -> Option<&Ver> {
-        self.installed.get(name).map(|v| v.as_ver())
+        self.installed.get(name).map(Version::as_ver)
     }
 
     /// Already installed locally?
@@ -169,7 +169,7 @@ impl PacmanIndex {
     /// versioned (their version, if any, lives on the providing pkg) so a
     /// provides hit deliberately returns `None`.
     pub fn sync_version(&self, name: &str) -> Option<&Ver> {
-        self.sync_versions.get(name).map(|v| v.as_ver())
+        self.sync_versions.get(name).map(Version::as_ver)
     }
 
     /// Resolve a (possibly virtual) name to the concrete pkgname pacman would

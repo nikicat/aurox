@@ -17,7 +17,7 @@ use crate::names::{PkgBase, PkgName, PkgTarget, PkgTargetSetExt};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke;
 use crate::paths;
-use crate::resolver::{self, Plan};
+use crate::resolver::{self, PkgbasePlan, Plan};
 use crate::ui;
 use crate::version::Version;
 use std::collections::{HashMap, HashSet};
@@ -250,15 +250,11 @@ fn run_aur_pipeline(
             // split (no `--pkg=` flag); we filter the produced files down
             // to the selection so `install_stratum`'s `pacman -U` skips
             // the rest.
-            let selection = plan.pkgname_selections.get(pkgbase).map(Vec::as_slice);
-            let hint = plan.counterpart_hints.get(pkgbase);
             row.push(prepare_one(
                 &mirror,
                 idx,
                 pac,
-                pkgbase,
-                selection,
-                hint,
+                &plan.pkgbase_plan(pkgbase),
                 cfg.review_history_scan_max,
                 noconfirm,
             )?);
@@ -285,7 +281,7 @@ fn run_aur_pipeline(
             idx,
             &built,
             stratum_idx,
-            &direct_names,
+            direct_names,
             asdeps,
             &mut transitive_marks,
             &mut report,
@@ -430,15 +426,11 @@ fn blocking_dep<'a>(
     report: &RunReport,
 ) -> Option<&'a PkgBase> {
     let deps = make_edges.get(pkgbase)?;
-    for dep in deps {
-        if report.failed.contains_key(dep)
-            || report.skipped_dep.contains_key(dep)
-            || report.skipped_user.iter().any(|s| s == dep)
-        {
-            return Some(dep);
-        }
-    }
-    None
+    deps.iter().find(|dep| {
+        report.failed.contains_key(*dep)
+            || report.skipped_dep.contains_key(*dep)
+            || report.skipped_user.iter().any(|s| s == *dep)
+    })
 }
 
 /// One pkgbase's prepared state, produced in phase 1 and consumed in phase 2.
@@ -467,17 +459,20 @@ enum Disposition {
     Skipped,
 }
 
-#[instrument(skip(mirror, idx, pac, selection, hint), fields(pkgbase = %pkgbase))]
+#[instrument(skip(mirror, idx, pac, target), fields(pkgbase = %target.pkgbase))]
 fn prepare_one<'a>(
     mirror: &MirrorRepo,
     idx: &'a IndexFile,
     pac: &PacmanIndex,
-    pkgbase: &'a PkgBase,
-    selection: Option<&'a [PkgName]>,
-    hint: Option<&PkgName>,
+    target: &PkgbasePlan<'a>,
     history_scan_max: usize,
     noconfirm: bool,
 ) -> Result<Prep<'a>> {
+    let &PkgbasePlan {
+        pkgbase,
+        selection,
+        hint,
+    } = target;
     let entry = idx
         .entries
         .iter()

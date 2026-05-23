@@ -23,7 +23,7 @@
 //! lexical-byte equality (vercmp normalises). `Hash` over the inner bytes
 //! plus `Eq` via vercmp would violate the `Hash ↔ Eq` invariant. The use
 //! cases for `Version` are all "value in a struct field" or "compare two
-//! versions" — never a HashMap key — so we just don't expose the broken
+//! versions" — never a `HashMap` key — so we just don't expose the broken
 //! traits.
 //!
 //! **No `AsRef<str>` / no `as_str()`-as-conversion.** Same reasoning as
@@ -344,11 +344,11 @@ mod tests {
 
     #[test]
     fn deref_lets_version_act_as_ver() {
-        let v = Version::from("1.0-1");
         // Coerce to &Ver via Deref to pass to a Ver-taking function.
         fn ver_len(v: &Ver) -> usize {
             v.as_str().len()
         }
+        let v = Version::from("1.0-1");
         assert_eq!(ver_len(&v), 5);
     }
 

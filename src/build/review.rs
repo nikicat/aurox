@@ -452,12 +452,12 @@ mod tests {
     };
     use crate::names::{PkgBase, PkgName};
     use crate::pacman::alpm_db::{InstalledCounterpart, MatchedVia};
-    use crate::version::Ver;
+    use crate::version::{Ver, Version};
     use gix::hash::Kind;
     use gix::ObjectId;
     use std::path::Path;
 
-    /// Default search bound used in the fallback_note assertions — the
+    /// Default search bound used in the `fallback_note` assertions — the
     /// constant from `Config::review_history_scan_max`'s default. Tests
     /// that exercise the bound itself use literal values inline.
     const TEST_HISTORY_SCAN: usize = 256;
@@ -468,7 +468,7 @@ mod tests {
     /// borrowing into itself. One `let f = fx(...)` per test, then `f.cp()`.
     struct Fixture {
         pkgname: PkgName,
-        version: crate::version::Version,
+        version: Version,
         via: MatchedVia,
     }
 
@@ -485,7 +485,7 @@ mod tests {
     fn fx(pkgname: &str, version: &str, via: MatchedVia) -> Fixture {
         Fixture {
             pkgname: PkgName::from(pkgname),
-            version: crate::version::Version::from(version),
+            version: Version::from(version),
             via,
         }
     }
