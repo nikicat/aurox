@@ -16,13 +16,15 @@ use clap::Parser;
 
 pub mod dispatch;
 pub mod flags;
+pub mod search;
 
 /// yay-like AUR helper backed by the github.com/archlinux/aur mirror.
 ///
 /// Pacman operations gitaur doesn't own (`-Q`, `-R`, `-T`, `-D`, `-F`, `-U`)
 /// are forwarded to `pacman` unchanged — run them with `pacman -Sh` / `-Qh`
-/// for their own option lists. Run gitaur with no args to refresh the AUR
-/// mirror + index (equivalent to `-Sy`).
+/// for their own option lists. Two yay parity shortcuts:
+///   * `gitaur`            → `-Syu` (refresh + upgrade with picker)
+///   * `gitaur <term>...`  → AUR fuzzy search + interactive install picker
 #[derive(Parser, Debug)]
 #[command(
     name = "gitaur",
@@ -64,6 +66,10 @@ const AFTER_HELP: &str = "GITAUR-OWNED OPERATIONS:\n\
   -Si <pkg>      show AUR package info\n\
   -Sc / -Scc     remove built worktrees + pass -Sc/-Scc through to pacman\n\
   -Qu            list upgrades from repos + AUR, no sudo (dry-run for -Syu)\n\
+\n\
+YAY PARITY SHORTCUTS:\n\
+  gitaur               run -Syu (refresh + upgrade)\n\
+  gitaur <term>...     fuzzy AUR search → multi-select picker → install\n\
 \n\
 PASS-THROUGH (raw `pacman` — clap doesn't parse these):\n\
   -Q (except -Qu), -R, -T, -D, -F, -U, and any flags they accept\n\

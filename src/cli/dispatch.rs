@@ -2,6 +2,7 @@
 
 use crate::build;
 use crate::cli::flags::{self, PacFlags};
+use crate::cli::search;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -11,14 +12,22 @@ use crate::pacman::invoke;
 use crate::ui;
 
 /// Top-level routing entry — clap already pre-scanned for pacman-owned ops,
-/// so by this point `cli.args` is gitaur's responsibility (`-S` family or
-/// none-at-all = refresh).
+/// so by this point `cli.args` is gitaur's responsibility (`-S` family,
+/// the bare-arg yay shortcuts, or none-at-all).
 pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
     let argv = &cli.args;
     let f = flags::parse(argv);
 
-    if argv.is_empty() {
-        return mirror::cmd_refresh(cfg, false).map(|()| 0);
+    // yay parity: no operation letter and no positional targets → run `-Syu`
+    // (refresh + upgrade). Long-only flags like `--noconfirm` still travel
+    // through `cli`, so the synthetic argv keeps the behaviour the user
+    // configured. Replaces an older "no-args = -Sy only" shortcut: bare
+    // `yay` / bare `paru` both upgrade, and gitaur's lone outlier was a
+    // surprise rather than a feature.
+    if f.op.is_none() && f.positional.is_empty() {
+        let syu = vec!["-Syu".to_owned()];
+        let synth = flags::parse(&syu);
+        return handle_s(cfg, cli, &synth, &syu);
     }
 
     match f.op {
@@ -29,7 +38,11 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
         Some(other) => Err(Error::other(format!(
             "unsupported gitaur op `-{other}` (pacman pass-through goes via the pre-scan, this dispatch is `-S` / `-Qu` only)"
         ))),
-        None => invoke::exec_pacman(cfg, argv),
+        // yay parity: `gitaur <term>...` with no operation letter is a
+        // fuzzy search across the AUR index → interactive multi-select →
+        // install. The empty-positional branch above already absorbed the
+        // no-op-and-no-target case, so reaching here means we have terms.
+        None => search::cmd_search_install(cfg, cli, &f.positional),
     }
 }
 
