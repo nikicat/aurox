@@ -155,6 +155,7 @@ print_in_format_impl = "warn"           # `println!` inside `Display::fmt`
 let_underscore_future = "warn"          # `let _ = async_fn()` — forgotten `.await`
 lossy_float_literal = "warn"            # `let x: f32 = 1.123456789` truncates
 suspicious_xor_used_as_pow = "warn"     # `2 ^ 8` is XOR, not exponent
+iter_over_hash_type = "warn"            # nondeterministic HashMap/HashSet iter
 # Hygiene picks — readable-code preferences, not bug catches.
 get_unwrap = "warn"                        # `.get(i).unwrap()` worse than `[i]`
 multiple_inherent_impl = "warn"            # `impl Foo` spread across same module

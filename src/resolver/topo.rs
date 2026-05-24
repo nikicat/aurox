@@ -14,7 +14,7 @@
 
 use crate::error::{Error, Result};
 use std::borrow::Borrow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::hash::{BuildHasher, Hash};
 
@@ -111,7 +111,10 @@ where
     K: Eq + Hash + Ord + Clone + fmt::Debug,
     S: BuildHasher,
 {
-    let mut remaining: HashMap<K, usize> = nodes
+    // BTreeMap so that `remaining`'s iteration (used to find ready nodes and
+    // to update in-degrees) is deterministic and pre-sorted by K — saves the
+    // explicit `ready.sort()`/`leftover.sort()` the old HashMap form needed.
+    let mut remaining: BTreeMap<K, usize> = nodes
         .iter()
         .map(|n| {
             let count = edges
@@ -123,26 +126,26 @@ where
 
     let mut out: Vec<Vec<K>> = Vec::new();
     while !remaining.is_empty() {
-        let mut ready: Vec<K> = remaining
+        let ready: Vec<K> = remaining
             .iter()
             .filter(|(_, deg)| **deg == 0)
             .map(|(n, _)| n.clone())
             .collect();
         if ready.is_empty() {
-            let mut leftover: Vec<K> = remaining.keys().cloned().collect();
-            leftover.sort();
+            let leftover: Vec<K> = remaining.keys().cloned().collect();
             return Err(Error::Resolve(format!("cycle among: {leftover:?}")));
         }
-        ready.sort();
         for r in &ready {
             remaining.remove(r);
         }
         // Decrement in-degree of pkgs that named anything in this stratum.
-        for (n, deps) in edges {
-            if let Some(deg) = remaining.get_mut(n) {
-                let removed = deps.iter().filter(|d| ready.contains(d)).count();
-                *deg = deg.saturating_sub(removed);
-            }
+        // Iterate `remaining` (BTreeMap → deterministic) and look up edges
+        // by key, not the reverse — keeps `iter_over_hash_type` clean.
+        for (n, deg) in &mut remaining {
+            let removed = edges
+                .get(n)
+                .map_or(0, |deps| deps.iter().filter(|d| ready.contains(d)).count());
+            *deg = deg.saturating_sub(removed);
         }
         out.push(ready);
     }
