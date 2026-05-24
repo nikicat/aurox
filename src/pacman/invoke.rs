@@ -7,8 +7,9 @@ use crate::pacman::alpm_db;
 use crate::runopts;
 use crate::ui;
 use crate::version::Version;
+use std::os::unix::process::ExitStatusExt;
 use std::process::Command;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// Sentinel value [`PkgUpgrade::repo`] carries for AUR-sourced rows.
 pub const REPO_AUR: &str = "aur";
@@ -86,8 +87,19 @@ pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
     }
     debug!(program, args = ?spawn_args, "spawning pacman");
     let status = Command::new(program).args(&spawn_args).status()?;
-    let code = status.code().unwrap_or(1);
-    info!(code, "pacman exited");
+    // `status.code()` is None iff the child was killed by a signal (OOM,
+    // SIGTERM, ^C). Surface the signal explicitly — without it, an
+    // OOM-killed pacman is indistinguishable from a normal `pacman` exit 1
+    // in both logs and the bubbled-up `Error::PacmanExit`. POSIX shells use
+    // `128 + signal` for the propagated code, so we do the same.
+    let code = if let Some(c) = status.code() {
+        info!(code = c, "pacman exited");
+        c
+    } else {
+        let sig = status.signal().unwrap_or(0);
+        warn!(signal = sig, "pacman was killed by signal");
+        128 + sig
+    };
     if status.success() {
         Ok(0)
     } else {

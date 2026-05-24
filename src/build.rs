@@ -618,7 +618,18 @@ fn install_stratum(
             .ok_or_else(|| Error::Build(format!("{}: missing from index", b.pkgbase)))?;
         for f in &b.files {
             files.push(f.clone());
-            let pkgname = install::extract_pkgname(f).unwrap_or_default();
+            // makepkg artifacts always have a parseable `<name>-<ver>-<rel>-<arch>.pkg.tar.*`
+            // shape — None here means a corrupted/unexpected filename slipped through, and
+            // silently defaulting to an empty pkgname would misclassify the install
+            // (`contains_pkgname("")` is trivially false → marked as a dep, then
+            // `pacman -D --asdeps ""` is a no-op). Fail loudly instead.
+            let pkgname = install::extract_pkgname(f).ok_or_else(|| {
+                Error::Build(format!(
+                    "{}: cannot extract pkgname from artifact {}",
+                    b.pkgbase,
+                    f.display(),
+                ))
+            })?;
             // `direct` is `HashSet<PkgTarget>`; `contains_pkgname` is the
             // single Borrow<str> probe site (cross-domain string match
             // between the user's typed targets and the built pkgname).
