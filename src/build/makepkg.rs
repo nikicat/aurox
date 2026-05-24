@@ -25,7 +25,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::thread;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 /// Run `makepkg` in `worktree` with the configured args + env.
 ///
@@ -91,17 +91,38 @@ pub fn run(cfg: &Config, worktree: &Path) -> Result<PathBuf> {
 /// Pump bytes from the pty master to the user's terminal and the build log.
 /// Read in raw chunks rather than by line so ANSI colour sequences and
 /// `\r`-terminated progress bars (curl, wget) reach the terminal byte-for-byte.
+///
+/// Per-destination "log once, keep draining" on failure: a broken stdout or a
+/// full disk on `build.log` shouldn't abort the build (and we must keep
+/// reading the pty so makepkg doesn't block on a full master buffer), but the
+/// user needs to know an output sink went away — surface via `tracing` (which
+/// writes to gitaur's own stderr/log, not the pty), once per sink.
 fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, log: &Mutex<File>) {
     let mut buf = [0u8; 8192];
+    let mut stdout_failed = false;
+    let mut log_failed = false;
     loop {
         match reader.read(&mut buf) {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
+            Err(e) => {
+                warn!(error = %e, "pty read failed; build output truncated");
+                return;
+            }
             Ok(n) => {
                 let slice = &buf[..n];
-                writer.write_all(slice).ok();
-                writer.flush().ok();
-                if let Ok(mut f) = log.lock() {
-                    f.write_all(slice).ok();
+                if !stdout_failed {
+                    if let Err(e) = writer.write_all(slice).and_then(|()| writer.flush()) {
+                        warn!(error = %e, "stdout write failed; terminal mirror disabled for the remainder of the build");
+                        stdout_failed = true;
+                    }
+                }
+                if !log_failed {
+                    if let Ok(mut f) = log.lock() {
+                        if let Err(e) = f.write_all(slice) {
+                            warn!(error = %e, "build.log write failed; log will be truncated");
+                            log_failed = true;
+                        }
+                    }
                 }
             }
         }
