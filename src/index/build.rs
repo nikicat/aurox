@@ -84,7 +84,14 @@ pub fn full_build(cfg: &Config, mirror: &MirrorRepo) -> Result<IndexFile> {
     pb.finish_with_message("done");
     entries.sort_by(|a, b| a.pkgbase.cmp(&b.pkgbase));
 
-    let mirror_head = head_oid(&mirror.repo).unwrap_or([0u8; 20]);
+    // `[0u8; 20]` doubles as the "no head yet" sentinel that `IndexFile::empty()`
+    // uses, so a freshly-cloned mirror with no commits maps cleanly to it. But
+    // it would also mask a corrupt/unreadable HEAD as "empty mirror" — log the
+    // fallback so post-mortems can tell the two apart.
+    let mirror_head = head_oid(&mirror.repo).unwrap_or_else(|| {
+        debug!("mirror HEAD unreadable; writing zero OID sentinel into index");
+        [0u8; 20]
+    });
     let idx = IndexFile {
         format_version: IndexFile::FORMAT_VERSION,
         mirror_head_oid: mirror_head,

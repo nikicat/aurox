@@ -31,8 +31,23 @@ const FILE_LOG_FILTER: &str =
 /// Best-effort: console logging always works; if the log file can't be
 /// created we print a warning to stderr and continue without file logging.
 pub fn init() -> Option<PathBuf> {
-    let console_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    // Branch on the raw env var rather than `try_from_default_env()` alone:
+    // its `FromEnvError` doesn't expose whether the failure was "unset" (a
+    // silent legitimate case → fall back to "warn") or "couldn't parse the
+    // value" (the user typed something — they need to know it was ignored).
+    let console_filter = match std::env::var("RUST_LOG") {
+        Err(std::env::VarError::NotPresent) => EnvFilter::new("warn"),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("gitaur: RUST_LOG is not valid UTF-8; falling back to RUST_LOG=warn");
+            EnvFilter::new("warn")
+        }
+        Ok(raw) => EnvFilter::try_new(&raw).unwrap_or_else(|e| {
+            eprintln!(
+                "gitaur: ignoring malformed RUST_LOG='{raw}' ({e}); falling back to RUST_LOG=warn"
+            );
+            EnvFilter::new("warn")
+        }),
+    };
     // `fmt::layer()` defaults to stdout, which competes with subprocess
     // stdout (makepkg, pacman -U). Pin to stderr so log lines interleave
     // cleanly with `ui::{step,note,…}` (which all use eprintln) and don't
