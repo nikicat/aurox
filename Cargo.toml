@@ -142,6 +142,34 @@ shadow_same = "warn"            # `let x = x;` rebind-noop
 use_debug = "warn"              # `{:?}` in user-facing output
 unneeded_field_pattern = "warn" # all fields `_` → use `..`
 needless_raw_strings = "warn"   # `r"…"` without escapes
+# Correctness-leaning restriction picks — each catches a real category of
+# subtle bug rather than a style preference.
+mixed_read_write_in_expression = "warn" # `a[i] = b[i += 1]` order ambiguity
+filetype_is_file = "warn"               # `.metadata().is_file()` skips symlinks
+path_buf_push_overwrite = "warn"        # `pb.push("/abs")` drops the original
+path_ends_with_ext = "warn"             # `Path::ends_with(".rs")` doesn't work
+mut_from_ref = "warn"                   # `&T` cast to `&mut T`
+non_send_fields_in_send_ty = "warn"     # wrong manual `unsafe impl Send`
+unsafe_derive_deserialize = "warn"      # derived `Deserialize` bypasses Send/Sync
+print_in_format_impl = "warn"           # `println!` inside `Display::fmt`
+let_underscore_future = "warn"          # `let _ = async_fn()` — forgotten `.await`
+lossy_float_literal = "warn"            # `let x: f32 = 1.123456789` truncates
+suspicious_xor_used_as_pow = "warn"     # `2 ^ 8` is XOR, not exponent
+# Hygiene picks — readable-code preferences, not bug catches.
+get_unwrap = "warn"                        # `.get(i).unwrap()` worse than `[i]`
+multiple_inherent_impl = "warn"            # `impl Foo` spread across same module
+same_name_method = "warn"                  # trait method shadowed by inherent
+partial_pub_fields = "warn"                # mixed visibility in struct
+string_lit_chars_any = "warn"              # `"abc".chars().any(…)` → `.contains(…)`
+char_lit_as_u8 = "warn"                    # `'a' as u8` for ASCII (opaque)
+bool_to_int_with_if = "warn"               # `if x { 1 } else { 0 }` → `usize::from`
+unnecessary_struct_initialization = "warn" # `Foo { ..other }` no-op
+large_stack_arrays = "warn"                # accidental stack overflows
+large_include_file = "warn"                # huge `include_str!`/`include_bytes!`
+inline_always = "warn"                     # `#[inline(always)]` discouraged
+# Cargo feature naming.
+redundant_feature_names = "warn" # `feature = "thing-feature"`
+negative_feature_names = "warn"  # `feature = "no-X"`
 # TODO: lints that match the project's style but are noisy today. Re-probe
 # (`cargo clippy ... -W clippy::<lint>`) periodically and adopt once the
 # count is fixable in one sitting.
