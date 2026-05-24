@@ -661,7 +661,9 @@ pub fn cmd_clean(cfg: &Config, argv: &[String]) -> Result<u8> {
         if let Err(e) = std::fs::remove_dir_all(&pkgs_root) {
             warn!(error = %e, "could not remove pkgs dir");
         }
-        std::fs::create_dir_all(&pkgs_root).ok();
+        if let Err(e) = std::fs::create_dir_all(&pkgs_root) {
+            warn!(error = %e, "could not recreate pkgs dir");
+        }
     }
     Ok(0)
 }

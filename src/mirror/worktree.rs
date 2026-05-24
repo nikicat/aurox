@@ -64,14 +64,17 @@ pub fn add_or_reset(mirror: &MirrorRepo, branch: &PkgBase, dest: &Path) -> Resul
     } else {
         // First call, or someone deleted half the state by hand. Drop any
         // orphaned admin entry, scrub a stale dest if one is in the way,
-        // then create the worktree fresh.
-        run_git(&[
+        // then create the worktree fresh. Prune failure isn't fatal here
+        // (the subsequent `worktree add` will surface anything real), but
+        // log it so post-mortems can correlate with a confusing add error.
+        if let Err(e) = run_git(&[
             "-C".as_ref(),
             mirror.path.as_os_str(),
             "worktree".as_ref(),
             "prune".as_ref(),
-        ])
-        .ok();
+        ]) {
+            debug!(error = %e, "preparatory worktree prune failed; continuing");
+        }
         if dest.exists() {
             force_remove(dest)?;
         }
@@ -110,8 +113,7 @@ pub fn prune(mirror: &MirrorRepo, _branch: &str, dest: &Path) -> Result<()> {
         mirror.path.as_os_str(),
         "worktree".as_ref(),
         "prune".as_ref(),
-    ])
-    .ok();
+    ])?;
     Ok(())
 }
 

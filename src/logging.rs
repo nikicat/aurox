@@ -105,7 +105,12 @@ fn prune_old_logs_in(dir: &Path, keep: usize) -> std::io::Result<()> {
         .collect();
     entries.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
     for (_, path) in entries.into_iter().skip(keep) {
-        std::fs::remove_file(&path).ok();
+        // Safe to `tracing::debug!` here: the file layer's writer is the
+        // *current* invocation's log, which is a different inode from any of
+        // the (older) files being unlinked here. No re-entry.
+        if let Err(e) = std::fs::remove_file(&path) {
+            tracing::debug!(path = %path.display(), error = %e, "failed to prune old log");
+        }
     }
     Ok(())
 }
