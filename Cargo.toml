@@ -49,6 +49,12 @@ regex = "1"
 smallvec = { version = "1", features = ["serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Per-run span hierarchy → Chrome/Perfetto trace JSON in `traces/`, so the
+# timings of git fetch vs. parallel index rebuild can be inspected as a
+# flamegraph (drag the file into https://ui.perfetto.dev). Pure file output,
+# no collector or async runtime — it just bridges our existing #[instrument]
+# spans into the trace-event format.
+tracing-chrome = "0.7"
 jiff = "0.2"
 glob = "0.3"
 # Pure-Rust regex backend (fancy-regex) avoids the onig C dep; ~10 transitive

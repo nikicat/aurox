@@ -61,14 +61,14 @@ pub fn logs_dir() -> PathBuf {
     state_dir().join("logs")
 }
 
+/// Directory holding per-invocation Chrome/Perfetto span traces.
+pub fn traces_dir() -> PathBuf {
+    state_dir().join("traces")
+}
+
 /// Create the state directory tree if missing.
 pub fn ensure_state_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir())?;
     std::fs::create_dir_all(state_dir().join("pkgs"))?;
     Ok(())
-}
-
-/// Create the logs directory if missing.
-pub fn ensure_logs_dir() -> std::io::Result<()> {
-    std::fs::create_dir_all(logs_dir())
 }
