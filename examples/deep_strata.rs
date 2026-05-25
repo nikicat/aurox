@@ -27,7 +27,7 @@ fn main() {
         }
         // python38-* form a giant cyclical cluster. Dedicated method on
         // PkgBase rather than reaching into the inner string.
-        if entry.pkgbase.0.starts_with("python38-") {
+        if entry.pkgbase.starts_with("python38-") {
             continue;
         }
         // Pick the first pkgname as the user-typed target.

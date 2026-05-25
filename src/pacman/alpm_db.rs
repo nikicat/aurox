@@ -361,7 +361,7 @@ impl PacmanIndex {
         if entry
             .replaces
             .iter()
-            .any(|r| strip_version_constraint(r) == stored_name.0)
+            .any(|r| stored_name == strip_version_constraint(r))
         {
             return Some(InstalledCounterpart {
                 pkgname: stored_name,
@@ -373,11 +373,11 @@ impl PacmanIndex {
             .pkgnames
             .iter()
             .flat_map(|p| &p.provides)
-            .any(|prov| strip_version_constraint(prov) == stored_name.0);
+            .any(|prov| stored_name == strip_version_constraint(prov));
         let in_pkgbase_provides = entry
             .provides
             .iter()
-            .any(|prov| strip_version_constraint(prov) == stored_name.0);
+            .any(|prov| stored_name == strip_version_constraint(prov));
         if in_scoped_provides || in_pkgbase_provides {
             return Some(InstalledCounterpart {
                 pkgname: stored_name,
@@ -808,9 +808,8 @@ mod tests {
         idx.installed.insert("foo".into(), "1-1".into());
         let e = entry("foo", &[("foo", &[])], &[], &[]);
         assert_eq!(
-            idx.counterpart_with_hint(&e, None)
-                .map(|c| c.pkgname.0.clone()),
-            idx.counterpart(&e).map(|c| c.pkgname.0.clone()),
+            idx.counterpart_with_hint(&e, None).map(|c| c.pkgname),
+            idx.counterpart(&e).map(|c| c.pkgname),
         );
     }
 

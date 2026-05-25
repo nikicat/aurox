@@ -55,7 +55,7 @@ use std::path::Path;
     Archive, Serialize, Deserialize, Debug, Clone, Default, Hash, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[rkyv(compare(PartialEq, PartialOrd))]
-pub struct PkgName(pub String);
+pub struct PkgName(String);
 
 /// One AUR pkgbase — the branch name on the mirror, the unit `makepkg`
 /// builds. Always a single pkgbase per AUR repo branch; produces one or
@@ -64,7 +64,7 @@ pub struct PkgName(pub String);
     Archive, Serialize, Deserialize, Debug, Clone, Default, Hash, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[rkyv(compare(PartialEq, PartialOrd))]
-pub struct PkgBase(pub String);
+pub struct PkgBase(String);
 
 /// A user-typed install target — unclassified.
 ///
@@ -79,7 +79,7 @@ pub struct PkgBase(pub String);
 /// `&PkgName` or `&PkgBase`, so the heterogeneous CLI/picker boundary
 /// can't be mistaken for a classified one.
 #[derive(Debug, Clone, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PkgTarget(pub String);
+pub struct PkgTarget(String);
 
 /// A virtual name declared in an AUR pkg's `provides=` array — **not** a pkgname.
 ///
@@ -96,7 +96,7 @@ pub struct PkgTarget(pub String);
     Archive, Serialize, Deserialize, Debug, Clone, Default, Hash, PartialEq, Eq, PartialOrd, Ord,
 )]
 #[rkyv(compare(PartialEq, PartialOrd))]
-pub struct VirtualName(pub String);
+pub struct VirtualName(String);
 
 macro_rules! impl_name_wrapper {
     ($ty:ident) => {
@@ -120,6 +120,12 @@ macro_rules! impl_name_wrapper {
             /// operation, not a downgrade.
             pub fn matches_regex(&self, r: &Regex) -> bool {
                 r.is_match(&self.0)
+            }
+            /// Prefix test as a domain operation — keeps cluster/family
+            /// checks (e.g. `python38-*`) from reaching into the inner
+            /// string just to call `str::starts_with`.
+            pub fn starts_with(&self, prefix: &str) -> bool {
+                self.0.starts_with(prefix)
             }
         }
 
