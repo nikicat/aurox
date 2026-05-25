@@ -65,6 +65,12 @@ pub struct IndexEntry {
     pub commit_oid: [u8; 20],
     /// Blob OID of the `.SRCINFO` file inside that commit's tree.
     pub srcinfo_blob_oid: [u8; 20],
+    /// Committer timestamp (seconds since the Unix epoch) of the branch tip
+    /// that produced this entry. Drives the "freshest first" ordering of the
+    /// `gitaur <term>` picker — recently-pushed AUR packages float to the top.
+    /// `0` for entries built before this field existed or whose commit time
+    /// couldn't be read.
+    pub commit_time_unix: i64,
 }
 
 /// Top-level archive: header metadata + entries sorted by `pkgbase`.
@@ -109,13 +115,16 @@ impl IndexEntry {
 }
 
 impl IndexFile {
-    /// Current format version constant. Bumped to **3** when `pkgbase` and
+    /// Current format version constant. Bumped to **4** when
+    /// [`IndexEntry::commit_time_unix`] was added (the branch-tip committer
+    /// timestamp the search picker sorts on). Was **3** when `pkgbase` and
     /// `Pkgname.name` switched from `String` to the typed `PkgBase` / `PkgName`
     /// newtypes. rkyv archives are distinct per Rust type even when the
-    /// underlying bytes match, so loading a v2 file with v3 types would
-    /// silently mis-shape the deserialized struct without the version
-    /// gate. v1/v2 archives must be rebuilt via `gitaur -Sy`.
-    pub const FORMAT_VERSION: u32 = 3;
+    /// underlying bytes match, and a new field shifts the layout, so loading an
+    /// older file with newer types would silently mis-shape the deserialized
+    /// struct without the version gate. Older archives must be rebuilt via
+    /// `gitaur -Sy`.
+    pub const FORMAT_VERSION: u32 = 4;
 
     /// Empty in-memory index. Used when no on-disk file exists yet.
     pub const fn empty() -> Self {

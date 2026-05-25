@@ -11,7 +11,7 @@ use crate::index::secondary::strip_version_constraint;
 use crate::names::PkgName;
 use crate::version::{Ver, Version};
 use alpm::Alpm;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{debug, instrument};
 
 /// What the user currently has installed that this AUR entry will displace.
@@ -53,6 +53,62 @@ pub enum MatchedVia {
     /// typically manifest in practice (e.g. `dotnet-core-7.0-bin` providing
     /// `dotnet-runtime-7.0`).
     Provides,
+}
+
+/// One sync-repo package matching a search query.
+///
+/// Owned so it outlives the `Alpm` handle (which is `!Sync` and borrows its
+/// `Package`s from the open DB). `repo` is the sync-DB name (`core`, `extra`,
+/// …) in pacman.conf precedence order; `installed` flags rows the user already
+/// has so the picker can mark them the way `pacman -Ss` does.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RepoHit {
+    pub repo: String,
+    pub name: PkgName,
+    pub version: Version,
+    pub desc: Option<String>,
+    pub installed: bool,
+}
+
+/// Search every sync repo for packages matching all `terms` (pacman `-Ss`
+/// AND semantics over name + description), returning owned hits.
+///
+/// Mirrors `pacman -Ss`: the first sync DB (pacman.conf order) that carries a
+/// pkgname wins, so a name shadowed in a later repo isn't listed twice. Used
+/// by the `gitaur <term>` picker to show repo packages alongside AUR ones the
+/// way yay/paru do.
+#[instrument]
+pub fn search_sync(terms: &[String]) -> Result<Vec<RepoHit>> {
+    let alpm = open()?;
+    let installed: HashSet<String> = alpm
+        .localdb()
+        .pkgs()
+        .iter()
+        .map(|p| p.name().to_owned())
+        .collect();
+    let mut hits = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for db in alpm.syncdbs() {
+        let matches = db
+            .search(terms.iter().map(String::as_str))
+            .map_err(|e| Error::other(format!("search {}: {e}", db.name())))?;
+        for p in &matches {
+            // First DB declaring the name wins, matching pacman's repo
+            // precedence — skip a name a higher-priority repo already produced.
+            if !seen.insert(p.name().to_owned()) {
+                continue;
+            }
+            hits.push(RepoHit {
+                repo: db.name().to_owned(),
+                name: PkgName::new(p.name()),
+                version: Version::from(p.version()),
+                desc: p.desc().map(str::to_owned),
+                installed: installed.contains(p.name()),
+            });
+        }
+    }
+    debug!(count = hits.len(), "repo search hits");
+    Ok(hits)
 }
 
 /// Open the system alpm DB with sync repos registered from `pacman.conf`.

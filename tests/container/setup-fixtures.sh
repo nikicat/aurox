@@ -52,6 +52,17 @@ add_aur_pkg() {
     stage="$(mktemp -d)"
     cp -r "$src"/* "$stage/"
     pushd "$stage" >/dev/null
+    # An optional `commit-date` file pins the branch tip's committer time so
+    # tests can assert gitaur's freshest-commit-first search ordering against
+    # known timestamps (otherwise every fixture commits at the same build
+    # second and the order is just the pkgbase tie-break). It's metadata for
+    # the harness, not part of the package, so drop it before committing the
+    # tree. Value is any `git`-parsable date string (e.g. `2020-01-01`).
+    local commit_date=""
+    if [[ -f "commit-date" ]]; then
+        commit_date="$(cat commit-date)"
+        rm -f commit-date
+    fi
     # Real archlinux/aur packages carry both PKGBUILD and .SRCINFO; gitaur's
     # index builder parses the .SRCINFO blob, so synthesize it from PKGBUILD.
     makepkg --printsrcinfo > .SRCINFO
@@ -59,7 +70,12 @@ add_aur_pkg() {
     git config user.email "test@example.com"
     git config user.name "test"
     git add .
-    git commit -q -m "$pkgbase: import fixture"
+    if [[ -n "$commit_date" ]]; then
+        GIT_AUTHOR_DATE="$commit_date" GIT_COMMITTER_DATE="$commit_date" \
+            git commit -q -m "$pkgbase: import fixture"
+    else
+        git commit -q -m "$pkgbase: import fixture"
+    fi
     git push --quiet "$MOCK_AUR" "$pkgbase":"$pkgbase"
     popd >/dev/null
     rm -rf "$stage"

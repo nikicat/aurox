@@ -1,0 +1,13 @@
+# Freshest-commit-first search-ordering fixture. Shares the unique 'csortprobe'
+# token with its siblings so one regex matches all three; the per-fixture
+# commit-date file pins the branch-tip committer time the picker sorts on.
+pkgname=test-csort-c
+pkgver=1.0
+pkgrel=1
+pkgdesc='gitaur test fixture: csortprobe ordering'
+arch=('any')
+license=('MIT')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}
