@@ -313,7 +313,7 @@ fn render_row(u: &PkgUpgrade, repo_w: usize, name_w: usize, old_w: usize, colore
     let repo_pad = " ".repeat(repo_w.saturating_sub(u.repo.len()));
     format!(
         "{repo}{repo_pad}  {name:<name_w$}  {old_pre}{old_suf}{old_pad}  ->  {new_pre}{new_suf}",
-        repo = style(&u.repo).color256(244),
+        repo = super::repo(&u.repo),
         repo_pad = repo_pad,
         name = u.name,
         old_pre = style(old_pre).dim(),

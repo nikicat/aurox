@@ -219,8 +219,9 @@ fn label_colored(row: &Row<'_>) -> String {
     match row {
         Row::Repo(r) => {
             let mut head = format!(
-                "{} {}",
-                style(format!("{}/{}", r.repo, r.name)).bold(),
+                "{}/{} {}",
+                ui::repo(&r.repo),
+                style(&r.name).bold(),
                 style(&r.version).green(),
             );
             if r.installed {
@@ -234,8 +235,9 @@ fn label_colored(row: &Row<'_>) -> String {
         Row::Aur(e) => {
             let ver = aur_version(e);
             let head = format!(
-                "{} {}",
-                style(format!("aur/{}", e.pkgbase)).bold(),
+                "{}/{} {}",
+                ui::repo("aur"),
+                style(&e.pkgbase).bold(),
                 style(ver).green(),
             );
             match e.pkgdesc.as_deref() {

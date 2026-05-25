@@ -42,7 +42,24 @@ pub enum ColorMode {
 static COLOR: OnceLock<ColorMode> = OnceLock::new();
 
 /// Install the process-wide color mode. First caller wins.
+///
+/// Also drives `console`'s own global gate so `always`/`never` actually force
+/// color on/off even when output isn't a TTY (e.g. `gitaur --color always |
+/// cat`). Without this, `color_on` would pick the colored code branch but
+/// every `console::style(...)` would still strip its escapes on a pipe.
+/// `auto` leaves console's built-in per-stream TTY detection untouched.
 pub fn set_color(mode: ColorMode) {
+    match mode {
+        ColorMode::Always => {
+            console::set_colors_enabled(true);
+            console::set_colors_enabled_stderr(true);
+        }
+        ColorMode::Never => {
+            console::set_colors_enabled(false);
+            console::set_colors_enabled_stderr(false);
+        }
+        ColorMode::Auto => {}
+    }
     COLOR.set(mode).ok();
 }
 
@@ -125,6 +142,36 @@ pub fn dim(text: impl AsRef<str>) -> console::StyledObject<String> {
     style(text.as_ref().to_owned()).color256(244).italic()
 }
 
+/// Style a repository name (`core`, `extra`, `aur`, …) as a colored list-row
+/// prefix, the way yay does.
+///
+/// Each name hashes deterministically to one of six bold ANSI colors, so
+/// `core`, `extra`, and `aur` come out visually distinct but stable per repo.
+///
+/// Replicates yay's `text.ColorHash` byte-for-byte — djb2 seeded at 5381 in
+/// 64-bit wrapping arithmetic, then `hash % 6` over the bold colors red,
+/// green, yellow, blue, magenta, cyan (ANSI 31–36).
+///
+/// Always emits color codes; callers gate on [`color_on`] and keep a plain
+/// branch (same convention as [`dim`]). The slash and package name stay the
+/// caller's responsibility so width math runs on the unstyled text.
+pub fn repo(name: impl AsRef<str>) -> console::StyledObject<String> {
+    let name = name.as_ref();
+    let mut hash: u64 = 5381;
+    for b in name.bytes() {
+        hash = u64::from(b).wrapping_add((hash << 5).wrapping_add(hash));
+    }
+    let styled = style(name.to_owned()).bold();
+    match hash % 6 {
+        0 => styled.red(),
+        1 => styled.green(),
+        2 => styled.yellow(),
+        3 => styled.blue(),
+        4 => styled.magenta(),
+        _ => styled.cyan(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +191,25 @@ mod tests {
             !out.contains("\u{1b}[1m"),
             "header should not be bold: {out:?}"
         );
+    }
+
+    /// `repo` must reproduce yay's `text.ColorHash` so prefixes look identical
+    /// across the two tools. These pins are the colors yay assigns today —
+    /// core→yellow, extra→green, multilib→cyan, aur→blue — computed from the
+    /// same djb2/`%6` mapping. A change to the hash or color table breaks here.
+    #[test]
+    fn repo_colors_match_yay_colorhash() {
+        let out = |name: &str| repo(name).force_styling(true).to_string();
+        let bold_colored = |name: &str, color: &str| {
+            let s = out(name);
+            s.contains(color) && s.contains("\u{1b}[1m")
+        };
+        assert!(bold_colored("core", "\u{1b}[33m"), "core not bold yellow");
+        assert!(bold_colored("extra", "\u{1b}[32m"), "extra not bold green");
+        assert!(
+            bold_colored("multilib", "\u{1b}[36m"),
+            "multilib not bold cyan"
+        );
+        assert!(bold_colored("aur", "\u{1b}[34m"), "aur not bold blue");
     }
 }
