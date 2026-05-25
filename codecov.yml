@@ -24,9 +24,9 @@ coverage:
     # Project-wide status: did total coverage drop?
     # `threshold: 1%` tolerates small fluctuations so PRs aren't blocked by
     # noise (e.g. a generic monomorphization shifting region counts).
-    # The unflagged `default` is the merged total across all uploads. The
-    # rust/podman flags are informational so they surface in PR comments
-    # without gating merges — the combined flag is the gate.
+    # The unflagged `default` is the merged total across all uploads. Every
+    # flag gates: a drop in rust, podman, or combined coverage blocks the
+    # merge (each posts its own status check on the PR).
     project:
       default:
         target: auto
@@ -36,12 +36,12 @@ coverage:
         flags: [rust]
         target: auto
         threshold: 1%
-        informational: true
+        informational: false
       podman:
         flags: [podman]
         target: auto
         threshold: 1%
-        informational: true
+        informational: false
       combined:
         flags: [combined]
         target: auto
