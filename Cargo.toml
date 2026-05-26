@@ -26,14 +26,29 @@ path = "src/main.rs"
 #    index;
 #  - a gix-transport patch that wraps the curl worker's `perform()` in a
 #    `gix_http` "http request" span carrying curl's CURLINFO timing — the only
-#    place that timing is reachable (see src/logging/chrome.rs).
-gix = { git = "https://github.com/nikicat/gitoxide", rev = "90a0a85d3", features = [
+#    place that timing is reachable (see src/logging/chrome.rs);
+#  - a `mark mappings` detail span in gix-protocol that splits
+#    `mark_complete_and_common_ref`'s per-mapping loop into `find_ms`
+#    (packed-ref lookup) vs `commit_ms` (ODB/commit-graph load) — the
+#    dominant cost of `receive` on the AUR mirror (see the `tracing-detail`
+#    feature below).
+gix = { git = "https://github.com/nikicat/gitoxide", rev = "d5b3ee00e", features = [
   # curl-rustls (over reqwest-rust-tls) so gix's low_speed_* / lowSpeedLimit
   # config actually fires — only the curl transport implements it, the
   # reqwest blocking transport silently ignores those fields. Adds libcurl
   # (dyn-linked) but keeps TLS pure-Rust via rustls.
   "blocking-http-transport-curl-rustls",
   "worktree-mutation",
+  # Compile in gix's own `coarse!` (INFO) and `detail!` (DEBUG) spans and bridge
+  # them to `tracing`. Without this they're zero-cost-removed, leaving the most
+  # expensive phase of a fetch — `gix_protocol::fetch::negotiate`'s
+  # `mark_complete_and_common_ref()` (the silent local "have"-set build, ~20s of
+  # the 25s `receive` span on the AUR mirror) — completely uninstrumented: gix
+  # never calls `progress.set_name()` for it, so our GixProgress adapter can't
+  # see it. It *is* wrapped in a `gix_trace::detail!("negotiate")` span, which
+  # this feature turns into a real DEBUG span on target `gix_protocol::*`,
+  # picked up by the `debug`-baseline chrome/file layers in src/logging.rs.
+  "tracing-detail",
 ] }
 clap = { version = "4", features = ["derive"] }
 rayon = "1.10"
