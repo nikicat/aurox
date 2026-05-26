@@ -72,6 +72,9 @@ portable-pty = "0.9"
 tempfile = "3"
 nix = { version = "0.31", features = ["resource"] }
 vt100 = "0.16"
+# Parse the Chrome/Perfetto trace JSON in the gix-progress span test. Already
+# in the lock via tracing-chrome; declared here for the test to use directly.
+serde_json = "1"
 
 [profile.release]
 lto = "thin"

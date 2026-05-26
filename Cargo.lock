@@ -778,6 +778,7 @@ dependencies = [
  "regex",
  "rkyv",
  "serde",
+ "serde_json",
  "smallvec",
  "syntect",
  "tempfile",

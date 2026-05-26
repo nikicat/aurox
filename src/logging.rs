@@ -80,15 +80,21 @@ pub fn init() -> Guard {
 
     // Chrome trace layer: same span/event stream as the file log, but emitted
     // as trace-events. `include_args(true)` folds the `#[instrument]`
-    // `fields(...)` (branch, counts, version, …) into each span's args so
-    // they show up in the Perfetto detail pane. Default `TraceStyle::Threaded`
-    // puts each rayon index-build worker on its own track, so the parallel
-    // fan-out under `full_build` is visible against the serial git fetch.
+    // `fields(...)` (branch, counts, version, …) into each span's args so they
+    // show up in the Perfetto detail pane.
+    //
+    // `TraceStyle::Async` (not the default Threaded): it records a span on
+    // open→close (`on_new_span`/`on_close`) and nests by parent scope, rather
+    // than on enter/exit per thread. That's what lets the gix fetch-phase
+    // sub-spans work — they're *held, not entered* (the progress adapter must
+    // stay `Send + Sync`, so it can't keep an `EnteredSpan`), and it keeps
+    // spans that open and close on different threads intact.
     let (chrome_layer, chrome_guard, trace_path) = match Traces.create(&basename) {
         Ok((file, path)) => {
             let (layer, guard) = ChromeLayerBuilder::new()
                 .writer(file)
                 .include_args(true)
+                .trace_style(tracing_chrome::TraceStyle::Async)
                 .build();
             (
                 Some(layer.with_filter(EnvFilter::new(FILE_LOG_FILTER))),
