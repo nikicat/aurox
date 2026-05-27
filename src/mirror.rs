@@ -69,6 +69,44 @@ impl MirrorRepo {
     pub fn write_commit_graph(&self, new_commits: Option<&[gix::ObjectId]>) {
         git::write_commit_graph(&self.path, new_commits);
     }
+
+    /// Fold accumulated loose refs back into `packed-refs` so the next fetch's
+    /// per-ref resolution stays on gix's borrowed fast path. Best-effort, and
+    /// ~1 s on the AUR mirror — gate on [`loose_branch_ref_count`] rather than
+    /// calling every fetch. See [`crate::git::pack_refs`].
+    pub fn pack_refs(&self) {
+        git::pack_refs(&self.path);
+    }
+}
+
+/// Loose refs accumulate (one file per changed ref) every fetch and never get
+/// packed on a mirror gitaur only fetches. Once this many have piled up, fold
+/// them back into `packed-refs`. The pack rewrites the whole ~10 MB file, so a
+/// threshold this size amortizes that ~1 s cost across hundreds of fetches
+/// while keeping the loose set — and the fast-path miss it causes — bounded.
+const LOOSE_REF_PACK_THRESHOLD: usize = 2000;
+
+/// Count loose refs under `refs/heads/` in the bare repo at `path`.
+///
+/// Packed refs live in the single `packed-refs` file, so only loose refs appear
+/// as files here — the walk is O(loose), not O(all refs). AUR branch names are
+/// flat (no `/`), but the recursion keeps it correct if that ever changes.
+fn loose_branch_ref_count(path: &Path) -> usize {
+    fn walk(dir: &Path, n: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => walk(&entry.path(), n),
+                Ok(_) => *n += 1,
+                Err(_) => {}
+            }
+        }
+    }
+    let mut n = 0;
+    walk(&path.join("refs").join("heads"), &mut n);
+    n
 }
 
 /// Fetch mirror updates and incrementally refresh the on-disk index.
@@ -151,6 +189,14 @@ pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
             // graphs their closure instead of re-walking all ~155k refs.
             let tips: Vec<gix::ObjectId> = updates.iter().filter_map(|u| u.new_oid).collect();
             mirror.write_commit_graph(Some(&tips));
+            // This fetch just wrote `updates.len()` more loose refs. Once enough
+            // have accumulated, pack them so subsequent fetches keep the fast
+            // path (see `LOOSE_REF_PACK_THRESHOLD`).
+            let loose = loose_branch_ref_count(&mirror.path);
+            if loose >= LOOSE_REF_PACK_THRESHOLD {
+                debug!(loose, "loose refs over threshold; packing");
+                mirror.pack_refs();
+            }
         }
         Some(_) => {
             // Nothing changed on the mirror, so the commit-graph is still current.
@@ -185,4 +231,35 @@ fn is_bootstrapped(path: &Path) -> bool {
         return false;
     };
     iter.next().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::loose_branch_ref_count;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn counts_loose_refs_recursively_and_ignores_packed_refs() {
+        let dir = TempDir::new().unwrap();
+        let heads = dir.path().join("refs").join("heads");
+        fs::create_dir_all(heads.join("group")).unwrap();
+        fs::write(heads.join("pkg-a"), "oid\n").unwrap();
+        fs::write(heads.join("pkg-b"), "oid\n").unwrap();
+        // A nested name (`group/sub`) must still be counted via the recursion.
+        fs::write(heads.join("group").join("sub"), "oid\n").unwrap();
+        // The single `packed-refs` file lives outside refs/heads and must not
+        // inflate the loose count, even with thousands of refs inside it.
+        fs::write(dir.path().join("packed-refs"), "# many refs...\n").unwrap();
+
+        assert_eq!(loose_branch_ref_count(dir.path()), 3);
+    }
+
+    #[test]
+    fn counts_zero_when_refs_heads_is_absent() {
+        // A freshly `pack-refs`'d store removes the loose files (and may remove
+        // empty dirs); a missing refs/heads must read as zero, not panic.
+        let dir = TempDir::new().unwrap();
+        assert_eq!(loose_branch_ref_count(dir.path()), 0);
+    }
 }

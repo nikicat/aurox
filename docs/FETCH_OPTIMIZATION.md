@@ -175,6 +175,23 @@ the `load` span sits on its own thread track starting at t≈0, overlapping the
 whole fetch. The post-fetch tail is now just `incremental_update` + `save` +
 `write_commit_graph` (~0.35 s total).
 
+### 12. Pack accumulated loose refs periodically
+`gitaur` · `git.rs` / `mirror.rs`
+
+The fast paths in #4/#7/#9 only fire for *packed* refs, but git writes every
+updated ref as a loose file (it never rewrites the ~10 MB `packed-refs` for one
+change), and a fetch-only mirror never runs `pack-refs`. So loose refs pile up
+forever — 5017 had accumulated since the clone — and each one drops back to the
+slow loose-first `find` (an `open()` per ref) in *both* find loops, while also
+bloating the `loose_names` set every packed ref is hashed against. `cmd_refresh`
+now counts loose branch refs after an incremental update and runs
+`git pack-refs --all` once they cross `LOOSE_REF_PACK_THRESHOLD` (2000). At 5017
+loose this measured `update_refs` self ~620 → ~460 ms (`exists_ms` 86 → 1, the #9
+fast path now firing for every ref) and `mark mappings` `find_ms` ~467 → ~424 ms.
+The pack itself rewrites all of `packed-refs` (~1 s), so the threshold amortizes
+it across hundreds of fetches. A binary/indexed ref backend (git's `reftable`)
+would moot this entirely, but gix only implements the files backend.
+
 ### Tooling (not perf, but part of the arc)
 - `gix-transport` http spans with curl CURLINFO timing (`90a0a85d3`),
   the `mark mappings` split-phase span (`d5b3ee00e`), and a `gix-ref`
