@@ -106,28 +106,40 @@ pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
 
     ui::info("refreshing AUR mirror");
     let mirror = MirrorRepo::open(&path)?;
-    let updates = fetch::incremental_fetch(cfg, &mirror)?;
-
-    // Load the existing index if any. A failed load (rkyv validation, schema
-    // mismatch after a gitaur upgrade, etc.) is **recovered from in-place**
-    // by falling back to a full rebuild — otherwise the user would be stuck
-    // in a loop where `-Sy` errors out before it can rebuild.
     let idx_path = paths::index_path();
-    let existing = if idx_path.exists() {
-        match index::load(&idx_path) {
-            Ok(idx) => Some(idx),
-            Err(e) => {
-                // Expected after a gitaur upgrade bumps the schema: the rebuild
-                // below is announced by "building index"/"index built", and on
-                // the resync path `load_or_resync` has already told the user
-                // why. So this is a trace, not a user-facing warning.
-                debug!(error = %e, "existing index unreadable; rebuilding from scratch");
-                None
+
+    // The fetch is network-bound and the index load is local file I/O against
+    // a different file, so run them concurrently: the ~0.5s load disappears
+    // under the multi-second fetch. A scoped thread lets the loader borrow
+    // `&idx_path` without an `Arc`; the fetch keeps the foreground (and its
+    // progress UI) on this thread.
+    //
+    // A failed load (rkyv validation, schema mismatch after a gitaur upgrade,
+    // etc.) is **recovered from in-place** by falling back to a full rebuild
+    // below — otherwise the user would be stuck in a loop where `-Sy` errors
+    // out before it can rebuild.
+    let (updates, existing) = std::thread::scope(|s| {
+        let loader = s.spawn(|| {
+            if !idx_path.exists() {
+                return None;
             }
-        }
-    } else {
-        None
-    };
+            match index::load(&idx_path) {
+                Ok(idx) => Some(idx),
+                Err(e) => {
+                    // Expected after a gitaur upgrade bumps the schema: the
+                    // rebuild below is announced by "building index"/"index
+                    // built", and on the resync path `load_or_resync` has
+                    // already told the user why. So this is a trace, not a
+                    // user-facing warning.
+                    debug!(error = %e, "existing index unreadable; rebuilding from scratch");
+                    None
+                }
+            }
+        });
+        let updates = fetch::incremental_fetch(cfg, &mirror)?;
+        let existing = loader.join().expect("index loader thread panicked");
+        Ok::<_, Error>((updates, existing))
+    })?;
 
     match existing {
         Some(mut idx) if !updates.is_empty() => {

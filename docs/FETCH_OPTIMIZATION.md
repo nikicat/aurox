@@ -163,6 +163,18 @@ incremental fetch already knows them — they're the `new_oid`s in the
 bootstrap and full-rebuild paths keep `--reachable` (no delta to feed). The
 `write_commit_graph` span dropped ~1.30 s → ~0.10 s on a 137-ref refresh.
 
+### 11. Load the index concurrently with the fetch
+`gitaur` · `mirror.rs`
+
+`cmd_refresh` ran strictly serially: fetch, *then* load `index.bin`, apply,
+save. But the load is local file I/O against a different file than anything the
+network fetch touches, so it now runs on a scoped thread alongside
+`incremental_fetch` (scoped so the loader borrows `&idx_path` — no `Arc`). The
+~0.5–0.7 s load disappears entirely under the multi-second fetch; in the trace
+the `load` span sits on its own thread track starting at t≈0, overlapping the
+whole fetch. The post-fetch tail is now just `incremental_update` + `save` +
+`write_commit_graph` (~0.35 s total).
+
 ### Tooling (not perf, but part of the arc)
 - `gix-transport` http spans with curl CURLINFO timing (`90a0a85d3`),
   the `mark mappings` split-phase span (`d5b3ee00e`), and a `gix-ref`
@@ -199,10 +211,11 @@ Ordered roughly by expected payoff. None attempted yet.
   change but keeps semantics intact.
 
 - **`receive` side.** `write_to_directory` (pack index, ~1.3 s) is now a
-  meaningful share of the total — the commit-graph write itself is handled
-  (#10). Options for the pack index: push it off the critical path, or
-  overlap it with the index `save`/`load` (both gitaur-side, independent of
-  the gix internals).
+  meaningful share of the total — the commit-graph write (#10) and the index
+  load (#11) are handled. The pack index lives inside gix's `receive`, so
+  overlapping it from gitaur isn't possible without restructuring; the
+  remaining gitaur-side tail (`save`, ~0.25 s) is small enough that hiding it
+  under the now-cheap commit-graph write would save little.
 
 - **`mark mappings` `commit_ms` (~355 ms).** The `get_or_insert_commit`
   cutoff-date lookup per want. It's only *used* when at least one mapping
