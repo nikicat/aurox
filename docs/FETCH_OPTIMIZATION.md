@@ -110,10 +110,10 @@ that really are loose (preserving loose-over-packed precedence).
 ### 5. `gitaur`: write a commit-graph after each fetch
 `gitaur` · `a3788fd`
 
-Shells out to `git commit-graph write --reachable` after a fetch. This is a
-cost in its own right (the `git` span, ~1.3–3.4 s depending on load) but it's
-the enabler for #6: with a commit-graph present, commit metadata lookups
-become an mmap binary search instead of an ODB inflate.
+Shells out to `git commit-graph write --split` after a fetch. This is a cost in
+its own right (the `git` span) but it's the enabler for #6: with a commit-graph
+present, commit metadata lookups become an mmap binary search instead of an ODB
+inflate. See #10 for how the incremental path feeds it.
 
 ### 6. Resolve refs via the commit-graph in `mark_all_refs`
 `gix-protocol` · `c1386c33e`
@@ -152,6 +152,17 @@ result is a guaranteed `NoChangeNeeded` whose object is present by definition
 skipping the exists probe, peel, and ff-walk. `update_refs()` self
 ~1.17 s → ~0.61 s (`exists_ms` ~430 ms → ~75 ms).
 
+### 10. Feed the commit-graph the fetched tips instead of `--reachable`
+`gitaur` · `git.rs` / `mirror.rs`
+
+The post-fetch `git commit-graph write` ran `--reachable`, which re-walks all
+~155k refs every time just to discover the handful of new commits. The
+incremental fetch already knows them — they're the `new_oid`s in the
+`RefUpdate` vector. The incremental path now pipes those tips via
+`--stdin-commits`, so git graphs only their not-yet-graphed closure; the
+bootstrap and full-rebuild paths keep `--reachable` (no delta to feed). The
+`write_commit_graph` span dropped ~1.30 s → ~0.10 s on a 137-ref refresh.
+
 ### Tooling (not perf, but part of the arc)
 - `gix-transport` http spans with curl CURLINFO timing (`90a0a85d3`),
   the `mark mappings` split-phase span (`d5b3ee00e`), and a `gix-ref`
@@ -187,10 +198,11 @@ Ordered roughly by expected payoff. None attempted yet.
   against the packed-refs snapshot in one pass. This is a deeper `gix-ref`
   change but keeps semantics intact.
 
-- **`receive` / commit-graph write side.** `write_to_directory` (pack index,
-  ~0.7 s) and the `git commit-graph write` we trigger (~1.3 s+) are now a
-  meaningful share of the total. Options: write the commit-graph
-  incrementally, write it less often, or push the cost off the critical path.
+- **`receive` side.** `write_to_directory` (pack index, ~1.3 s) is now a
+  meaningful share of the total — the commit-graph write itself is handled
+  (#10). Options for the pack index: push it off the critical path, or
+  overlap it with the index `save`/`load` (both gitaur-side, independent of
+  the gix internals).
 
 - **`mark mappings` `commit_ms` (~355 ms).** The `get_or_insert_commit`
   cutoff-date lookup per want. It's only *used* when at least one mapping

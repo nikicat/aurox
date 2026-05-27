@@ -61,9 +61,13 @@ impl MirrorRepo {
     /// Refresh the mirror's commit-graph so the *next* fetch's negotiation can
     /// read commit times from an mmap'd file instead of inflating every commit
     /// from the pack (the dominant remaining cost of building the have-set).
+    ///
+    /// `new_commits` is forwarded to [`crate::git::write_commit_graph`]:
+    /// `Some(tips)` for an incremental fetch (only those tips' closure is
+    /// graphed), `None` for a fresh clone / full rebuild (walk every ref).
     /// Best-effort — see [`crate::git::write_commit_graph`].
-    pub fn write_commit_graph(&self) {
-        git::write_commit_graph(&self.path);
+    pub fn write_commit_graph(&self, new_commits: Option<&[gix::ObjectId]>) {
+        git::write_commit_graph(&self.path, new_commits);
     }
 }
 
@@ -95,7 +99,8 @@ pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
         index::save(&idx, &paths::index_path())?;
         ui::info("index built");
         // Seed the commit-graph so the first incremental `-Sy` negotiates fast.
-        mirror.write_commit_graph();
+        // Fresh clone: no delta, so walk every ref (`--reachable`).
+        mirror.write_commit_graph(None);
         return Ok(());
     }
 
@@ -129,8 +134,11 @@ pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
             index::update::incremental_update(&mirror, &updates, &mut idx)?;
             index::save(&idx, &idx_path)?;
             ui::note(&format!("{} ref(s) updated", updates.len()));
-            // New commits arrived; fold them into the commit-graph for next time.
-            mirror.write_commit_graph();
+            // New commits arrived; fold them into the commit-graph for next
+            // time. Feed just the fetched tips (`--stdin-commits`) so git
+            // graphs their closure instead of re-walking all ~155k refs.
+            let tips: Vec<gix::ObjectId> = updates.iter().filter_map(|u| u.new_oid).collect();
+            mirror.write_commit_graph(Some(&tips));
         }
         Some(_) => {
             // Nothing changed on the mirror, so the commit-graph is still current.
@@ -141,7 +149,8 @@ pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
             let idx = index::build::full_build(cfg, &mirror)?;
             index::save(&idx, &idx_path)?;
             ui::info("index built");
-            mirror.write_commit_graph();
+            // Full rebuild: graph the whole history (`--reachable`).
+            mirror.write_commit_graph(None);
         }
     }
     Ok(())

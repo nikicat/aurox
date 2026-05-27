@@ -9,10 +9,12 @@
 //! one place is what makes them uniformly observable.
 
 use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
+use gix::ObjectId;
 use tracing::{debug, field, info_span};
 
 use crate::error::{Error, Result};
@@ -29,6 +31,19 @@ use crate::error::{Error, Result};
 /// the subprocess wall time in the trace; the exit code is recorded on the span
 /// once known.
 pub fn run<I, S>(args: I, cwd: Option<&Path>) -> Result<Vec<u8>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_with_stdin(args, cwd, None)
+}
+
+/// As [`run`], but feed `stdin` to the subprocess (and close the pipe so git
+/// sees EOF). For commands like `commit-graph write --stdin-commits` that read
+/// a small payload from stdin and emit little on stdout — large stdin *and*
+/// large stdout together could deadlock this write-then-read sequence, but no
+/// such caller exists.
+fn run_with_stdin<I, S>(args: I, cwd: Option<&Path>, stdin: Option<&[u8]>) -> Result<Vec<u8>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -56,9 +71,26 @@ where
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }
-    let out = cmd
-        .output()
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    if stdin.is_some() {
+        cmd.stdin(Stdio::piped());
+    }
+    let mut child = cmd
+        .spawn()
         .map_err(|e| Error::other(format!("spawn git: {e}")))?;
+    if let Some(bytes) = stdin {
+        // `take()` drops the handle after the write, closing the pipe so git
+        // reaches EOF and stops reading.
+        child
+            .stdin
+            .take()
+            .expect("stdin piped above")
+            .write_all(bytes)
+            .map_err(|e| Error::other(format!("write git stdin: {e}")))?;
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| Error::other(format!("wait git: {e}")))?;
 
     span.record("exit_code", out.status.code().unwrap_or(-1));
     debug!(
@@ -85,22 +117,34 @@ where
 /// `--split` keeps each call incremental (only new commits are appended, with
 /// periodic auto-merge), so repeated `-Sy` runs stay cheap.
 ///
+/// `new_commits` selects how git discovers what to add:
+/// - `Some(oids)` → `--stdin-commits`: git ingests exactly those tips plus any
+///   ancestors not already graphed. On an incremental `-Sy` that touched a
+///   handful of refs this is the few-commit closure rather than a walk of all
+///   ~155k refs. Pass the fetched ref tips here.
+/// - `None` → `--reachable`: walk every ref. The right choice on a fresh clone
+///   or full rebuild, where there is no delta and the whole history is new.
+///
 /// Best-effort: the graph is a read accelerator (gix treats its absence as
 /// "no graph" and falls back to the ODB), so a failure here — an old `git`
 /// without `commit-graph`, a read-only store, etc. — is logged and swallowed
 /// rather than aborting the refresh.
-pub fn write_commit_graph(repo: &Path) {
+pub fn write_commit_graph(repo: &Path, new_commits: Option<&[ObjectId]>) {
     let _span = info_span!("write_commit_graph").entered();
-    if let Err(e) = run(
-        [
-            "commit-graph",
-            "write",
-            "--reachable",
-            "--split",
-            "--no-progress",
-        ],
-        Some(repo),
-    ) {
+    let mut args = vec!["commit-graph", "write", "--split", "--no-progress"];
+    let stdin = if let Some(oids) = new_commits {
+        args.push("--stdin-commits");
+        let mut buf = Vec::new();
+        for oid in oids {
+            buf.extend_from_slice(oid.to_hex().to_string().as_bytes());
+            buf.push(b'\n');
+        }
+        Some(buf)
+    } else {
+        args.push("--reachable");
+        None
+    };
+    if let Err(e) = run_with_stdin(args, Some(repo), stdin.as_deref()) {
         debug!(error = %e, "commit-graph write failed; continuing without it");
     }
 }
@@ -157,7 +201,7 @@ mod tests {
         let info = dir.path().join("objects").join("info");
         // Best-effort writer: on success it leaves either a single-file
         // `commit-graph` or a split `commit-graphs/` chain.
-        write_commit_graph(dir.path());
+        write_commit_graph(dir.path(), None);
         let single = info.join("commit-graph").exists();
         let split = info.join("commit-graphs").exists();
         assert!(
@@ -166,6 +210,23 @@ mod tests {
             info.display()
         );
         // And whatever was written must verify clean.
+        run(["commit-graph", "verify"], Some(dir.path())).unwrap();
+    }
+
+    #[test]
+    fn write_commit_graph_from_stdin_commits() {
+        let dir = repo_with_commits();
+        // Mirror the incremental `-Sy` path: hand the fetched tip oid to git via
+        // `--stdin-commits` instead of letting it walk every ref.
+        let head = run(["rev-parse", "refs/heads/main"], Some(dir.path())).unwrap();
+        let oid = ObjectId::from_hex(String::from_utf8(head).unwrap().trim().as_bytes()).unwrap();
+        write_commit_graph(dir.path(), Some(&[oid]));
+        let info = dir.path().join("objects").join("info");
+        assert!(
+            info.join("commit-graph").exists() || info.join("commit-graphs").exists(),
+            "expected a commit-graph under {}",
+            info.display()
+        );
         run(["commit-graph", "verify"], Some(dir.path())).unwrap();
     }
 }
