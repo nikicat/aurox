@@ -16,6 +16,12 @@ path = "src/lib.rs"
 name = "gitaur"
 path = "src/main.rs"
 
+# Dev/profiling helper: reads the per-run span traces in state_dir()/traces/
+# and answers "where did the time in span X go?" without a throwaway script.
+[[bin]]
+name = "gitaur-trace"
+path = "src/bin/trace.rs"
+
 [dependencies]
 # Pinned to nikicat/gitoxide#b-plus-c-integration for changes not yet in a
 # published gix release:

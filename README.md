@@ -84,6 +84,20 @@ The `logs/` files are always written at `debug` level regardless of console
 verbosity. `RUST_LOG` (e.g. `RUST_LOG=gitaur=debug`) raises only the *console*
 tracing level — it does not change what lands in `logs/`.
 
+The `traces/` files drop straight into [ui.perfetto.dev](https://ui.perfetto.dev),
+but the `gitaur-trace` helper answers "where did the time in span X go?" from the
+terminal without opening a browser. With no argument it reads the newest trace:
+
+```
+gitaur-trace                      # spans aggregated by total self time
+gitaur-trace tree                 # full per-thread containment tree
+gitaur-trace tree --span receive  # just the subtree(s) under `receive`
+gitaur-trace --min-ms 50 tree     # hide spans shorter than 50 ms
+```
+
+`self` time is each span's wall time minus its children — the un-instrumented
+cost that lives directly in that span. Pass `--file <path>` for a specific trace.
+
 ## How it differs from yay / paru
 
 - **No `aurweb` RPC.** All metadata comes from the GitHub mirror clone.
