@@ -33,6 +33,10 @@ path = "src/bin/trace.rs"
 #  - a gix-transport patch that wraps the curl worker's `perform()` in a
 #    `gix_http` "http request" span carrying curl's CURLINFO timing — the only
 #    place that timing is reachable (see src/logging/chrome.rs);
+#  - a gix-transport `http::Options::download_progress` byte counter the curl
+#    backend feeds per response-body chunk — the only live signal during the
+#    otherwise-silent v2 `ls-refs` advertisement (many MiB on the AUR mirror);
+#    drives the `network` throughput row (see src/ui/gix_progress.rs);
 #  - a `mark mappings` detail span in gix-protocol that splits
 #    `mark_complete_and_common_ref`'s per-mapping loop into `find_ms`
 #    (packed-ref lookup) vs `commit_ms` (ODB/commit-graph load) — the
@@ -62,7 +66,7 @@ path = "src/bin/trace.rs"
 #    per-ref loose `open()` — the dominant cost of applying the ref transaction
 #    (the `apply` span). Cuts that resolution on the AUR mirror from ~640ms to
 #    ~240ms (`apply` ~770ms to ~400ms); adds a `ref tx resolve` detail span.
-gix = { git = "https://github.com/nikicat/gitoxide", rev = "2d63be6b0", features = [
+gix = { git = "https://github.com/nikicat/gitoxide", rev = "2a625da5a", features = [
   # curl-rustls (over reqwest-rust-tls) so gix's low_speed_* / lowSpeedLimit
   # config actually fires — only the curl transport implements it, the
   # reqwest blocking transport silently ignores those fields. Adds libcurl

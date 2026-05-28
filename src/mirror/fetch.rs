@@ -32,6 +32,7 @@ pub struct RefUpdate {
 #[instrument(skip(cfg, mirror))]
 pub fn incremental_fetch(cfg: &Config, mirror: &MirrorRepo) -> Result<Vec<RefUpdate>> {
     let mut progress = GixProgress::new("fetch");
+    let net_counter = progress.net_counter();
     let interrupt = AtomicBool::new(false);
 
     let outcome = {
@@ -44,7 +45,7 @@ pub fn incremental_fetch(cfg: &Config, mirror: &MirrorRepo) -> Result<Vec<RefUpd
         let mut connection = remote
             .connect(Direction::Fetch)
             .map_err(|e| Error::Gix(format!("connect: {e}")))?;
-        connection.set_transport_options(boxed_http_options(cfg));
+        connection.set_transport_options(boxed_http_options(cfg, net_counter));
 
         let prepared = {
             let _span = info_span!("prepare_fetch").entered();

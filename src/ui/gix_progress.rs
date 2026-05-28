@@ -16,8 +16,10 @@ use gix::progress::prodash::progress::Step;
 use gix::progress::{Count as GixCount, Id, MessageLevel, Unit};
 use gix::{NestedProgress, Progress as GixProgressTrait};
 use indicatif::{MultiProgress, ProgressBar};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 /// Adapter implementing [`gix::Progress`] / [`gix::NestedProgress`] on top of
 /// our indicatif bars.
@@ -43,6 +45,76 @@ pub struct GixProgress {
 struct Shared {
     multi: MultiProgress,
     summary: ProgressBar,
+    /// Always-on wire-throughput row, fed by [`NetMeter`]'s pump thread.
+    net: NetMeter,
+}
+
+/// A persistent `network` byte bar plus the background thread that pumps it.
+///
+/// gix reports progress only for phases it drives itself (the pack receive);
+/// the v2 `ls-refs` advertisement — which on a 155k-ref mirror is ~11 MiB and
+/// can take minutes — is read inside gix with no progress callbacks at all. The
+/// bytes do flow through the curl backend, which adds each received chunk to
+/// `counter` (via `http::Options::download_progress`). Since the main thread is
+/// blocked in gix during that read and can't tick a bar, a dedicated thread
+/// samples `counter` into `bar` so the row shows live bytes + speed regardless
+/// of which phase is running.
+struct NetMeter {
+    /// Cumulative response-body bytes; shared with the curl backend.
+    counter: Arc<AtomicU64>,
+    /// The `network` row in the [`Shared::multi`].
+    bar: ProgressBar,
+    /// Set to stop the pump thread.
+    stop: Arc<AtomicBool>,
+    /// Pump handle; `take`n by the first [`NetMeter::stop_and_clear`].
+    handle: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl NetMeter {
+    /// Add the `network` row to `multi` and spawn the pump that mirrors
+    /// `counter` into it every ~120 ms.
+    fn spawn(multi: &MultiProgress) -> Self {
+        let counter = Arc::new(AtomicU64::new(0));
+        let bar = multi.add(bar_bytes_streaming("network"));
+        tick(&bar);
+        let stop = Arc::new(AtomicBool::new(false));
+        let handle = std::thread::spawn({
+            let counter = Arc::clone(&counter);
+            let bar = bar.clone();
+            let stop = Arc::clone(&stop);
+            move || {
+                while !stop.load(Ordering::Relaxed) {
+                    bar.set_position(counter.load(Ordering::Relaxed));
+                    std::thread::sleep(Duration::from_millis(120));
+                }
+            }
+        });
+        Self {
+            counter,
+            bar,
+            stop,
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
+    /// Stop the pump, join it, and clear the row. Idempotent: the handle is
+    /// taken once, so a later call (e.g. from `Drop`) is a no-op.
+    fn stop_and_clear(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        // Bind the `take` out of the guard first so the lock isn't held across
+        // the `join` (matches the leaf-clearing idiom in `finish`/`Drop`).
+        let handle = self.handle.lock().unwrap().take();
+        if let Some(h) = handle {
+            h.join().ok();
+        }
+        self.bar.finish_and_clear();
+    }
+}
+
+impl Drop for NetMeter {
+    fn drop(&mut self) {
+        self.stop_and_clear();
+    }
 }
 
 /// Detect a byte-unit by asking the unit to format its own label.
@@ -66,13 +138,25 @@ impl GixProgress {
         let summary = mp.add(bar_sideband(label));
         summary.set_message("starting…");
         tick(&summary);
+        let net = NetMeter::spawn(&mp);
         Self {
-            shared: Arc::new(Shared { multi: mp, summary }),
+            shared: Arc::new(Shared {
+                multi: mp,
+                summary,
+                net,
+            }),
             own_name: String::new(),
             own_unit_is_bytes: false,
             own_max: None,
             leaf: Mutex::new(None),
         }
+    }
+
+    /// The cumulative download-byte counter the curl backend should write to.
+    /// Hand this to `mirror::http_transport_options` so the `network` row
+    /// reflects live wire throughput.
+    pub fn net_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.net.counter)
     }
 
     /// Clear all live bars. Intended for end-of-clone cleanup.
@@ -81,6 +165,7 @@ impl GixProgress {
         if let Some(pb) = taken {
             pb.finish_and_clear();
         }
+        self.shared.net.stop_and_clear();
         self.shared.summary.finish_and_clear();
     }
 
@@ -371,5 +456,58 @@ impl NestedProgress for GixProgress {
 
     fn add_child_with_id(&mut self, name: impl Into<String>, _id: Id) -> Self::SubProgress {
         self.add_child(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// Wait (bounded) for the pump to mirror `counter` into `bar`. Returns the
+    /// observed position so callers can assert; bounded so a slow box can't
+    /// hang the suite if the pump is broken.
+    fn wait_for_position(bar: &ProgressBar, want: u64) -> u64 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while bar.position() != want && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        bar.position()
+    }
+
+    #[test]
+    fn net_counter_feeds_the_visible_bar() {
+        // The whole feature hinges on this seam: the counter handed to the curl
+        // backend (`net_counter`) is the one the pump mirrors into the row the
+        // user sees. Bytes written to it must surface on the bar.
+        let progress = GixProgress::new("test");
+        progress.net_counter().fetch_add(4096, Ordering::Relaxed);
+        assert_eq!(wait_for_position(&progress.shared.net.bar, 4096), 4096);
+        progress.finish();
+    }
+
+    #[test]
+    fn stop_and_clear_joins_and_is_idempotent() {
+        let meter = NetMeter::spawn(&MultiProgress::new());
+        meter.stop_and_clear();
+        assert!(
+            meter.handle.lock().unwrap().is_none(),
+            "pump handle should be taken+joined"
+        );
+        meter.stop_and_clear(); // second call must not panic / double-join
+    }
+
+    #[test]
+    fn dropping_a_child_keeps_the_pump_alive() {
+        // Children share the parent's `Shared` (and thus the one `NetMeter`);
+        // gix creates and drops child nodes per phase. A child's `Drop` must
+        // clear only its own leaf, never stop the shared pump — otherwise the
+        // network row would freeze after the first phase ends.
+        let mut root = GixProgress::new("test");
+        let counter = root.net_counter();
+        drop(root.add_child("phase"));
+        counter.fetch_add(2048, Ordering::Relaxed);
+        assert_eq!(wait_for_position(&root.shared.net.bar, 2048), 2048);
+        root.finish();
     }
 }
