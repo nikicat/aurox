@@ -131,10 +131,17 @@ fn unit_is_bytes(unit: &Unit) -> bool {
 }
 
 impl GixProgress {
-    /// Create a fresh adapter. Stages just the summary line; leaves spawn
-    /// lazily as gix children emit progress.
+    /// Create a fresh adapter with its own private `MultiProgress`. Stages just
+    /// the summary line; leaves spawn lazily as gix children emit progress.
     pub fn new(label: &str) -> Self {
-        let mp = MultiProgress::new();
+        Self::with_multi(label, MultiProgress::new())
+    }
+
+    /// Like [`new`](Self::new) but draws into a caller-supplied `MultiProgress`,
+    /// so the fetch's rows share one display with other concurrent progress
+    /// (e.g. the parallel official-repo db sync in `mirror::cmd_refresh`). Two
+    /// separate `MultiProgress` instances would fight over the terminal.
+    pub fn with_multi(label: &str, mp: MultiProgress) -> Self {
         let summary = mp.add(bar_sideband(label));
         summary.set_message("starting…");
         tick(&summary);

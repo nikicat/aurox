@@ -35,6 +35,12 @@ pub struct Config {
     pub privilege_escalator: String,
     /// Include VCS pkgs (`-git`/`-svn`/…) in `-Syu` by default.
     pub devel: bool,
+    /// On `-Sy`, also refresh the official-repo databases (rootless, in
+    /// parallel with the AUR mirror fetch) so `-Qu`/`-Syu` reflect the latest
+    /// pacman-repo versions without a privileged `pacman -Sy`. Set `false` if
+    /// you keep the system db current yourself and want `-Sy` to touch the AUR
+    /// mirror only.
+    pub check_repo_updates: bool,
     /// `prompt` | `skip` | `always-show` — PKGBUILD review default.
     pub review_default: String,
     /// Pre-check AUR rows in the interactive `-Syu` picker. `false` (default)

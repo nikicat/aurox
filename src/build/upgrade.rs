@@ -32,7 +32,9 @@ pub fn collect_upgrade_plan(cfg: &Config, devel: bool) -> Result<Vec<PkgUpgrade>
     if idx_path.exists() {
         let idx = index::load_or_resync(cfg, &idx_path)?;
         let by = Secondary::build(&idx);
-        let alpm = alpm_db::open()?;
+        // Same rootless-sync db as `query_repo_upgrades` so the AUR-vs-repo
+        // "foreign" split is computed against one consistent view.
+        let alpm = alpm_db::open_synced()?;
         let pac = PacmanIndex::build(&alpm);
         plan.extend(aur_upgrades(&idx, &by, &pac, devel));
     }

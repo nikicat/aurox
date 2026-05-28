@@ -7,6 +7,7 @@
 use gitaur::config::defaults::default_config;
 use gitaur::mirror::clone::bootstrap_clone;
 use gitaur::testing::git;
+use indicatif::MultiProgress;
 use tempfile::TempDir;
 
 #[test]
@@ -42,7 +43,7 @@ fn bootstrap_clone_lands_refs_under_refs_heads() {
     // Point gitaur at the bare and run the real bootstrap path.
     let mut cfg = default_config();
     cfg.mirror_url = format!("file://{}", bare.display());
-    bootstrap_clone(&cfg, &dest).expect("bootstrap_clone");
+    bootstrap_clone(&cfg, &dest, &MultiProgress::new()).expect("bootstrap_clone");
 
     // Collect every ref under both candidate roots.
     let repo = gix::open(&dest).expect("open dest");

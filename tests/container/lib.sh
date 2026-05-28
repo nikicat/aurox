@@ -35,6 +35,11 @@ bootstrap() {
     cat > "$CONFIG_DIR/config.toml" <<EOF
 # Point gitaur at the on-disk fake mirror instead of github.com/archlinux/aur.
 mirror_url = "file://$MOCK_AUR"
+# The image's /etc/pacman.conf carries the real [core]/[extra]; leaving the
+# rootless official-repo sync on would make every refresh smoke hit the network,
+# breaking the suite's no-network guarantee. Off by default; the dedicated
+# rootless-sync smoke flips it back on against a hermetic local-repo-only config.
+check_repo_updates = false
 EOF
 }
 

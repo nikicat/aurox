@@ -8,16 +8,20 @@ use crate::error::{Error, Result};
 use crate::mirror::http_transport_options;
 use crate::ui;
 use gix::remote::Direction;
+use indicatif::MultiProgress;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use tracing::{info, instrument};
 
 /// Bare-clone the configured mirror URL into `dest`, with a live progress UI.
-#[instrument(skip(cfg))]
-pub fn bootstrap_clone(cfg: &Config, dest: &Path) -> Result<()> {
+///
+/// Draws into the caller-owned `mp` so the clone rows share one display with
+/// the parallel official-repo db sync (see [`crate::mirror::cmd_refresh`]).
+#[instrument(skip(cfg, mp))]
+pub fn bootstrap_clone(cfg: &Config, dest: &Path, mp: &MultiProgress) -> Result<()> {
     info!(url = %cfg.mirror_url, dest = %dest.display(), "gix clone --bare");
 
-    let mut progress = ui::GixProgress::new("clone");
+    let mut progress = ui::GixProgress::with_multi("clone", mp.clone());
     let net_counter = progress.net_counter();
     let interrupt = AtomicBool::new(false);
 

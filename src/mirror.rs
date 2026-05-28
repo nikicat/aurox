@@ -9,9 +9,11 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::git;
 use crate::index;
+use crate::pacman::sync::{self, SyncOutcome};
 use crate::paths;
 use crate::ui;
 use gix::protocol::transport::client::blocking_io::http;
+use indicatif::MultiProgress;
 use std::any::Any;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,13 +123,55 @@ fn loose_branch_ref_count(path: &Path) -> usize {
     n
 }
 
-/// Fetch mirror updates and incrementally refresh the on-disk index.
+/// Refresh gitaur's databases: the AUR mirror always, and — unless
+/// [`Config::check_repo_updates`] is off — the official-repo sync DBs in
+/// parallel.
 ///
-/// `force_reclone` (set by `gaur -Syy`) blows away the existing bare clone
-/// and re-bootstraps from scratch, regardless of whether the current clone
-/// looks healthy. Use when the on-disk repo is suspected to be corrupted or
-/// when you want a clean baseline.
+/// Both halves draw into one shared [`MultiProgress`] so the AUR fetch rows and
+/// the per-repo db-download rows line up in a single display. The repo sync is
+/// best-effort: a failure there is reported as a warning and never fails the
+/// AUR refresh (whose result is what this returns).
+///
+/// `force_reclone` (set by `gaur -Syy`) blows away the existing bare clone and
+/// re-bootstraps from scratch, regardless of whether the current clone looks
+/// healthy. Use when the on-disk repo is suspected corrupted or you want a
+/// clean baseline.
 pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
+    let mp = MultiProgress::new();
+    let aur = if cfg.check_repo_updates {
+        // Scoped thread: the official-repo db sync (libalpm download) overlaps
+        // the network-bound AUR fetch. It borrows `cfg`/`mp` for the scope and
+        // draws its own rows into the shared display.
+        std::thread::scope(|s| {
+            let repo = s.spawn(|| sync::refresh_sync_db(&mp));
+            let aur = refresh_aur_mirror(cfg, force_reclone, &mp);
+            report_repo_sync(repo.join());
+            aur
+        })
+    } else {
+        refresh_aur_mirror(cfg, force_reclone, &mp)
+    };
+    // Backstop: wipe any progress rows a mid-download error may have left
+    // (each row normally clears itself on completion).
+    mp.clear().ok();
+    aur
+}
+
+/// Surface the parallel repo-db sync's outcome once the shared progress display
+/// is torn down. Best-effort — every failure mode is a warning, never fatal.
+fn report_repo_sync(joined: std::thread::Result<Result<SyncOutcome>>) {
+    match joined {
+        Ok(Ok(SyncOutcome::Refreshed)) => ui::note("official package databases refreshed"),
+        Ok(Ok(SyncOutcome::AlreadyCurrent)) => ui::note("official package databases up to date"),
+        Ok(Err(e)) => ui::warn(&format!("official-repo refresh failed: {e}")),
+        Err(_) => ui::warn("official-repo refresh thread panicked"),
+    }
+}
+
+/// Fetch AUR mirror updates and incrementally refresh the on-disk index,
+/// drawing progress into the shared `mp`. See [`cmd_refresh`] for the
+/// `force_reclone` semantics.
+fn refresh_aur_mirror(cfg: &Config, force_reclone: bool, mp: &MultiProgress) -> Result<()> {
     let path = paths::aur_repo_path();
 
     if force_reclone && path.exists() {
@@ -142,7 +186,7 @@ pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
         } else if !force_reclone {
             ui::info("first run: cloning AUR mirror (this takes a few minutes)");
         }
-        clone::bootstrap_clone(cfg, &path)?;
+        clone::bootstrap_clone(cfg, &path, mp)?;
         ui::info("building index");
         let mirror = MirrorRepo::open(&path)?;
         let idx = index::build::full_build(cfg, &mirror)?;
@@ -186,7 +230,7 @@ pub fn cmd_refresh(cfg: &Config, force_reclone: bool) -> Result<()> {
                 }
             }
         });
-        let updates = fetch::incremental_fetch(cfg, &mirror)?;
+        let updates = fetch::incremental_fetch(cfg, &mirror, mp)?;
         let existing = loader.join().expect("index loader thread panicked");
         Ok::<_, Error>((updates, existing))
     })?;

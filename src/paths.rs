@@ -51,6 +51,15 @@ pub fn index_path() -> PathBuf {
     state_dir().join("index.bin")
 }
 
+/// Private pacman dbpath for gitaur's rootless official-repo db sync.
+///
+/// See [`crate::pacman::sync`]. Holds a `sync/` dir of downloaded repo DBs and a
+/// `local` symlink to the system localdb, so libalpm reads the real
+/// installed-package set while available versions come from gitaur's own fetch.
+pub fn sync_db_path() -> PathBuf {
+    state_dir().join("syncdb")
+}
+
 /// Path to `config.toml`.
 pub fn config_path() -> PathBuf {
     config_dir().join("config.toml")

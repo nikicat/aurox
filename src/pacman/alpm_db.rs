@@ -5,6 +5,7 @@
 //! owned hash structures, making subsequent lookups pure data — Sync, cheap,
 //! and parallelisable.
 
+use super::sync;
 use crate::error::{Error, Result};
 use crate::index::schema::IndexEntry;
 use crate::index::secondary::strip_version_constraint;
@@ -12,7 +13,14 @@ use crate::names::PkgName;
 use crate::version::{Ver, Version};
 use alpm::Alpm;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use tracing::{debug, instrument};
+
+/// Parse the host's `pacman.conf` (via `pacman-conf`). Shared by every
+/// alpm-handle builder so the config is read one consistent way.
+fn load_pacman_conf() -> Result<pacmanconf::Config> {
+    pacmanconf::Config::new().map_err(|e| Error::other(format!("read pacman.conf: {e}")))
+}
 
 /// What the user currently has installed that this AUR entry will displace.
 ///
@@ -117,8 +125,55 @@ pub fn search_sync(terms: &[String]) -> Result<Vec<RepoHit>> {
 /// state, not alpm state. We parse the config and let `alpm-utils` register
 /// every `[repo]` section.
 pub fn open() -> Result<Alpm> {
-    let conf =
-        pacmanconf::Config::new().map_err(|e| Error::other(format!("read pacman.conf: {e}")))?;
+    build_alpm(None, None)
+}
+
+/// Like [`open`], but reading sync repos from gitaur's rootless sync db.
+///
+/// When that db has been populated (see [`crate::pacman::sync::refresh_sync_db`]),
+/// upgrade checks reflect the just-fetched official-repo versions without a
+/// privileged `pacman -Sy`. Installed-package reads are identical either way —
+/// the private dbpath's `local` is a symlink to the system one.
+///
+/// Falls back to [`open`] (system dbpath) until the first successful refresh,
+/// and is deliberately *not* used on the install path: `pacman -S` runs against
+/// the system db, so resolving installs against a fresher store could plan a
+/// version pacman wouldn't yet have.
+pub fn open_synced() -> Result<Alpm> {
+    build_alpm(sync::synced_db_path().as_deref(), None)
+}
+
+/// Open a handle aimed at gitaur's private dbpath for a *write* (the rootless
+/// `syncdbs().update()`), used by [`sync::refresh_sync_db`].
+///
+/// The logfile is redirected to `/dev/null`: a sync-db update may `logaction`,
+/// and the system log (`/var/log/pacman.log`) is root-owned — writing it as a
+/// normal user would fail. We want the download, not an audit line.
+pub(crate) fn open_at_for_refresh(db: &Path) -> Result<Alpm> {
+    build_alpm(Some(db), Some(Path::new("/dev/null")))
+}
+
+/// The system pacman dbpath — the effective `DBPath`, read via `pacman-conf`
+/// (so a `pacman.conf` override is honored, falling back to pacman's own
+/// compiled default). We don't guess a path if the lookup fails: a wrong value
+/// would symlink `local` to the wrong store and silently corrupt the upgrade
+/// check, so the error propagates and the refresh degrades to a warning.
+pub(crate) fn system_db_path() -> Result<PathBuf> {
+    Ok(PathBuf::from(load_pacman_conf()?.db_path))
+}
+
+/// Open alpm with sync repos from `pacman.conf`, optionally overriding the
+/// dbpath and/or logfile. `dbpath = None` uses the system dbpath; `Some(db)`
+/// points at a private store (whose `local` must resolve to a real localdb).
+fn build_alpm(dbpath: Option<&Path>, logfile: Option<&Path>) -> Result<Alpm> {
+    let mut conf = load_pacman_conf()?;
+    if let Some(db) = dbpath {
+        debug!(dbpath = %db.display(), "alpm reading sync repos from gitaur's rootless db");
+        conf.db_path = db.to_string_lossy().into_owned();
+    }
+    if let Some(lf) = logfile {
+        conf.log_file = lf.to_string_lossy().into_owned();
+    }
     alpm_utils::alpm_with_conf(&conf).map_err(|e| Error::other(format!("open alpm with conf: {e}")))
 }
 

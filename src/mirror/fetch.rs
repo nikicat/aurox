@@ -13,6 +13,7 @@ use gix::refs::TargetRef;
 use gix::remote::fetch::refs::update::{Mode, Outcome as UpdateOutcome};
 use gix::remote::fetch::{Status, refmap::Mapping};
 use gix::remote::{Direction, ref_map::Options as RefMapOptions};
+use indicatif::MultiProgress;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 use tracing::{debug, info, info_span, instrument};
@@ -29,9 +30,16 @@ pub struct RefUpdate {
 }
 
 /// Fetch `refs/heads/*` from the mirror remote and collect [`RefUpdate`]s.
-#[instrument(skip(cfg, mirror))]
-pub fn incremental_fetch(cfg: &Config, mirror: &MirrorRepo) -> Result<Vec<RefUpdate>> {
-    let mut progress = GixProgress::new("fetch");
+///
+/// Draws into the caller-owned `mp` so the fetch rows share one display with
+/// the parallel official-repo db sync (see [`crate::mirror::cmd_refresh`]).
+#[instrument(skip(cfg, mirror, mp))]
+pub fn incremental_fetch(
+    cfg: &Config,
+    mirror: &MirrorRepo,
+    mp: &MultiProgress,
+) -> Result<Vec<RefUpdate>> {
+    let mut progress = GixProgress::with_multi("fetch", mp.clone());
     let net_counter = progress.net_counter();
     let interrupt = AtomicBool::new(false);
 

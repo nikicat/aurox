@@ -36,7 +36,10 @@ pub struct PkgUpgrade {
 /// (foreign / AUR) are skipped here — they go through [`crate::build`].
 #[instrument]
 pub fn query_repo_upgrades() -> Result<Vec<PkgUpgrade>> {
-    let alpm = alpm_db::open()?;
+    // Read available versions from gitaur's rootless sync db when it's been
+    // refreshed (`-Sy`), so the upgrade list reflects the latest repos without
+    // a privileged `pacman -Sy`. Falls back to the system db otherwise.
+    let alpm = alpm_db::open_synced()?;
     let mut upgrades = Vec::new();
     for ipkg in alpm.localdb().pkgs() {
         for db in alpm.syncdbs() {

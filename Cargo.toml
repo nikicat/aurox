@@ -141,6 +141,9 @@ portable-pty = "0.9"
 tempfile = "3"
 nix = { version = "0.31", features = ["resource"] }
 vt100 = "0.16"
+# Integration tests that drive `bootstrap_clone` need to hand it a
+# `MultiProgress`; it's already a normal dep, so cargo unifies the version.
+indicatif = "0.18"
 
 [profile.release]
 lto = "thin"

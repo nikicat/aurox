@@ -20,6 +20,7 @@ pub fn default_config() -> Config {
         makepkg_args: vec!["-d".into(), "--noconfirm".into(), "--needed".into()],
         privilege_escalator: "sudo".into(),
         devel: false,
+        check_repo_updates: true,
         review_default: "prompt".into(),
         aur_default_select: false,
         // 256 covers ~2 years of dotnet-core-7.0-bin-shaped pkgs (~10
