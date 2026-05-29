@@ -42,11 +42,11 @@ fn main() {
         cmd.env(k, v);
     }
     cmd.env("TERM", "xterm-256color");
-    // Tracing logs share this PTY with the UI (the console layer writes to
-    // stderr). The loop's UI is `ui::*`/eprintln and prints regardless, so cap
-    // tracing at `warn` to keep info-level chatter from scrolling the rows we
-    // assert on off the screen — the test stays deterministic in log volume.
-    cmd.env("RUST_LOG", "warn");
+    // The test image's Dockerfile sets `RUST_LOG=off` so the console tracing
+    // layer doesn't share this PTY with the UI we assert on (a stray WARN
+    // floods the screen). All assertable output comes from `ui::*` eprintlns
+    // which run regardless of the tracing filter; the file log layer keeps
+    // every event for post-mortem.
 
     let mut child = pty.slave.spawn_command(cmd).expect("spawn gaur");
     drop(pty.slave);
@@ -62,10 +62,24 @@ fn main() {
     });
     send(&mut writer, b"\r"); // confirm the (default-checked repo) selection
 
-    // 2. Change-set preview, then its confirm gate.
+    // 2. Change-set preview, then its confirm gate. The batch total must be a
+    //    real nonzero figure: a `total  0 B` is the smoking gun of the stale-
+    //    syncdb size bug (`extended/05_loop_size_from_synced_db.sh`), where the
+    //    buggy code reads `download_size()` from the system syncdb whose
+    //    installed-version archive sits in the pacman cache → 0. The anchored
+    //    `total  0 B` substring distinguishes that from any real nonzero total
+    //    (`total  812 B`, `total  1.50 KiB`, …) without the
+    //    `"500 B".contains("0 B")` footgun a bare `0 B` check would hit.
     expect(&mut parser, &rx, "change-set preview + confirm", |s| {
         s.contains("this batch") && s.contains("Proceed with this batch")
     });
+    let screen = parser.screen().contents();
+    assert!(
+        !screen.contains("total  0 B"),
+        "change-set total is `0 B` — preview sizes look stale (read from the \
+         system syncdb whose installed-version archive is cached) rather than \
+         the freshly synced db's new version\n--- screen ---\n{screen}\n--- end ---"
+    );
     send(&mut writer, b"\r"); // accept (default Y)
 
     // 3. Sudo escalation gate for `pacman -Syu`.

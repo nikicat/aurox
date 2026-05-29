@@ -61,7 +61,13 @@ RUN printf '\n[local-repo]\nSigLevel = Optional TrustAll\nServer = file:///srv/l
 
 USER builder
 WORKDIR /work
+# `RUST_LOG=off` mutes the console tracing layer by default — the suite's shell
+# assertions grep `ui::*` (eprintln) output only, and the PTY-driven loop test
+# can't tolerate stray WARN lines scrolling the picker off the screen. The
+# unconditional file-log layer (`state_dir()/logs/gitaur-*.log` at debug) still
+# captures everything for post-mortem; an individual test can re-export
+# `RUST_LOG=…` if it specifically wants tracing on stderr.
 ENV CARGO_TARGET_DIR=/tmp/target \
-    RUST_LOG=gitaur=info
+    RUST_LOG=off
 
 CMD ["bash"]
