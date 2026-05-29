@@ -269,6 +269,17 @@ impl RowAnnotations {
         self.reviewed.insert(name);
     }
 
+    /// The badge status overlaid on `name`, if any. Lets the loop's tests
+    /// verify the failed/interrupted/skipped wiring without rendering.
+    pub fn status_of(&self, name: &PkgName) -> Option<RowStatus> {
+        self.status.get(name).copied()
+    }
+
+    /// Whether `name` is flagged reviewed.
+    pub fn is_reviewed(&self, name: &PkgName) -> bool {
+        self.reviewed.contains(name)
+    }
+
     /// The [`Badge`] for one row — its session status (if any) plus whether its
     /// PKGBUILD was already reviewed. Empty for repo rows and for AUR rows the
     /// loop hasn't touched yet.

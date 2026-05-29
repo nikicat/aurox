@@ -56,9 +56,10 @@ fi
 # the orchestrator has already produced an instrumented binary, so we skip.
 if [[ -z "$coverage_dir" ]]; then
     # `tarpit` is the HTTP-stall example used by the idle-timeout test in
-    # extended/. Building it alongside gaur is cheap and keeps the test
-    # script container-side (no host cargo inside the container).
-    ( cd "$REPO_ROOT" && cargo build --bin gaur --example tarpit )
+    # extended/; `upgrade_loop_e2e` is the PTY driver for the upgrade-loop test.
+    # Building them alongside gaur is cheap and keeps the tests container-side
+    # (no host cargo inside the container).
+    ( cd "$REPO_ROOT" && cargo build --bin gaur --example tarpit --example upgrade_loop_e2e )
 else
     mkdir -p "$coverage_dir"
 fi

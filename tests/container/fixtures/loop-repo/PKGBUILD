@@ -1,0 +1,14 @@
+# Official-repo fixture for the upgrade-loop e2e (extended/04). Baked into the
+# local sync DB at 2.0; the test installs a locally-built 1.0 first so the loop
+# sees a pending repo upgrade to drive through the picker, change-set preview,
+# and `pacman -Syu`.
+pkgname=loop-repo
+pkgver=2.0
+pkgrel=1
+pkgdesc='gitaur test fixture: a repo package the upgrade loop can upgrade'
+arch=('any')
+license=('MIT')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}
