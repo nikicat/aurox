@@ -8,6 +8,7 @@
 //! `docs/UPDATE_LOOP.md` for the full design.
 
 use super::dispatch;
+use crate::build::metrics::MetricsStore;
 use crate::build::{
     self, BuildFailure, ConfirmGate, InstallOpts, RunReport, Target, UpgradeSession,
 };
@@ -17,10 +18,11 @@ use crate::mirror;
 use crate::names::{PkgBase, PkgName};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
+use crate::paths;
 use crate::resolver::Plan;
-use crate::ui::{self, RowAnnotations, RowStatus, UpgradeSelection};
+use crate::ui::{self, PreviewMetrics, RowAnnotations, RowStatus, UpgradeSelection};
 use std::collections::{HashMap, HashSet};
-use tracing::{info, instrument};
+use tracing::{info, instrument, warn};
 
 /// Cross-batch state the loop carries for the whole session. None of it is
 /// persisted to disk — restarting `gaur` starts fresh. Keyed by [`PkgBase`]
@@ -226,7 +228,8 @@ impl LoopEnv for RealEnv<'_> {
         // still holds the installed versions, whose cached archives make
         // `download_size()` report a misleading `0 B`.
         let size_pac = synced_pac()?;
-        preview(candidates, sel, resolved.as_ref(), &size_pac);
+        let metrics = preview_metrics(self.session, sel, resolved.as_ref());
+        preview(candidates, sel, resolved.as_ref(), &size_pac, &metrics);
         if !ui::confirm("Proceed with this batch?", false)
             .map_err(|e| Error::other(format!("confirm: {e}")))?
         {
@@ -309,12 +312,13 @@ fn resolve_aur(
 
 /// Render the change-set preview: the selected root upgrades (repo + AUR) plus
 /// the dependencies the AUR builds pull in, with per-row and total sizes read
-/// from `pac`.
+/// from `pac` and per-AUR-row build-time figures read from `metrics`.
 fn preview(
     candidates: &[PkgUpgrade],
     sel: &UpgradeSelection,
     resolved: Option<&Plan>,
     pac: &PacmanIndex,
+    metrics: &PreviewMetrics,
 ) {
     // Roots: repo upgrades the user selected (look up their versions in the
     // candidate list) plus the AUR upgrades, which already carry versions.
@@ -344,7 +348,91 @@ fn preview(
             (repo_deps, aur_deps)
         }
     };
-    ui::change_set_table(&roots, &repo_deps, &aur_deps, pac);
+    ui::change_set_table(&roots, &repo_deps, &aur_deps, pac, metrics);
+}
+
+/// How old a recorded build duration may be before the change-set preview
+/// dims it. Build flows change as compilers, libs, and ccache state move on,
+/// so a measurement from months ago becomes a shaky predictor of "how long
+/// will the rebuild take?". 90 days is a hand-picked balance — long enough to
+/// cover the natural cadence of routine rebuilds, short enough that anything
+/// older deserves the dim/"trust this less" affordance.
+const STALE_METRIC_AGE_SECS: u64 = 90 * 24 * 3_600;
+
+/// Build the per-row build-time overlay for the change-set preview from the
+/// cross-session metrics store. Returns an empty overlay on any failure (open
+/// or per-pkgbase lookup): the preview then renders `~?` for every AUR row,
+/// which is correct (no measurement available) and never blocks the batch.
+///
+/// `stale` is populated from the recorded `built_at_ms` — a row older than
+/// [`STALE_METRIC_AGE_SECS`] gets dimmed in the preview. Using the metric's
+/// own timestamp (not the localdb install date) is the source-of-truth answer
+/// to "when was this prediction's data captured?" — they're usually close, but
+/// the metric timestamp survives reinstalls that move localdb's install date
+/// forward without re-measuring the build.
+fn preview_metrics(
+    session: &UpgradeSession,
+    sel: &UpgradeSelection,
+    resolved: Option<&Plan>,
+) -> PreviewMetrics {
+    let store = match MetricsStore::open(&paths::metrics_db_path()) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "open metrics store for preview; skipping build-time column");
+            return PreviewMetrics::empty();
+        }
+    };
+
+    let mut out = PreviewMetrics::empty();
+    let now = std::time::SystemTime::now();
+
+    // AUR roots: map pkgname → pkgbase → recorded measurement. The picker
+    // hands us pkgnames, so the overlay is keyed by pkgname; the store is
+    // keyed by pkgbase.
+    for u in &sel.aur {
+        let Some(pb) = session.pkgbase_of(&u.name) else {
+            continue;
+        };
+        match store.latest_build(pb) {
+            Ok(Some(rec)) => {
+                out.root_build_secs.insert(u.name.clone(), rec.build_secs);
+                // Mark the row stale when the measurement is older than the
+                // threshold; clock-skew failures fall through to "not stale"
+                // — better to under-dim than to wrongly disparage a fresh
+                // figure on a broken clock.
+                if rec.age(now).is_ok_and(|a| a >= STALE_METRIC_AGE_SECS) {
+                    out.stale.insert(u.name.clone());
+                }
+            }
+            Ok(None) => {}
+            Err(e) => warn!(error = %e, pkgbase = %pb, "lookup AUR root build time"),
+        }
+    }
+
+    // AUR build deps: pkgbases directly. The resolver's `aur_strata` is the
+    // full closure; subtract `direct_aur` to leave only the pulled-in deps.
+    // Dep cells aren't dimmed today — they're rare and the preview lacks
+    // visible weight for indented rows to lose.
+    if let Some(plan) = resolved {
+        let roots_set: HashSet<&PkgBase> = plan.direct_aur.iter().collect();
+        let dep_pkgbases: Vec<&PkgBase> = plan
+            .aur_strata
+            .iter()
+            .flatten()
+            .filter(|pb| !roots_set.contains(pb))
+            .collect();
+        match store.latest_build_many(dep_pkgbases.iter().copied()) {
+            Ok(map) => {
+                out.dep_build_secs = map
+                    .into_iter()
+                    .map(|(pb, rec)| (pb, rec.build_secs))
+                    .collect();
+            }
+            Err(e) => warn!(error = %e, "bulk lookup AUR dep build times"),
+        }
+    }
+
+    out
 }
 
 #[cfg(test)]

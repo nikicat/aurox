@@ -11,11 +11,13 @@
 //!
 //! Splitting the two lets callers `set_message` without clobbering the label.
 
+mod change_set;
 mod gix_progress;
 mod progress;
 mod prompts;
 mod tables;
 
+pub use change_set::{PreviewMetrics, change_set_table};
 pub use gix_progress::GixProgress;
 pub use progress::{
     TICK_PERIOD, bar_bytes, bar_bytes_streaming, bar_count, bar_sideband, promote_byte_bar,
@@ -23,8 +25,8 @@ pub use progress::{
 };
 pub use prompts::{confirm, select_pkgnames};
 pub use tables::{
-    RowAnnotations, RowStatus, UpgradeSelection, change_set_table, install_table, pkg_list,
-    select_upgrades, upgrade_table,
+    RowAnnotations, RowStatus, UpgradeSelection, install_table, pkg_list, select_upgrades,
+    upgrade_table,
 };
 
 use console::{Term, style};
@@ -196,6 +198,26 @@ pub fn human_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{size:.2} {}", UNITS[unit])
+    }
+}
+
+/// Format a wall-clock duration as the change-set preview shows it: `42s`,
+/// `3m 17s`, `2h 8m`.
+///
+/// Two units max (the leading non-zero plus the next down) — enough
+/// resolution for "is this a quick rebuild or an evening's worth of compile
+/// time?" without precision noise. Sub-second figures are not meaningful for
+/// builds (makepkg's own setup is ~1 s) so floors at `0s`.
+pub fn human_duration(seconds: u64) -> String {
+    let h = seconds / 3600;
+    let m = (seconds % 3600) / 60;
+    let s = seconds % 60;
+    if h > 0 {
+        format!("{h}h {m}m")
+    } else if m > 0 {
+        format!("{m}m {s}s")
+    } else {
+        format!("{s}s")
     }
 }
 

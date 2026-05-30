@@ -23,10 +23,12 @@ use crate::ui;
 use crate::version::Version;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::time::Instant;
 use tracing::{debug, info, instrument, warn};
 
 pub mod install;
 pub mod makepkg;
+pub mod metrics;
 pub mod print;
 pub mod review;
 pub mod upgrade;
@@ -725,7 +727,9 @@ fn prepare_one<'a>(
 #[instrument(skip(cfg, prep), fields(pkgbase = %prep.pkgbase, version = %prep.new_ver))]
 fn run_build(cfg: &Config, prep: &Prep<'_>) -> Result<Vec<PathBuf>> {
     ui::step(&format!("makepkg {}", prep.pkgbase));
+    let started = Instant::now();
     makepkg::run(cfg, &prep.wt.path)?;
+    let build_secs = started.elapsed().as_secs();
 
     let produced = install::find_produced(&prep.wt.path)?;
     let outputs = select_outputs(&produced, &prep.required, &prep.new_ver);
@@ -739,9 +743,30 @@ fn run_build(cfg: &Config, prep: &Prep<'_>) -> Result<Vec<PathBuf>> {
         pkgbase = %prep.pkgbase,
         version = %prep.new_ver,
         files = outputs.len(),
+        build_secs,
         "build complete"
     );
+    // Append the timing to the cross-session store. Failures are non-fatal:
+    // the package built fine and is on disk; only the cost-visibility hint is
+    // lost, and the next successful build will record again.
+    record_build_metric(prep.pkgbase, build_secs);
     Ok(outputs)
+}
+
+/// Append `pkgbase`'s build duration to the metrics store. Errors are logged
+/// and swallowed — see `run_build` for the rationale.
+fn record_build_metric(pkgbase: &PkgBase, build_secs: u64) {
+    let path = paths::metrics_db_path();
+    let store = match metrics::MetricsStore::open(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, path = %path.display(), "open metrics store");
+            return;
+        }
+    };
+    if let Err(e) = store.record_build(pkgbase, build_secs) {
+        warn!(error = %e, %pkgbase, "record build duration");
+    }
 }
 
 /// Keep only `.pkg.tar.{zst,xz}` whose `(pkgname, version)` matches one of

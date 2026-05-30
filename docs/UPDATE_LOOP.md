@@ -1,14 +1,18 @@
 # Update loop, change-set preview & build-cost estimates (design)
 
-Status: **phases 1–2 implemented; phases 3–4 pending.** The no-arg `gaur` loop,
+Status: **phases 1–3 implemented; phase 4 pending.** The no-arg `gaur` loop,
 session state, reviewed-set gating, picker badges, change-set preview, and
 SIGINT-during-build → bail-to-table now live in `src/cli/upgrade_loop.rs` +
 `src/build/makepkg.rs` (backed by `build::UpgradeSession` and the
 `build::resolve_targets` / `build::apply_plan` split). Phase 2 added the
 per-row size column + batch total on the change-set preview, reading from the
 pacman DBs with no store (`PacmanIndex::{installed_size, sync_download_size}` +
-`ui::human_bytes`). Phases 3–4 (build-time metric, custom picker) are not
-started. The single-shot `-Syu` flow remains `dispatch::handle_s` in
+`ui::human_bytes`). Phase 3 added the build-time column + batch total, backed
+by `build::metrics::MetricsStore` (`rusqlite` over `state_dir()/metrics.db`)
+and a `built_at_ms`-based staleness dim — see `src/build/metrics.rs` and the
+new `src/ui/change_set.rs` module (the change-set preview was split out of
+`src/ui/tables.rs` when it grew its own type cluster). Phase 4 (custom picker)
+is not started. The single-shot `-Syu` flow remains `dispatch::handle_s` in
 `src/cli/dispatch.rs`.
 
 ## Problem
@@ -349,28 +353,51 @@ Imprecision is accepted by decision: installed≠download size, and a manually
 installed package may differ from what gitaur would build. The number is a
 hint, not a contract.
 
-### Build time — the one stored metric (later phase)
+### Build time — the one stored metric — DONE
 
 Build duration is the only cost that cannot be read back from any pacman DB or
-artifact. When build-time tracking lands:
+artifact, so phase 3 introduced a small SQLite store at
+`state_dir()/metrics.db` (`paths::metrics_db_path` + `rusqlite` with
+`features = ["bundled"]`).
 
-- Store `state_dir()/metrics.db` (new `paths::metrics_db_path()`, `rusqlite`):
+**Schema** — append-only history rather than the upsert the design first
+sketched:
 
-  ```sql
-  CREATE TABLE IF NOT EXISTS build_metrics (
-      pkgbase    TEXT PRIMARY KEY,
-      build_secs INTEGER NOT NULL
-  );
-  ```
+```sql
+CREATE TABLE IF NOT EXISTS build_metrics (
+    pkgbase     TEXT NOT NULL,
+    build_secs  INTEGER NOT NULL,
+    built_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_build_metrics_pkgbase_built_at
+    ON build_metrics(pkgbase, built_at_ms DESC);
+```
 
-  That's the whole schema. The version/date context for staleness is *also*
-  deducible from localdb (the install date ≈ when it was last built), so it
-  isn't duplicated here. A `source_dl_bytes` column can be added later if the
-  source-download figure (cuda's cold-cache GiB) proves worth measuring
-  separately from installed size.
-- Capture by wrapping the `makepkg::run` call in `run_build`
-  (`src/build.rs:560`) with an `Instant`; upsert on success. The `Cached`
-  disposition (`src/build.rs:515`) skips the build and leaves the row intact.
+Switched away from the original `pkgbase PRIMARY KEY` because the history is
+cheap to keep and unblocks future aggregation (median, recent-weighted mean,
+drift detection) without a migration. `built_at_ms` is Unix-epoch
+*milliseconds* so two builds in the same wall second still order; `ROWID DESC`
+is the secondary tie-breaker. The read path takes the latest row via
+`MetricsStore::latest_build{,_many}` — the freshest measurement is the best
+single predictor when the build flow has been changing. `source_dl_bytes` can
+be added later as a column without rewriting anything.
+
+**Capture** — `run_build` (`src/build.rs`) wraps `makepkg::run` with an
+`Instant`; on success it calls `record_build_metric`, which opens the store on
+demand and appends one row. The `Cached` disposition skips the build and
+leaves the history intact. Failures (store open, insert) are downgraded to
+`warn!` — a successful build must never be turned into a failure by the cost-
+visibility hint going missing.
+
+**Render & dim** — `src/ui/change_set.rs` carries a `TimeEst` cell (`Estimate`
+/ `Unknown` / `None`), `time_of_root` / `time_of_aur_dep` resolve from a
+`PreviewMetrics` overlay, and the batch total appends a `~Xh Ym build` term
+when at least one AUR row exists. Staleness uses the metric's own
+`built_at_ms` (not the localdb install date the design first sketched, which
+moves forward on reinstalls without a fresh measurement) compared against a
+`STALE_METRIC_AGE_SECS = 90 days` threshold in `src/cli/upgrade_loop.rs`.
+Stale `Estimate` cells render through `ui::dim`; `Unknown` and `None` cells
+are never dimmed (a dimmed `~?` reads as a render glitch).
 
 ### Batch total before apply — DONE
 
@@ -415,10 +442,14 @@ No row moves; the badge carries the state.
    `src/ui/tables.rs` (`SizeEst`, `change_set_table`) + `src/ui.rs`
    (`human_bytes`) + `src/pacman/alpm_db.rs` (size maps). The `base()` summing
    the sketch floated was dropped as unnecessary — see "Size" above.
-3. **Build-time metric.** Add `rusqlite` + `metrics.db` (just
-   `pkgbase → build_secs`); capture around `makepkg::run`; add the build-time
-   term to the column and total; dim estimates whose localdb install date is
-   old.
+3. **Build-time metric. — DONE.** Adds `rusqlite` + `metrics.db` (append-only
+   `(pkgbase, build_secs, built_at_ms)` history, not the upsert the design
+   first sketched); captures around `makepkg::run`; adds the build-time term
+   to the column and total; dims rows whose latest measurement is older than
+   90 days (using the metric's own `built_at_ms`, not localdb's install
+   date). Landed in `src/build/metrics.rs` (store + `BuildRecord::age`) +
+   `src/build.rs::run_build` (capture) + `src/ui/change_set.rs` (`TimeEst`,
+   render, batch total) — see "Build time" above.
 4. **Polish / custom picker (route 2).** Live inline dep-expansion and the
    `v` review hotkey in a custom picker; optional `source_dl_bytes`.
 

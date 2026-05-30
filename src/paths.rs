@@ -75,6 +75,16 @@ pub fn traces_dir() -> PathBuf {
     state_dir().join("traces")
 }
 
+/// `SQLite` store for cross-session build-time metrics — see
+/// [`crate::build::metrics`].
+///
+/// Schema is intentionally minimal (one row per successful build, holding the
+/// pkgbase, wall-time seconds, and a Unix-epoch-ms timestamp); everything else
+/// (version, install date) is recoverable from pacman's localdb.
+pub fn metrics_db_path() -> PathBuf {
+    state_dir().join("metrics.db")
+}
+
 /// Create the state directory tree if missing.
 pub fn ensure_state_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir())?;

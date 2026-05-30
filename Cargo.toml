@@ -147,6 +147,12 @@ signal-hook = "0.3"
 # integration test, so both features live on this one entry.
 nix = { version = "0.31", features = ["resource", "signal"] }
 
+# Per-pkgbase build-time store backing the change-set preview's build-time
+# column. `bundled` vendors SQLite so the dep doesn't reach for a system libsqlite
+# (Arch ships it but a `--no-default-features` reviewer build might not). The
+# schema is one table with two columns; we don't need feature flags.
+rusqlite = { version = "0.40", features = ["bundled"] }
+
 [dev-dependencies]
 tempfile = "3"
 vt100 = "0.16"
