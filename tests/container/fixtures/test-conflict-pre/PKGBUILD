@@ -1,0 +1,15 @@
+# Pre-installed seed for smoke 57: the AUR fixture `test-conflict-aur`
+# declares `conflicts=('test-conflict-pre')`, so installing it under
+# --noconfirm should abort the pacman transaction with an unresolvable
+# conflict. Staged under /srv/foreign-pkgs/ (repo=foreign), seeded via
+# `install_foreign test-conflict-pre`.
+pkgname=test-conflict-pre
+pkgver=1.0
+pkgrel=1
+pkgdesc='gitaur test fixture: pre-installed pkg that triggers a conflict'
+arch=('any')
+license=('MIT')
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}
