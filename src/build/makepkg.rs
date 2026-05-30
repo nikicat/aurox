@@ -24,15 +24,17 @@ use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tracing::{debug, info, instrument, warn};
 
-/// Run `makepkg` in `worktree` with the configured args + env.
+/// Run `makepkg` in `worktree` with the configured args + env, plus any
+/// `extra_args` (e.g. `--nobuild` / `--noextract` for the VCS two-phase build).
 ///
 /// makepkg has no flag to limit which pkgnames of a split PKGBUILD get
 /// packaged — `package_*()` is run for every member, all-or-nothing. So we
@@ -40,12 +42,23 @@ use tracing::{debug, info, instrument, warn};
 /// (`build::filter_by_selection`) decides which of the resulting
 /// `.pkg.tar.zst` files end up in the `pacman -U` transaction.
 ///
+/// `fresh_log` truncates `build.log` (the first makepkg pass of a run);
+/// passing `false` appends, so a multi-pass sequence (VCS `--nobuild` then
+/// `--noextract`) lands in a single contiguous log.
+///
 /// Returns the path to the captured `build.log` on success; on failure the
 /// same path is embedded in the [`Error::Build`] message.
 #[instrument(skip(cfg))]
-pub fn run(cfg: &Config, worktree: &Path) -> Result<PathBuf> {
+pub fn run(cfg: &Config, worktree: &Path, extra_args: &[&str], fresh_log: bool) -> Result<PathBuf> {
     let log_path = worktree.join("build.log");
-    let log_file = File::create(&log_path)?;
+    let log_file = if fresh_log {
+        File::create(&log_path)?
+    } else {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?
+    };
 
     let pty = native_pty_system()
         .openpty(pty_size())
@@ -59,7 +72,10 @@ pub fn run(cfg: &Config, worktree: &Path) -> Result<PathBuf> {
     for arg in &cfg.makepkg_args {
         cmd.arg(arg);
     }
-    debug!(args = ?cfg.makepkg_args, cwd = %worktree.display(), log = %log_path.display(), "spawning makepkg under pty");
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    debug!(args = ?cfg.makepkg_args, extra = ?extra_args, cwd = %worktree.display(), log = %log_path.display(), "spawning makepkg under pty");
 
     let mut child = pty
         .slave
@@ -120,6 +136,53 @@ pub fn run(cfg: &Config, worktree: &Path) -> Result<PathBuf> {
     }
     info!(log = %log_path.display(), "makepkg succeeded");
     Ok(log_path)
+}
+
+/// Resolve the exact package filenames `makepkg` will produce in `worktree`,
+/// *before* building, via `makepkg --packagelist`.
+///
+/// `--packagelist` sources the PKGBUILD and evaluates `pkgver()`, so a VCS
+/// pkgbase (`-git`/`-svn`/…) reports its *dynamic* version here — the same
+/// string the build stamps into the artifact filename. Freezing on this list
+/// (instead of the static `.SRCINFO` pkgver, which `pkgver()` overrides and
+/// which therefore never matches the built file) is what lets `build::run_build`
+/// collect a VCS package's artifact instead of failing with "produced no
+/// packages". The env mirrors [`run`], so sources land in the same `SRCDEST`
+/// the subsequent build reuses — resolving the version here costs no extra
+/// download beyond what the build would do anyway.
+#[instrument(skip(cfg))]
+pub fn package_list(cfg: &Config, worktree: &Path) -> Result<Vec<PathBuf>> {
+    let out = Command::new(&cfg.makepkg_path)
+        .arg("--packagelist")
+        .current_dir(worktree)
+        .env("PKGDEST", worktree)
+        .env("SRCDEST", worktree.join("src-cache"))
+        .env("BUILDDIR", worktree)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| Error::Build(format!("spawn makepkg --packagelist: {e}")))?;
+    if !out.status.success() {
+        return Err(Error::Build(format!(
+            "makepkg --packagelist failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
+    }
+    let list = parse_package_list(&String::from_utf8_lossy(&out.stdout));
+    debug!(count = list.len(), "froze package list before build");
+    Ok(list)
+}
+
+/// Parse `makepkg --packagelist` stdout: one artifact path per line. Blank
+/// lines are dropped and surrounding whitespace trimmed; every other line is
+/// taken verbatim as a path (makepkg emits absolute `PKGDEST/…` paths).
+fn parse_package_list(stdout: &str) -> Vec<PathBuf> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(PathBuf::from)
+        .collect()
 }
 
 /// Forward SIGINT to makepkg's whole process group so its build children
@@ -185,5 +248,37 @@ fn pty_size() -> PtySize {
         cols,
         pixel_width: 0,
         pixel_height: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_package_list_trims_and_skips_blanks() {
+        let out = "/pkgs/foo-1.0-1-x86_64.pkg.tar.zst\n\n  /pkgs/bar-2.0-1-any.pkg.tar.zst  \n";
+        assert_eq!(
+            parse_package_list(out),
+            vec![
+                PathBuf::from("/pkgs/foo-1.0-1-x86_64.pkg.tar.zst"),
+                PathBuf::from("/pkgs/bar-2.0-1-any.pkg.tar.zst"),
+            ],
+        );
+    }
+
+    /// The VCS case this whole freeze exists for: `makepkg --packagelist`
+    /// reports the *dynamic* `pkgver()` result, so the frozen filename carries
+    /// the built `r70.g0dae0f47c-1` — not the static `r2.g3e316c1c5-2` from
+    /// `.SRCINFO`. Captured verbatim from a `selinux-refpolicy-arch-git` run.
+    #[test]
+    fn parse_package_list_captures_vcs_dynamic_pkgver() {
+        let out = "/pkgs/selinux-refpolicy-arch-git-RELEASE_2_20260312.r70.g0dae0f47c-1-any.pkg.tar.zst\n";
+        let list = parse_package_list(out);
+        assert_eq!(list.len(), 1);
+        assert!(
+            list[0].to_string_lossy().contains("r70.g0dae0f47c-1"),
+            "frozen filename must carry the dynamic pkgver, not the static one",
+        );
     }
 }

@@ -1,0 +1,26 @@
+# `-git` VCS fixture whose `pkgver()` OVERRIDES the static pkgver, the way a
+# real git-describe pkgver() does once upstream moves past the maintainer's
+# last `.SRCINFO` push. Distinct from `test-vcs-git`, whose pkgver() returns
+# the same string as the static `pkgver=` and so never exercises the mismatch.
+#
+# Regression target (smoke 59): the static `pkgver=0.r0` is what lands in
+# `.SRCINFO` (makepkg --printsrcinfo does NOT run pkgver()) and therefore in
+# gitaur's index, but the build stamps `0.r99` into the artifact. gitaur must
+# freeze the real version (two-phase --nobuild/--noextract) and collect by it,
+# instead of gating on the stale `0.r0` and failing with "produced no packages".
+pkgname=test-vcs-bump-git
+pkgver=0.r0
+pkgrel=1
+pkgdesc='gitaur test fixture: VCS pkg whose pkgver() bumps past the static version'
+arch=('any')
+license=('MIT')
+
+pkgver() {
+    # No real sources needed — a fixed value higher than the static pkgver is
+    # enough to reproduce the dynamic-override the install path must handle.
+    echo "0.r99"
+}
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+}

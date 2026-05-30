@@ -24,7 +24,7 @@ use crate::version::Version;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Instant;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 pub mod install;
 pub mod makepkg;
@@ -753,12 +753,68 @@ fn prepare_one<'a>(
 fn run_build(cfg: &Config, prep: &Prep<'_>) -> Result<Vec<PathBuf>> {
     ui::step(&format!("makepkg {}", prep.pkgbase));
     let started = Instant::now();
-    makepkg::run(cfg, &prep.wt.path)?;
+
+    // VCS pkgbases resolve their real `pkgver()` only while makepkg extracts
+    // sources (it then rewrites `pkgver=` in place), so the artifact can't be
+    // named from the static `.SRCINFO` version in `prep.new_ver`. Extract first
+    // (`--nobuild`) to freeze the real version, read the exact output filenames
+    // (`makepkg --packagelist`, which now reflects the rewritten pkgver), reuse
+    // them if already built, else build from the extracted sources
+    // (`--noextract`). Non-VCS pkgbases have an authoritative static pkgver, so
+    // a single build + version-gated collection is correct and skips the extra
+    // makepkg pass.
+    let (outputs, expected) = if prep.pkgbase.is_vcs() {
+        makepkg::run(cfg, &prep.wt.path, &["--nobuild"], true)?;
+        let expected = makepkg::package_list(cfg, &prep.wt.path)?;
+        debug!(expected = ?expected, "froze package list before build");
+
+        // Idempotency at the frozen version: reuse makepkg's exact outputs if
+        // they're already on disk. Skips redundant VCS rebuilds and dodges
+        // makepkg's "a package has already been built (use -f)" abort on a
+        // stale artifact left by an earlier run — the phase-1 cache
+        // (`prepare_one`) can't catch this since it gates on the static pkgver.
+        let on_disk = select_produced(
+            &install::find_produced(&prep.wt.path)?,
+            &expected,
+            &prep.required,
+        );
+        if !prep.required.is_empty() && covers_all(&on_disk, &prep.required) {
+            ui::note(&format!("{}: reusing built artifact", prep.pkgbase));
+            info!(pkgbase = %prep.pkgbase, files = on_disk.len(), "reusing built artifact at frozen version; skipping build");
+            return Ok(on_disk);
+        }
+
+        makepkg::run(cfg, &prep.wt.path, &["--noextract"], false)?;
+        let produced = install::find_produced(&prep.wt.path)?;
+        (
+            select_produced(&produced, &expected, &prep.required),
+            Some(expected),
+        )
+    } else {
+        makepkg::run(cfg, &prep.wt.path, &[], true)?;
+        let produced = install::find_produced(&prep.wt.path)?;
+        (
+            select_outputs(&produced, &prep.required, &prep.new_ver),
+            None,
+        )
+    };
     let build_secs = started.elapsed().as_secs();
 
-    let produced = install::find_produced(&prep.wt.path)?;
-    let outputs = select_outputs(&produced, &prep.required, &prep.new_ver);
     if outputs.is_empty() {
+        // makepkg exited 0 yet nothing we required landed. Log the expected
+        // outputs (the frozen list for VCS, the static version otherwise)
+        // against what's on disk so the failure is diagnosable from the gitaur
+        // log, not just the TTY — this path used to return silently, leaving
+        // the `selinux-refpolicy-arch-git` run showing "makepkg succeeded"
+        // followed by nothing.
+        error!(
+            pkgbase = %prep.pkgbase,
+            version = %prep.new_ver,
+            expected = ?expected,
+            produced = ?install::find_produced(&prep.wt.path).unwrap_or_default(),
+            required = ?prep.required,
+            "makepkg exited 0 but produced no matching package"
+        );
         return Err(Error::Build(format!(
             "{}: makepkg produced no packages",
             prep.pkgbase
@@ -812,6 +868,45 @@ fn select_outputs(files: &[PathBuf], required: &[PkgName], new_ver: &Version) ->
         .filter(|f| required.iter().any(|n| install::matches_pkg(f, n, new_ver)))
         .cloned()
         .collect()
+}
+
+/// Pick which freshly-built artifacts to install, matching against the frozen
+/// `makepkg --packagelist` output (`expected`) rather than a predicted
+/// version.
+///
+/// This is the post-build counterpart to [`select_outputs`]: where that gates
+/// on a `Version` (used by the phase-1 idempotency check, which can't know a
+/// VCS pkgbase's dynamic pkgver up front), this matches produced files by
+/// basename against the list makepkg said it would emit — `pkgver()` already
+/// evaluated. A produced file is kept iff its basename is in `expected` *and*
+/// its pkgname is one the run requires, so stale artifacts from an earlier
+/// build (absent from the current frozen list) and split-pkg siblings the user
+/// didn't ask for are both dropped.
+fn select_produced(
+    produced: &[PathBuf],
+    expected: &[PathBuf],
+    required: &[PkgName],
+) -> Vec<PathBuf> {
+    use std::ffi::OsStr;
+    let expected_names: HashSet<&OsStr> = expected.iter().filter_map(|p| p.file_name()).collect();
+    produced
+        .iter()
+        .filter(|f| f.file_name().is_some_and(|n| expected_names.contains(n)))
+        .filter(|f| install::extract_pkgname(f).is_some_and(|name| required.contains(&name)))
+        .cloned()
+        .collect()
+}
+
+/// True iff every required pkgname is represented among `selected`. Used by the
+/// VCS reuse gate in `run_build` to decide whether an existing build covers the
+/// whole required set (`selected` is already pkgname/frozen-filtered, so this
+/// just checks coverage — the analogue of `prepare_one`'s all-present check).
+fn covers_all(selected: &[PathBuf], required: &[PkgName]) -> bool {
+    required.iter().all(|name| {
+        selected
+            .iter()
+            .any(|f| install::extract_pkgname(f).as_ref() == Some(name))
+    })
 }
 
 /// Install every `.pkg.tar.zst` produced by one stratum's builds in a single
@@ -1035,6 +1130,68 @@ mod tests {
         let required = vec![pn("test-trivial")];
         let kept = select_outputs(&files, &required, &Version::from("1.0-1"));
         assert_eq!(kept, files);
+    }
+
+    /// Regression for the `selinux-refpolicy-arch-git` failure: a VCS pkgbase's
+    /// `pkgver()` stamps a *dynamic* version (`…r70.g0dae0f47c-1`) that the
+    /// static `.SRCINFO` pkgver (`…r2.g3e316c1c5-2`, what landed in
+    /// `prep.new_ver`) never matches. Collecting against the frozen
+    /// `makepkg --packagelist` output keeps the real artifact, where the old
+    /// version-gated path returned empty and failed with "produced no
+    /// packages" despite a clean makepkg exit.
+    #[test]
+    fn select_produced_keeps_vcs_artifact_at_dynamic_pkgver() {
+        let built =
+            "/wt/selinux-refpolicy-arch-git-RELEASE_2_20260312.r70.g0dae0f47c-1-any.pkg.tar.zst";
+        let produced = vec![p(built)];
+        // The frozen list carries the same dynamic version — the static r2
+        // pkgver never appears here.
+        let expected = vec![p(built)];
+        let required = vec![pn("selinux-refpolicy-arch-git")];
+        let kept = select_produced(&produced, &expected, &required);
+        assert_eq!(
+            kept,
+            vec![p(built)],
+            "VCS artifact must be collected by its frozen pkgver",
+        );
+    }
+
+    /// Companion to the regression above, pinning *why* the freeze is needed:
+    /// gating the same VCS artifact on the static `.SRCINFO` version (what
+    /// `select_outputs` does) drops it — the exact bug `select_produced`
+    /// avoids.
+    #[test]
+    fn select_outputs_static_version_drops_vcs_artifact() {
+        let built = vec![p(
+            "/wt/selinux-refpolicy-arch-git-RELEASE_2_20260312.r70.g0dae0f47c-1-any.pkg.tar.zst",
+        )];
+        let required = vec![pn("selinux-refpolicy-arch-git")];
+        let static_ver = Version::from("RELEASE_2_20260312.r2.g3e316c1c5-2");
+        let kept = select_outputs(&built, &required, &static_ver);
+        assert!(
+            kept.is_empty(),
+            "static-version gate cannot match the dynamic built version — this is the bug",
+        );
+    }
+
+    /// `select_produced` still drops what isn't in the frozen list (a stale
+    /// artifact from an earlier build at a different pkgver) and what isn't
+    /// required (a split-pkg sibling), matching `select_outputs`' two filters
+    /// but keyed on the frozen filenames instead of a predicted version.
+    #[test]
+    fn select_produced_drops_stale_and_unrequested_siblings() {
+        let produced = vec![
+            p("/wt/pkg-a-2.0-1-any.pkg.tar.zst"), // current + required
+            p("/wt/pkg-a-1.0-1-any.pkg.tar.zst"), // stale: not in frozen list
+            p("/wt/pkg-b-2.0-1-any.pkg.tar.zst"), // sibling: frozen but not required
+        ];
+        let expected = vec![
+            p("/wt/pkg-a-2.0-1-any.pkg.tar.zst"),
+            p("/wt/pkg-b-2.0-1-any.pkg.tar.zst"),
+        ];
+        let required = vec![pn("pkg-a")];
+        let kept = select_produced(&produced, &expected, &required);
+        assert_eq!(kept, vec![p("/wt/pkg-a-2.0-1-any.pkg.tar.zst")]);
     }
 
     /// `artifacts_built` scopes to whatever pkgname set the caller passes — the
