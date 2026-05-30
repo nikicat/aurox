@@ -18,42 +18,13 @@
 //! — `SizeEst`, `TimeEst`, `PreviewMetrics` — that doesn't apply anywhere
 //! else.
 
+use super::cost::{PreviewMetrics, RowCost, TimeEst, built_suffix, cost_of_root, time_col};
 use super::tables::{Paint, col_widths, render_row, sort_for_display};
 use super::{color_on, human_bytes, human_duration};
 use crate::names::{PkgBase, PkgName};
 use crate::pacman::alpm_db::PacmanIndex;
 use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
-use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
-
-/// Per-row build-time overlay the change-set preview reads.
-///
-/// The maps are keyed differently because AUR root rows arrive as
-/// [`PkgUpgrade`] (keyed by [`PkgName`] — what the picker handed us) while AUR
-/// build-dep rows arrive as a flat list of [`PkgBase`] (resolver pulls).
-/// `stale` marks AUR roots whose recorded build time should render dimmed
-/// because the installed version it was measured against is now far away in
-/// time.
-#[derive(Debug, Default)]
-pub struct PreviewMetrics {
-    /// AUR root row → last successful build duration (seconds).
-    pub root_build_secs: HashMap<PkgName, u64>,
-    /// AUR build-dep pkgbase → last successful build duration (seconds).
-    pub dep_build_secs: HashMap<PkgBase, u64>,
-    /// AUR roots whose localdb install date is older than the staleness
-    /// threshold — the recorded `build_secs` reflects a long-ago build flow,
-    /// so the cell is dimmed to signal the estimate is shakier than the
-    /// number alone suggests.
-    pub stale: HashSet<PkgName>,
-}
-
-impl PreviewMetrics {
-    /// Empty overlay — used by tests and by the upgrade loop when the metrics
-    /// store fails to open (every AUR row then renders `~?` for time).
-    pub fn empty() -> Self {
-        Self::default()
-    }
-}
 
 /// Render the change-set preview.
 ///
@@ -100,29 +71,30 @@ pub fn change_set_table(
         .max()
         .unwrap_or(0);
 
-    // Build-time cells. Repo rows render as [`TimeEst::None`] (empty cell);
-    // AUR rows render Estimate / Unknown.
-    let root_times: Vec<TimeEst> = ordered.iter().map(|u| time_of_root(u, metrics)).collect();
-    let aur_dep_times: Vec<TimeEst> = aur_deps
+    // Build-time + built state per row. Repo rows are [`RowCost::none`] (empty
+    // cell, no tag); AUR rows carry their Estimate / Unknown figure, the stale
+    // dim flag, and whether the artifact is already built.
+    let colored = paint.colored();
+    let root_costs: Vec<RowCost> = ordered.iter().map(|u| cost_of_root(u, metrics)).collect();
+    let aur_dep_costs: Vec<RowCost> = aur_deps
         .iter()
-        .map(|pb| time_of_aur_dep(pb, metrics))
+        .map(|pb| cost_of_aur_dep(pb, metrics))
         .collect();
-    let time_w = root_times
+    let time_w = root_costs
         .iter()
-        .chain(&aur_dep_times)
-        .map(|t| t.render().len())
+        .chain(&aur_dep_costs)
+        .map(|c| c.visible_len())
         .max()
         .unwrap_or(0);
 
-    for (i, (u, size)) in ordered.iter().zip(&root_sizes).enumerate() {
+    for ((u, size), cost) in ordered.iter().zip(&root_sizes).zip(&root_costs) {
         let row = render_row(u, repo_w, name_w, old_w, paint);
         let new_pad = " ".repeat(new_w.saturating_sub(u.new_ver.len()));
-        let time = &root_times[i];
-        let stale = metrics.stale.contains(&u.name);
         eprintln!(
-            "    {row}{new_pad}  {size:>size_w$}  {time:>time_w$}",
+            "    {row}{new_pad}  {size:>size_w$}  {time}{tag}",
             size = size.render(),
-            time = time.render_styled(paint, stale),
+            time = time_col(*cost, time_w, colored),
+            tag = built_suffix(*cost, colored),
         );
     }
 
@@ -147,12 +119,13 @@ pub fn change_set_table(
                 empty = "",
             );
         }
-        for ((name, size), time) in aur_deps.iter().zip(&aur_dep_sizes).zip(&aur_dep_times) {
+        for ((name, size), cost) in aur_deps.iter().zip(&aur_dep_sizes).zip(&aur_dep_costs) {
             eprintln!(
-                "      {name:<dep_w$}  {tag:<tag_w$}  {size:>size_w$}  {time:>time_w$}",
+                "      {name:<dep_w$}  {tag:<tag_w$}  {size:>size_w$}  {time}{built}",
                 tag = "(build)",
                 size = size.render(),
-                time = time.render_styled(paint, false),
+                time = time_col(*cost, time_w, colored),
+                built = built_suffix(*cost, colored),
             );
         }
     }
@@ -165,7 +138,7 @@ pub fn change_set_table(
             .copied(),
     );
     let (total_secs, time_approx, time_any) =
-        batch_time_total(root_times.iter().chain(&aur_dep_times).copied());
+        batch_time_total(root_costs.iter().chain(&aur_dep_costs).map(|c| c.time));
     let size_prefix = if size_approx { "~" } else { "" };
     let mut total_line = format!("total  {size_prefix}{}", human_bytes(total_bytes));
     // The build-time term joins the size term only when at least one AUR row
@@ -257,101 +230,16 @@ fn batch_size_total(sizes: impl IntoIterator<Item = SizeEst>) -> (u64, bool) {
     (total, approx)
 }
 
-/// A change-set row's build-time figure.
-///
-/// AUR roots and AUR build deps with a recorded prior duration become
-/// [`Self::Estimate`] (`~Xm Ys`). AUR rows the store has never seen are
-/// [`Self::Unknown`] (`~?`). Repo rows are [`Self::None`] — they don't build
-/// at all, so the cell renders empty rather than `~?` (which would imply a
-/// missing measurement).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimeEst {
-    Estimate(u64),
-    Unknown,
-    None,
-}
-
-impl TimeEst {
-    /// Seconds this row contributes to the batch total (0 when unknown or
-    /// not applicable).
-    const fn secs(self) -> u64 {
-        match self {
-            Self::Estimate(n) => n,
-            Self::Unknown | Self::None => 0,
-        }
-    }
-
-    /// Whether the figure makes the build-time total an approximate lower
-    /// bound. Both `Estimate` (it's a prediction) and `Unknown` (it under-
-    /// counts) flag the total approximate; `None` is "not applicable" and
-    /// doesn't affect the total's accuracy.
-    const fn approximate(self) -> bool {
-        matches!(self, Self::Estimate(_) | Self::Unknown)
-    }
-
-    /// Whether this row participates in the build-time total at all. Used to
-    /// suppress the trailing `~Xm Ys build` term on pure-repo batches.
-    const fn applicable(self) -> bool {
-        !matches!(self, Self::None)
-    }
-
-    /// Plain cell text. [`Self::None`] returns empty so a padded column
-    /// collapses neatly.
-    fn render(self) -> String {
-        match self {
-            Self::Estimate(n) => format!("~{}", human_duration(n)),
-            Self::Unknown => "~?".to_owned(),
-            Self::None => String::new(),
-        }
-    }
-
-    /// Whether the rendered cell should be passed through [`super::dim`]:
-    /// only when the user can see styling (`paint.colored()`), only when the
-    /// estimate is flagged stale, and only on real `Estimate` values — dimming
-    /// a `~?` Unknown would look like a render glitch, and there's nothing to
-    /// dim on `None`. Pulled out so the decision is testable without
-    /// depending on `console`'s global TTY gate.
-    const fn should_dim(self, paint: Paint, stale: bool) -> bool {
-        paint.colored() && stale && matches!(self, Self::Estimate(_))
-    }
-
-    /// Styled cell: same text as [`Self::render`], dimmed when
-    /// [`Self::should_dim`] holds. The `to_string` round-trip respects
-    /// `console`'s color gate (so a piped output stays plain even when
-    /// `stale` is set).
-    fn render_styled(self, paint: Paint, stale: bool) -> String {
-        let s = self.render();
-        if self.should_dim(paint, stale) {
-            super::dim(s).to_string()
-        } else {
-            s
-        }
-    }
-}
-
-/// Build-time cell for one AUR root row. Repo rows return [`TimeEst::None`]
-/// (no build happens); AUR rows with a recorded duration become
-/// [`TimeEst::Estimate`]; AUR rows the metrics store has never seen are
-/// [`TimeEst::Unknown`].
-fn time_of_root(u: &PkgUpgrade, metrics: &PreviewMetrics) -> TimeEst {
-    if u.repo != REPO_AUR {
-        return TimeEst::None;
-    }
-    metrics
-        .root_build_secs
-        .get(&u.name)
-        .copied()
-        .map_or(TimeEst::Unknown, TimeEst::Estimate)
-}
-
-/// Build-time cell for one pulled-in AUR build dep. Either Estimate or
-/// Unknown — these rows are by definition AUR builds.
-fn time_of_aur_dep(pb: &PkgBase, metrics: &PreviewMetrics) -> TimeEst {
-    metrics
+/// Cost cell for one pulled-in AUR build dep — by definition an AUR build, so
+/// the figure is Estimate or Unknown (never None). Dep cells aren't dimmed for
+/// staleness today, but a built dep still shows the `built` tag.
+fn cost_of_aur_dep(pb: &PkgBase, metrics: &PreviewMetrics) -> RowCost {
+    let time = metrics
         .dep_build_secs
         .get(pb)
         .copied()
-        .map_or(TimeEst::Unknown, TimeEst::Estimate)
+        .map_or(TimeEst::Unknown, TimeEst::Estimate);
+    RowCost::aur(time, false, metrics.built_deps.contains(pb))
 }
 
 /// Sum a change set's build-time figures into `(seconds, approximate, any)`.
@@ -453,62 +341,56 @@ mod tests {
         assert!(approx, "an estimate makes the total approximate");
     }
 
-    /// `TimeEst` renders the three meaningful cells; `None` collapses to empty
-    /// so the column padding does the right thing for repo rows.
+    /// Source selection for the root cost cell: repo rows are not-applicable
+    /// (`None`, never built); AUR rows resolve their figure through
+    /// `root_build_secs`, an unrecorded AUR row is `Unknown`, and the
+    /// stale/built flags come straight from the overlay sets.
     #[test]
-    fn time_est_renders_each_variant() {
-        assert_eq!(TimeEst::Estimate(45).render(), "~45s");
-        assert_eq!(TimeEst::Estimate(125).render(), "~2m 5s");
-        assert_eq!(TimeEst::Estimate(3_725).render(), "~1h 2m");
-        assert_eq!(TimeEst::Unknown.render(), "~?");
-        assert_eq!(TimeEst::None.render(), "");
-    }
-
-    /// Source selection for the build-time cell: repo rows are not-applicable
-    /// (`None`); AUR rows resolve through `root_build_secs`; an unrecorded
-    /// AUR row is `Unknown`.
-    #[test]
-    fn time_of_root_picks_by_repo_and_lookup() {
+    fn cost_of_root_picks_by_repo_and_flags() {
         let mut metrics = PreviewMetrics::empty();
         metrics
             .root_build_secs
             .insert(PkgName::from("paru-bin"), 90);
+        metrics.built_roots.insert(PkgName::from("paru-bin"));
+        metrics.stale.insert(PkgName::from("first-time"));
 
-        // Repo row → no build, so no cell.
-        assert_eq!(
-            time_of_root(&up("core", "glibc", "1-1", "2-1"), &metrics),
-            TimeEst::None,
-        );
-        // AUR row with a recorded duration.
-        assert_eq!(
-            time_of_root(&up(REPO_AUR, "paru-bin", "1-1", "2-1"), &metrics),
-            TimeEst::Estimate(90),
-        );
-        // AUR row the store has never seen.
-        assert_eq!(
-            time_of_root(&up(REPO_AUR, "first-time", "0-1", "1-1"), &metrics),
-            TimeEst::Unknown,
-        );
+        // Repo row → no build, so no cell and no flags.
+        let repo = cost_of_root(&up("core", "glibc", "1-1", "2-1"), &metrics);
+        assert_eq!(repo.time, TimeEst::None);
+        assert!(!repo.built);
+
+        // AUR row with a recorded duration, flagged built.
+        let recorded = cost_of_root(&up(REPO_AUR, "paru-bin", "1-1", "2-1"), &metrics);
+        assert_eq!(recorded.time, TimeEst::Estimate(90));
+        assert!(recorded.built);
+        assert!(!recorded.stale);
+
+        // AUR row the store has never seen, flagged stale (e.g. from an older
+        // sibling measurement) but not built.
+        let first = cost_of_root(&up(REPO_AUR, "first-time", "0-1", "1-1"), &metrics);
+        assert_eq!(first.time, TimeEst::Unknown);
+        assert!(first.stale);
+        assert!(!first.built);
     }
 
     /// Pulled-in AUR build deps don't have a `repo` field to switch on — they
-    /// are always AUR builds — so the cell is Estimate or Unknown but never
-    /// None.
+    /// are always AUR builds — so the figure is Estimate or Unknown but never
+    /// None; the built flag tracks `built_deps`.
     #[test]
-    fn time_of_aur_dep_resolves_or_unknown() {
+    fn cost_of_aur_dep_resolves_or_unknown() {
         let mut metrics = PreviewMetrics::empty();
         metrics
             .dep_build_secs
             .insert(PkgBase::from("nvidia-utils"), 600);
+        metrics.built_deps.insert(PkgBase::from("nvidia-utils"));
 
-        assert_eq!(
-            time_of_aur_dep(&PkgBase::from("nvidia-utils"), &metrics),
-            TimeEst::Estimate(600),
-        );
-        assert_eq!(
-            time_of_aur_dep(&PkgBase::from("never-built"), &metrics),
-            TimeEst::Unknown,
-        );
+        let recorded = cost_of_aur_dep(&PkgBase::from("nvidia-utils"), &metrics);
+        assert_eq!(recorded.time, TimeEst::Estimate(600));
+        assert!(recorded.built);
+
+        let unknown = cost_of_aur_dep(&PkgBase::from("never-built"), &metrics);
+        assert_eq!(unknown.time, TimeEst::Unknown);
+        assert!(!unknown.built);
     }
 
     /// The build-time total reports (sum, approximate, any). `None` doesn't
@@ -537,37 +419,10 @@ mod tests {
         assert!(any);
     }
 
-    /// `should_dim` is the decision behind the stale-dim affordance. Only the
-    /// exact combination `(Colored, stale=true, Estimate)` qualifies; the
-    /// other axes (paint, stale flag, variant) all suppress it.
-    #[test]
-    fn time_est_should_dim_truth_table() {
-        let est = TimeEst::Estimate(60);
-        // Only this combination dims.
-        assert!(est.should_dim(Paint::Colored, true));
-        // Each axis independently disables dimming.
-        assert!(
-            !est.should_dim(Paint::Plain, true),
-            "plain paint must skip dim"
-        );
-        assert!(
-            !est.should_dim(Paint::Colored, false),
-            "non-stale must skip dim"
-        );
-        // Unknown / None must never dim, even with stale=true and Colored.
-        assert!(
-            !TimeEst::Unknown.should_dim(Paint::Colored, true),
-            "Unknown must never dim — `~?` dimmed looks like a render glitch",
-        );
-        assert!(
-            !TimeEst::None.should_dim(Paint::Colored, true),
-            "None has no cell to dim",
-        );
-    }
-
     /// `change_set_table` must survive the cases most likely to break the
     /// width/zip math: a mixed root + dep batch, the no-deps path, an empty
-    /// change set, and a batch with a stale-marked AUR row. Output goes to
+    /// change set, a stale-marked AUR row, and already-built root + dep rows
+    /// (which dim the time cell and append the `built` tag). Output goes to
     /// stderr so we assert "doesn't panic," as the other table smokes do.
     #[test]
     fn change_set_table_smoke() {
@@ -592,6 +447,10 @@ mod tests {
             .insert(PkgBase::from("nvidia-utils"), 480);
         // Mark cuda's recorded time as stale → the cell renders dimmed.
         metrics.stale.insert(PkgName::from("cuda"));
+        // cuda is already built (root) and nvidia-utils too (dep) → both gain a
+        // `built` tag, exercising the built rendering in both row kinds.
+        metrics.built_roots.insert(PkgName::from("cuda"));
+        metrics.built_deps.insert(PkgBase::from("nvidia-utils"));
 
         change_set_table(&roots, &repo_deps, &aur_deps, &pac, &metrics);
         change_set_table(&roots, &[], &[], &pac, &PreviewMetrics::empty());

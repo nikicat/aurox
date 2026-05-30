@@ -204,7 +204,11 @@ impl LoopEnv for RealEnv<'_> {
         candidates: &[PkgUpgrade],
         annotations: &RowAnnotations,
     ) -> Result<UpgradeSelection> {
-        ui::select_upgrades(candidates, self.cfg, false, annotations)
+        // Cost overlay for every AUR candidate (not just the eventual
+        // selection) so the picker can show build time + a `built` tag before
+        // the user commits.
+        let metrics = candidate_metrics(self.session, candidates);
+        ui::select_upgrades(candidates, self.cfg, false, annotations, &metrics)
             .map_err(|e| Error::other(format!("upgrade selection: {e}")))
     }
 
@@ -375,43 +379,34 @@ fn preview_metrics(
     sel: &UpgradeSelection,
     resolved: Option<&Plan>,
 ) -> PreviewMetrics {
-    let store = match MetricsStore::open(&paths::metrics_db_path()) {
-        Ok(s) => s,
-        Err(e) => {
+    // The store backs only the build-time figures; the `built` tags are pure
+    // on-disk reads, so a failed store still leaves them populated below.
+    let store = MetricsStore::open(&paths::metrics_db_path())
+        .inspect_err(|e| {
             warn!(error = %e, "open metrics store for preview; skipping build-time column");
-            return PreviewMetrics::empty();
-        }
-    };
-
+        })
+        .ok();
     let mut out = PreviewMetrics::empty();
     let now = std::time::SystemTime::now();
 
-    // AUR roots: map pkgname → pkgbase → recorded measurement. The picker
-    // hands us pkgnames, so the overlay is keyed by pkgname; the store is
-    // keyed by pkgbase.
+    // AUR roots: map pkgname → pkgbase → recorded measurement + on-disk
+    // artifact. The picker hands us pkgnames, so the overlay is keyed by
+    // pkgname; the store is keyed by pkgbase.
     for u in &sel.aur {
         let Some(pb) = session.pkgbase_of(&u.name) else {
             continue;
         };
-        match store.latest_build(pb) {
-            Ok(Some(rec)) => {
-                out.root_build_secs.insert(u.name.clone(), rec.build_secs);
-                // Mark the row stale when the measurement is older than the
-                // threshold; clock-skew failures fall through to "not stale"
-                // — better to under-dim than to wrongly disparage a fresh
-                // figure on a broken clock.
-                if rec.age(now).is_ok_and(|a| a >= STALE_METRIC_AGE_SECS) {
-                    out.stale.insert(u.name.clone());
-                }
-            }
-            Ok(None) => {}
-            Err(e) => warn!(error = %e, pkgbase = %pb, "lookup AUR root build time"),
+        if row_built(pb, u) {
+            out.built_roots.insert(u.name.clone());
+        }
+        if let Some(store) = &store {
+            insert_root_time(&mut out, store, &u.name, pb, now);
         }
     }
 
     // AUR build deps: pkgbases directly. The resolver's `aur_strata` is the
     // full closure; subtract `direct_aur` to leave only the pulled-in deps.
-    // Dep cells aren't dimmed today — they're rare and the preview lacks
+    // Dep build times aren't dimmed today — they're rare and the preview lacks
     // visible weight for indented rows to lose.
     if let Some(plan) = resolved {
         let roots_set: HashSet<&PkgBase> = plan.direct_aur.iter().collect();
@@ -421,18 +416,105 @@ fn preview_metrics(
             .flatten()
             .filter(|pb| !roots_set.contains(pb))
             .collect();
-        match store.latest_build_many(dep_pkgbases.iter().copied()) {
-            Ok(map) => {
-                out.dep_build_secs = map
-                    .into_iter()
-                    .map(|(pb, rec)| (pb, rec.build_secs))
-                    .collect();
+        for pb in &dep_pkgbases {
+            if pkgbase_built(session, pb) {
+                out.built_deps.insert((*pb).clone());
             }
-            Err(e) => warn!(error = %e, "bulk lookup AUR dep build times"),
+        }
+        if let Some(store) = &store {
+            match store.latest_build_many(dep_pkgbases.iter().copied()) {
+                Ok(map) => {
+                    out.dep_build_secs = map
+                        .into_iter()
+                        .map(|(pb, rec)| (pb, rec.build_secs))
+                        .collect();
+                }
+                Err(e) => warn!(error = %e, "bulk lookup AUR dep build times"),
+            }
         }
     }
 
     out
+}
+
+/// The cost overlay the picker reads: build-time + stale + `built` flag for
+/// every AUR candidate row (repo rows carry none). Computed for *all*
+/// candidates, not just the eventual selection, so the user sees the cost
+/// before committing. Opens the metrics store once; on failure the build-time
+/// cells degrade to `~?` while the `built` tags (pure on-disk reads) still
+/// render.
+fn candidate_metrics(session: &UpgradeSession, candidates: &[PkgUpgrade]) -> PreviewMetrics {
+    let store = MetricsStore::open(&paths::metrics_db_path())
+        .inspect_err(|e| {
+            warn!(error = %e, "open metrics store for picker; build-time column degraded");
+        })
+        .ok();
+    let mut out = PreviewMetrics::empty();
+    let now = std::time::SystemTime::now();
+    for u in candidates {
+        if u.repo != REPO_AUR {
+            continue;
+        }
+        let Some(pb) = session.pkgbase_of(&u.name) else {
+            continue;
+        };
+        if row_built(pb, u) {
+            out.built_roots.insert(u.name.clone());
+        }
+        if let Some(store) = &store {
+            insert_root_time(&mut out, store, &u.name, pb, now);
+        }
+    }
+    out
+}
+
+/// Whether the artifact for a single AUR upgrade row is already built on disk.
+/// Per-pkgname, not per-pkgbase: the picker and preview list each split-package
+/// pkgname as its own row, so each gets its own `built` tag. The row carries
+/// its own target version (`new_ver` == the index version a build would emit),
+/// so no index lookup is needed; VCS rows never match (dynamic pkgver).
+fn row_built(pb: &PkgBase, u: &PkgUpgrade) -> bool {
+    build::artifacts_built(pb, &u.new_ver, std::slice::from_ref(&u.name))
+}
+
+/// Record `pkgbase`'s latest build duration into the root overlay keyed by
+/// `name`, flagging it stale when the measurement predates
+/// [`STALE_METRIC_AGE_SECS`]. Clock-skew failures fall through to "not stale" —
+/// better to under-dim than to wrongly disparage a fresh figure on a broken
+/// clock. A lookup error warns and leaves the row at `~?`.
+fn insert_root_time(
+    out: &mut PreviewMetrics,
+    store: &MetricsStore,
+    name: &PkgName,
+    pb: &PkgBase,
+    now: std::time::SystemTime,
+) {
+    match store.latest_build(pb) {
+        Ok(Some(rec)) => {
+            out.root_build_secs.insert(name.clone(), rec.build_secs);
+            if rec.age(now).is_ok_and(|a| a >= STALE_METRIC_AGE_SECS) {
+                out.stale.insert(name.clone());
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!(error = %e, pkgbase = %pb, "lookup AUR root build time"),
+    }
+}
+
+/// Whether `pkgbase`'s build is complete on disk — *every* pkgname it produces
+/// at the index version has an artifact. Used for the pulled-in AUR **dep**
+/// rows, which the preview labels by pkgbase (one row per build unit), unlike
+/// the root rows which are per-pkgname (see [`row_built`]). A read-only mirror
+/// of the build pipeline's idempotency check (see [`build::artifacts_built`]);
+/// `false` when the pkgbase isn't in the index.
+fn pkgbase_built(session: &UpgradeSession, pb: &PkgBase) -> bool {
+    session
+        .secondary()
+        .lookup_pkgbase(session.index(), pb)
+        .is_some_and(|entry| {
+            let pkgnames: Vec<PkgName> = entry.pkgnames.iter().map(|p| p.name.clone()).collect();
+            build::artifacts_built(pb, &entry.version(), &pkgnames)
+        })
 }
 
 #[cfg(test)]

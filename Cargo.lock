@@ -827,6 +827,7 @@ dependencies = [
  "opentelemetry_sdk",
  "pacmanconf",
  "portable-pty",
+ "pty-harness",
  "rayon",
  "regex",
  "rkyv",
@@ -2380,6 +2381,14 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "pty-harness"
+version = "0.1.0"
+dependencies = [
+ "portable-pty",
+ "vt100",
 ]
 
 [[package]]

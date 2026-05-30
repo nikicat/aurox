@@ -4,6 +4,7 @@
 //! [`sort_for_display`], [`col_widths`], and [`render_row`] (all
 //! `pub(super)` for that reason).
 
+use super::cost::{PreviewMetrics, built_suffix, cost_of_root, time_col};
 use super::{color_on, dim};
 use crate::config::Config;
 use crate::names::PkgName;
@@ -345,11 +346,18 @@ impl Theme for UpgradePickerTheme<'_> {
 /// or stdin is not a TTY — same UX rule as [`super::confirm`]. Default mask is
 /// "repo rows checked, AUR rows per `cfg.aur_default_select`"; the AUR knob
 /// lets users opt into yay/paru parity (everything pre-selected).
+///
+/// `metrics` overlays the per-AUR-row cost columns: a right-aligned build-time
+/// estimate (`~Xm Ys` / `~?`, dimmed when stale) and a trailing `built` tag
+/// when the artifact is already on disk. The single-shot `-Syu` picker passes
+/// an empty overlay (it has no loop session to read the metrics store), so its
+/// rows render exactly as before.
 pub fn select_upgrades(
     plan: &[PkgUpgrade],
     cfg: &Config,
     noconfirm: bool,
     annotations: &RowAnnotations,
+    metrics: &PreviewMetrics,
 ) -> std::io::Result<UpgradeSelection> {
     if plan.is_empty() {
         return Ok(UpgradeSelection::default());
@@ -367,21 +375,39 @@ pub fn select_upgrades(
     let interactive = !noconfirm && std::io::stdin().is_terminal();
     let selected: Vec<usize> = if interactive {
         let (repo_w, name_w, old_w) = col_widths(&ordered);
+        // The build-time column sits after the (padded) new-version cell, so
+        // it needs `new_w` to align and `time_w` (max visible cell) to size
+        // itself. Repo rows / first-time AUR rows fill it with blanks.
+        let new_w = ordered.iter().map(|u| u.new_ver.len()).max().unwrap_or(0);
+        let costs: Vec<_> = ordered.iter().map(|u| cost_of_root(u, metrics)).collect();
+        let time_w = costs.iter().map(|c| c.visible_len()).max().unwrap_or(0);
         let colored = color_on();
         // Pass plain-ASCII labels to dialoguer so its redraw
         // (`clear_preserve_prompt`) measures byte length ≈ visible width;
         // it counts bytes against terminal columns to estimate wrap and
         // would otherwise over-clear every redraw — eating lines above the
         // prompt — when items carry ANSI escapes. Colour is reapplied at
-        // render time via [`UpgradePickerTheme`]. Session badges trail the
-        // version cell, so they don't perturb column alignment.
+        // render time via [`UpgradePickerTheme`]. The cost columns and session
+        // badges trail the version cell, so they don't perturb column
+        // alignment (the build-time cell is the last *aligned* column; the
+        // `built` tag and badges trail it unaligned).
+        let cost_cols = |u: &PkgUpgrade, cost, paint: Paint| {
+            let new_pad = " ".repeat(new_w.saturating_sub(u.new_ver.len()));
+            format!(
+                "{new_pad}  {}{}",
+                time_col(cost, time_w, paint.colored()),
+                built_suffix(cost, paint.colored()),
+            )
+        };
         let ascii_rows: Vec<String> = ordered
             .iter()
             .zip(&badges)
-            .map(|(u, b)| {
+            .zip(&costs)
+            .map(|((u, b), &cost)| {
                 format!(
-                    "{}{}",
+                    "{}{}{}",
                     render_row(u, repo_w, name_w, old_w, Paint::Plain),
+                    cost_cols(u, cost, Paint::Plain),
                     b.render(Paint::Plain),
                 )
             })
@@ -391,10 +417,12 @@ pub fn select_upgrades(
                 .iter()
                 .zip(&ascii_rows)
                 .zip(&badges)
-                .map(|((u, p), b)| {
+                .zip(&costs)
+                .map(|(((u, p), b), &cost)| {
                     let colored_row = format!(
-                        "{}{}",
+                        "{}{}{}",
                         render_row(u, repo_w, name_w, old_w, Paint::Colored),
+                        cost_cols(u, cost, Paint::Colored),
                         b.render(Paint::Colored),
                     );
                     (p.as_str(), colored_row)

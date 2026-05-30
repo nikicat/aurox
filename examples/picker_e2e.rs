@@ -36,7 +36,22 @@ fn main() {
 
     let plan = synthetic_plan(20);
     let cfg = Config::default();
-    let sel = ui::select_upgrades(&plan, &cfg, false, &ui::RowAnnotations::default())
+    // Exercise the cost columns under the redraw test too: give the AUR rows a
+    // build-time estimate and mark some already-built, so the build-time cell
+    // (dimmed on built rows) and the trailing `built` tag are on screen while
+    // the harness checks dialoguer's wrap math.
+    let mut metrics = ui::PreviewMetrics::empty();
+    for (i, u) in plan.iter().enumerate() {
+        if u.repo == REPO_AUR {
+            metrics
+                .root_build_secs
+                .insert(u.name.clone(), 60 * (i as u64 + 1));
+            if i % 2 == 0 {
+                metrics.built_roots.insert(u.name.clone());
+            }
+        }
+    }
+    let sel = ui::select_upgrades(&plan, &cfg, false, &ui::RowAnnotations::default(), &metrics)
         .expect("picker failed");
 
     // Echo the selection on stdout so the test can confirm the prompt ran

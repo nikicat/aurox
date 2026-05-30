@@ -8,6 +8,14 @@ repository = "https://github.com/nikicat/gitaur"
 keywords = ["aur", "archlinux", "pacman", "package-manager"]
 categories = ["command-line-utilities"]
 
+# `pty-harness` (the e2e example drivers' shared PTY harness) is a workspace
+# member so it shares this Cargo.lock. Outside a workspace, running cargo inside
+# its directory would write a second, redundant `pty-harness/Cargo.lock`.
+# `default-members` keeps bare `cargo build`/`cargo test` scoped to gitaur.
+[workspace]
+members = ["pty-harness"]
+default-members = ["."]
+
 [lib]
 name = "gitaur"
 path = "src/lib.rs"
@@ -156,6 +164,11 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 [dev-dependencies]
 tempfile = "3"
 vt100 = "0.16"
+# PTY test harness shared by the e2e example drivers (examples/*_e2e.rs). Its
+# own crate so its API is genuinely `pub` (the drivers are external users),
+# sidestepping the bin-crate visibility-lint tension a shared in-example module
+# would hit. See `pty-harness/src/lib.rs`.
+pty-harness = { path = "pty-harness" }
 # Integration tests that drive `bootstrap_clone` need to hand it a
 # `MultiProgress`; it's already a normal dep, so cargo unifies the version.
 indicatif = "0.18"

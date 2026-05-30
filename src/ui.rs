@@ -12,12 +12,14 @@
 //! Splitting the two lets callers `set_message` without clobbering the label.
 
 mod change_set;
+mod cost;
 mod gix_progress;
 mod progress;
 mod prompts;
 mod tables;
 
-pub use change_set::{PreviewMetrics, change_set_table};
+pub use change_set::change_set_table;
+pub use cost::PreviewMetrics;
 pub use gix_progress::GixProgress;
 pub use progress::{
     TICK_PERIOD, bar_bytes, bar_bytes_streaming, bar_count, bar_sideband, promote_byte_bar,

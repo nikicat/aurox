@@ -11,9 +11,15 @@ pacman DBs with no store (`PacmanIndex::{installed_size, sync_download_size}` +
 by `build::metrics::MetricsStore` (`rusqlite` over `state_dir()/metrics.db`)
 and a `built_at_ms`-based staleness dim — see `src/build/metrics.rs` and the
 new `src/ui/change_set.rs` module (the change-set preview was split out of
-`src/ui/tables.rs` when it grew its own type cluster). Phase 4 (custom picker)
-is not started. The single-shot `-Syu` flow remains `dispatch::handle_s` in
-`src/cli/dispatch.rs`.
+`src/ui/tables.rs` when it grew its own type cluster). The build-time column and
+an **already-built column** now also appear on the interactive picker, not just
+the confirm screen — the shared cost cells (`TimeEst`, `PreviewMetrics`,
+`RowCost`, the `built` tag) live in a leaf `src/ui/cost.rs` that both the picker
+(`tables.rs`) and the preview (`change_set.rs`) draw from. The rest of phase 4
+(live inline dep-expansion + the `v` review hotkey, both needing a custom
+picker) is not started. The single-shot `-Syu` flow remains `dispatch::handle_s`
+in `src/cli/dispatch.rs` (it passes an empty cost overlay, so its picker rows
+render as before).
 
 ## Problem
 
@@ -399,6 +405,41 @@ moves forward on reinstalls without a fresh measurement) compared against a
 Stale `Estimate` cells render through `ui::dim`; `Unknown` and `None` cells
 are never dimmed (a dimmed `~?` reads as a render glitch).
 
+### Already-built column — DONE
+
+Independent of the stored metrics, both the picker and the change-set preview
+flag rows whose artifact is **already on disk** — a build that was completed in
+an earlier batch/session but not yet installed (e.g. the user declined the sudo
+gate, or a later pkgbase in the stratum failed). Such a row is free: `pacman -U`
+reuses the cached `.pkg.tar.{zst,xz}` instead of rebuilding.
+
+The check is a read-only mirror of the build pipeline's idempotency test
+(`build::artifacts_built` — a matching `.pkg.tar.*` at the index's exact
+`[epoch:]pkgver-pkgrel` in the pkgbase's worktree), so the column never
+disagrees with what the build would actually do. It touches only the worktree —
+no fetch, no `makepkg`, no localdb — so it's cheap to call per candidate while
+drawing the picker. VCS pkgbases (dynamic `pkgver`) never match, which is
+correct: they always rebuild. A built row renders a trailing `built` tag
+(unaligned, like the session badges) and dims its build-time cell — the recorded
+duration is shown for context but the rebuild cost is moot.
+
+**Scope is per-row, not per-pkgbase.** The picker and preview list each
+split-package pkgname as its **own** row, so the tag is resolved per **pkgname**
+(`row_built` checks just that row's artifact) — `cuda` can read built while
+`cuda-tools` from the same pkgbase does not. The pulled-in AUR **dep** rows are
+the one exception: the preview labels them by pkgbase (one row per build unit),
+so they use the whole-pkgbase "every member present" check (`pkgbase_built`).
+makepkg emits all members in one pass, so the two rarely diverge — but a partial
+on-disk state now renders honestly per row instead of all-or-nothing.
+
+Covered end to end by `tests/container/extended/06_loop_built_tag.sh`: it stages
+an installed-but-outdated foreign pkg, publishes a newer version to the mock
+AUR, pre-places that version's artifact in the build worktree, then drives the
+real loop under a PTY (via the `loop_built_tag_e2e` example) and asserts the
+picker row carries the `built` tag — proving the worktree path, artifact
+filename, and index version all line up against the live binary. The shared PTY
+plumbing those drivers use lives in the `pty-harness` dev-dependency crate.
+
 ### Batch total before apply — DONE
 
 The confirm screen sums the size column of the whole resolved change set
@@ -451,7 +492,13 @@ No row moves; the badge carries the state.
    `src/build.rs::run_build` (capture) + `src/ui/change_set.rs` (`TimeEst`,
    render, batch total) — see "Build time" above.
 4. **Polish / custom picker (route 2).** Live inline dep-expansion and the
-   `v` review hotkey in a custom picker; optional `source_dl_bytes`.
+   `v` review hotkey in a custom picker; optional `source_dl_bytes`. *Partially
+   landed:* the build-time column and the already-built column now render on the
+   picker too (the dialoguer `MultiSelect` rows just gained trailing cost cells +
+   a `built` tag — see "Already-built column"). The shared cost cells moved to
+   `src/ui/cost.rs`. Still pending: live inline dep-expansion on toggle and the
+   `v` hotkey, which genuinely need the custom picker (`MultiSelect` has no
+   toggle-time or custom-key hook).
 
 Phase 1 is independently shippable and delivers most of the felt
 improvement; 2–3 are the cost-visibility payload; 4 is the slicker picker.

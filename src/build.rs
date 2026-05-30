@@ -35,6 +35,31 @@ pub mod upgrade;
 
 pub use upgrade::{UpgradeSession, cmd_query_upgrades, collect_upgrade_plan};
 
+/// Read-only mirror of [`prepare_one`]'s idempotency check.
+///
+/// For the upgrade picker and change-set preview: whether every pkgname in
+/// `pkgnames` already has a built `.pkg.tar.{zst,xz}` at `version` in
+/// `pkgbase`'s worktree, so a `pacman -U` would reuse the artifact instead of
+/// rebuilding. The caller chooses the scope: a **single** pkgname for one
+/// split-package row (the picker lists each pkgname separately, so each gets
+/// its own `built` tag), or the pkgbase's **full** pkgname set to ask "is this
+/// whole pkgbase's build done?".
+///
+/// Touches only the on-disk worktree — no fetch, no `makepkg`, no localdb — so
+/// it's safe to call once per candidate while drawing the picker. VCS pkgbases
+/// (dynamic `pkgver`) never match here, which is correct: they always rebuild.
+/// An empty `pkgnames` is never "built" (matches the cache check, which would
+/// otherwise vacuously succeed on a pkgbase that produces nothing).
+pub fn artifacts_built(pkgbase: &PkgBase, version: &Version, pkgnames: &[PkgName]) -> bool {
+    let Ok(found) = install::find_produced(&paths::pkg_worktree(pkgbase)) else {
+        return false;
+    };
+    !pkgnames.is_empty()
+        && pkgnames
+            .iter()
+            .all(|name| found.iter().any(|f| install::matches_pkg(f, name, version)))
+}
+
 /// One built pkgbase's set of `.pkg.tar.zst` outputs.
 struct BuiltPkg {
     pkgbase: PkgBase,
@@ -1010,5 +1035,47 @@ mod tests {
         let required = vec![pn("test-trivial")];
         let kept = select_outputs(&files, &required, &Version::from("1.0-1"));
         assert_eq!(kept, files);
+    }
+
+    /// `artifacts_built` scopes to whatever pkgname set the caller passes — the
+    /// distinction the picker relies on. A split pkgbase whose worktree holds
+    /// only *one* member's artifact reads built for that member (the per-row
+    /// query) but not for the whole pkgbase (the dep-row query). The matching
+    /// version must be exact, and a never-built pkgbase is never built.
+    #[test]
+    fn artifacts_built_scopes_to_requested_pkgnames() {
+        use crate::testing::ScopedStateRoot;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let _root = ScopedStateRoot::new(tmp.path().to_path_buf());
+
+        // A split pkgbase `splitpkg` producing `splitpkg-a` and `splitpkg-b`,
+        // but only `-a`'s artifact is on disk at 2.0-1.
+        let pkgbase = pb("splitpkg");
+        let wt = paths::pkg_worktree(&pkgbase);
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join("splitpkg-a-2.0-1-x86_64.pkg.tar.zst"), "").unwrap();
+        let ver = Version::from("2.0-1");
+
+        // Per-row (single pkgname): the built member reads built, its sibling
+        // does not — each split row gets its own answer.
+        assert!(artifacts_built(&pkgbase, &ver, &[pn("splitpkg-a")]));
+        assert!(!artifacts_built(&pkgbase, &ver, &[pn("splitpkg-b")]));
+        // Whole-pkgbase (dep row): not done until every member is present.
+        assert!(!artifacts_built(
+            &pkgbase,
+            &ver,
+            &[pn("splitpkg-a"), pn("splitpkg-b")]
+        ));
+
+        // Version must match exactly, and an empty set is never built.
+        assert!(!artifacts_built(
+            &pkgbase,
+            &Version::from("2.0-2"),
+            &[pn("splitpkg-a")]
+        ));
+        assert!(!artifacts_built(&pkgbase, &ver, &[]));
+        // A pkgbase with no worktree at all is simply not built.
+        assert!(!artifacts_built(&pb("ghost"), &ver, &[pn("ghost")]));
     }
 }

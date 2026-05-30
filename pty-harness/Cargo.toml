@@ -1,0 +1,27 @@
+[package]
+name = "pty-harness"
+version = "0.1.0"
+edition = "2024"
+description = "PTY test harness: spawn the gaur binary under a virtual terminal and walk its TUI for the e2e example drivers."
+license = "MIT"
+repository = "https://github.com/nikicat/gitaur"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+portable-pty = "0.9"
+vt100 = "0.16"
+
+# A real lib crate (the e2e example drivers are its external users), so `pub` is
+# genuinely reachable here — none of the bin-crate visibility tension that an
+# in-example module hits. Lighter lint set than the main crate: this is test
+# scaffolding, so we keep `unsafe` out and `clippy::all` on, but skip the
+# pedantic doc-nags (`missing_panics_doc` et al.) — the harness panics by design
+# on a failed expectation, that's its contract.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

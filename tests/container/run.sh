@@ -55,11 +55,12 @@ fi
 # Build the binary on the host once, mount /work read-only. In coverage mode
 # the orchestrator has already produced an instrumented binary, so we skip.
 if [[ -z "$coverage_dir" ]]; then
-    # `tarpit` is the HTTP-stall example used by the idle-timeout test in
-    # extended/; `upgrade_loop_e2e` is the PTY driver for the upgrade-loop test.
-    # Building them alongside gaur is cheap and keeps the tests container-side
-    # (no host cargo inside the container).
-    ( cd "$REPO_ROOT" && cargo build --bin gaur --example tarpit --example upgrade_loop_e2e )
+    # Build gaur plus every example driver the suite shells out to: `tarpit`
+    # (HTTP-stall for the idle-timeout test) and the PTY loop drivers
+    # (`upgrade_loop_e2e`, `loop_built_tag_e2e`, …). `--examples` builds them
+    # all, so adding a new scenario driver needs no edit here. Cheap, and keeps
+    # the tests container-side (no host cargo inside the container).
+    ( cd "$REPO_ROOT" && cargo build --bin gaur --examples )
 else
     mkdir -p "$coverage_dir"
 fi

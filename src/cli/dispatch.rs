@@ -102,9 +102,18 @@ fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8
         if plan.is_empty() {
             ui::info("nothing to do");
         } else {
-            // Single-shot `-Syu` has no prior batch, so no row annotations.
-            let sel = ui::select_upgrades(&plan, cfg, noconfirm, &ui::RowAnnotations::default())
-                .map_err(|e| Error::other(format!("upgrade selection: {e}")))?;
+            // Single-shot `-Syu` has no prior batch (no row annotations) and no
+            // loop session to read the metrics store, so the cost overlay is
+            // empty — rows render as before, without the build-time/built
+            // columns.
+            let sel = ui::select_upgrades(
+                &plan,
+                cfg,
+                noconfirm,
+                &ui::RowAnnotations::default(),
+                &ui::PreviewMetrics::empty(),
+            )
+            .map_err(|e| Error::other(format!("upgrade selection: {e}")))?;
             if sel.is_empty() {
                 return Err(Error::UserAbort);
             }
