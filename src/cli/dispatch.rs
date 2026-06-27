@@ -4,7 +4,7 @@ use crate::build;
 use crate::cli::Cli;
 use crate::cli::flags::{self, PacFlags};
 use crate::cli::search;
-use crate::cli::upgrade_loop;
+use crate::cli::shell;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index;
@@ -20,17 +20,17 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
     let argv = &cli.args;
     let f = flags::parse(argv);
 
-    // yay parity: no operation letter and no positional targets → run `-Syu`
-    // (refresh + upgrade). Interactively this is the iterative upgrade loop
-    // (refresh once, then picker→apply until done — see `upgrade_loop`); a
-    // non-interactive run (--noconfirm, piped stdin, cron) does a single pass
-    // like explicit `-Syu`. Replaces an older "no-args = -Sy only" shortcut:
-    // bare `yay` / bare `paru` both upgrade, and gitaur's lone outlier was a
-    // surprise rather than a feature.
+    // yay parity: no operation letter and no positional targets. Interactively
+    // this opens the shell (REPL) — see `cli::shell`; in phase 1 its `upgrade`
+    // command bridges to the iterative upgrade loop. A non-interactive run
+    // (--noconfirm, piped stdin, cron) does a single `-Syu` pass like explicit
+    // `-Syu`. Replaces an older "no-args = -Sy only" shortcut: bare `yay` /
+    // bare `paru` both upgrade, and gitaur's lone outlier was a surprise rather
+    // than a feature.
     if f.op.is_none() && f.positional.is_empty() {
         let interactive = !cli.noconfirm && std::io::stdin().is_terminal();
         if interactive {
-            return upgrade_loop::run(cfg, cli.devel || cfg.devel);
+            return shell::run(cfg, cli.devel || cfg.devel);
         }
         let syu = vec!["-Syu".to_owned()];
         let synth = flags::parse(&syu);

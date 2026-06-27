@@ -317,12 +317,21 @@ sessions; an optional rustyline `Hinter` can ghost-suggest from history later.
 
 Each phase is independently shippable and leaves the flag CLI fully working.
 
-1. **REPL skeleton.** rustyline loop, `shell-words` parse, `Command` enum, the
-   session hoist (reuse `UpgradeSession`), `help`/`quit`/Ctrl-C/Ctrl-D, history
-   file. Wire the no-arg interactive branch to `shell::run`; keep `upgrade_loop`
-   as the fallback the branch *was* calling (feature-gate or direct swap — TBD).
-   `ShellEnv` trait + pure `dispatch` core with a scripted-fake unit test, like
-   `drive`/`FakeEnv`.
+1. **REPL skeleton. — DONE.** rustyline loop, `shell-words` parse, `Command`
+   enum, `help`/`quit`/Ctrl-C/Ctrl-D, persistent history, and the `ShellEnv` +
+   pure `dispatch` split with scripted-fake unit tests (mirrors `drive`/`FakeEnv`).
+   Landed in `src/cli/shell.rs` + `src/cli/shell/command.rs`; wired at the no-arg
+   interactive branch of `cli/dispatch.rs`. **As shipped — deviations from the
+   sketch above:**
+   - *Direct swap, no env gate.* Bare interactive `gaur` enters the shell
+     unconditionally (the `GITAUR_SHELL` gate idea was dropped). Non-interactive
+     bare `gaur` still does single-shot `-Syu`.
+   - *`upgrade` bridges to the loop.* Rather than feature-gate `upgrade_loop`, the
+     phase-1 `upgrade` command delegates to `upgrade_loop::run` via the `ShellEnv`
+     seam — so the headline upgrade flow doesn't regress and `upgrade_loop` stays
+     reachable (no dead code) until phases 3–4 replace it with cart staging.
+   - *Session hoist + startup refresh deferred to phase 2*, when `search` first
+     needs the loaded index. The cart-staging verbs are acknowledged stubs for now.
 2. **Read-only commands + selector core.** `search` (reuse `search.rs` query →
    numbered output, remember list), `info`, and the `Selector` parse+resolve
    (numbers/ranges/names/globs) — the reusable core every later command needs.

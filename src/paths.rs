@@ -85,6 +85,15 @@ pub fn metrics_db_path() -> PathBuf {
     state_dir().join("metrics.db")
 }
 
+/// Persistent command history for the interactive shell (`gaur` REPL).
+///
+/// Lives under the state dir alongside logs/traces so it follows the same
+/// XDG + test-override rules; rustyline loads it at session start and appends
+/// on exit. See [`crate::cli::shell`].
+pub fn shell_history_path() -> PathBuf {
+    state_dir().join("shell_history")
+}
+
 /// Create the state directory tree if missing.
 pub fn ensure_state_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(state_dir())?;

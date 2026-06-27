@@ -160,6 +160,8 @@ nix = { version = "0.31", features = ["resource", "signal"] }
 # (Arch ships it but a `--no-default-features` reviewer build might not). The
 # schema is one table with two columns; we don't need feature flags.
 rusqlite = { version = "0.40", features = ["bundled"] }
+rustyline = "18.0.1"
+shell-words = "1.1.1"
 
 [dev-dependencies]
 tempfile = "3"
