@@ -26,51 +26,81 @@ family operations and the AUR-related half of `-Syu`.
 
 ## Module map
 
+Each parent module is a `<name>.rs` file (not `<name>/mod.rs`) sitting
+next to its `<name>/` submodule directory — the Rust-2018 path layout.
+
 ```
 src/
-├── cli/             argv pre-scan + clap + dispatch to handlers
-│   ├── mod.rs       entry point; pre-scan routes pacman-owned ops
-│   ├── flags.rs     pacman-style clustered flag parser (-Syyu → S,y,y,u)
-│   └── dispatch.rs  routes to mirror / index / build subcommands
+├── cli.rs           top-level CLI entry: pre-scan routes pacman-owned ops, then clap
+├── cli/
+│   ├── flags.rs        pacman-style clustered flag parser (-Syyu → S,y,y,u)
+│   ├── dispatch.rs     routes to mirror / index / build subcommands
+│   ├── search.rs       `gaur <term>...` — yay-style fuzzy search → multi-select → install
+│   └── upgrade_loop.rs the no-arg `gaur` upgrade loop (session, picker, retry)
 │
-├── mirror/          AUR mirror lifecycle
-│   ├── mod.rs       cmd_refresh: clone-or-fetch + index update
-│   ├── clone.rs     gix bare clone (custom refspec — see TESTING.md)
-│   ├── fetch.rs     incremental gix fetch; emits RefUpdate deltas
-│   ├── worktree.rs  per-pkgbase build worktrees via git linked worktrees
-│   └── sideband.rs  parse libgit2 sideband for nicer progress UI
+├── mirror.rs        cmd_refresh: clone-or-fetch + index update
+├── mirror/
+│   ├── clone.rs        gix bare clone (custom refspec — see TESTING.md)
+│   ├── fetch.rs        incremental gix fetch; emits RefUpdate deltas
+│   ├── worktree.rs     per-pkgbase build worktrees via git linked worktrees
+│   └── sideband.rs     parse the server sideband stream for nicer progress UI
 │
-├── index/           rkyv-archived AUR catalog
-│   ├── mod.rs       load/save/search/info
-│   ├── schema.rs    IndexFile + IndexEntry definitions
-│   ├── build.rs     full_build: parallel parse of every .SRCINFO blob
-│   ├── update.rs    incremental_update: applies RefUpdate deltas
-│   ├── secondary.rs by_name / by_provides hash tables (built post-load)
-│   └── srcinfo.rs   tiny .SRCINFO parser
+├── index.rs         load/save/search/info over the rkyv-archived catalog
+├── index/
+│   ├── schema.rs       IndexFile + IndexEntry definitions (FORMAT_VERSION)
+│   ├── build.rs        full_build: parallel parse of every .SRCINFO blob
+│   ├── update.rs       incremental_update: applies RefUpdate deltas
+│   ├── secondary.rs    by_name / by_provides hash tables (built post-load)
+│   └── srcinfo.rs      tiny .SRCINFO parser
 │
-├── resolver/        plan a `-S` invocation
-│   ├── mod.rs       resolve: BFS into Plan + Kahn strata
-│   ├── classify.rs  installed / repo / aur(idx) / missing
-│   └── topo.rs      sort (flat) + strata (Kahn layered)
+├── resolver.rs      resolve: BFS into Plan + Kahn strata
+├── resolver/
+│   ├── classify.rs        installed / repo / aur(idx) / missing
+│   ├── pkgbase_expand.rs  expand pkgbase-only targets → explicit pkgnames + hints
+│   └── topo.rs            sort (flat) + strata (Kahn layered)
 │
-├── build.rs         the install pipeline entry: cmd_install + cmd_clean
+├── build.rs         the install pipeline entry: cmd_install + cmd_clean + artifacts_built
 ├── build/
-│   ├── makepkg.rs   spawn makepkg under a pty (preserves colour) with PKGDEST/SRCDEST/BUILDDIR pinned
-│   ├── install.rs   .pkg.tar.zst discovery + pkgname extraction
-│   ├── review.rs    PKGBUILD diff review prompt
-│   ├── print.rs     review-table + install-summary rendering
-│   └── upgrade.rs   collect_upgrade_plan: foreign-localdb × AUR index walk
+│   ├── makepkg.rs      spawn makepkg under a pty (preserves colour) with PKGDEST/SRCDEST/BUILDDIR pinned
+│   ├── install.rs      .pkg.tar.* discovery (find_produced) + pkgname/version matching
+│   ├── review.rs       PKGBUILD diff review prompt
+│   ├── print.rs        review-table + install-summary rendering
+│   ├── upgrade.rs      collect_upgrade_plan: foreign-localdb × AUR index walk
+│   └── metrics.rs      per-pkgbase build-duration history (rusqlite, metrics.db)
 │
-├── pacman/          everything that wraps pacman / libalpm
-│   ├── alpm_db.rs   open Alpm + PacmanIndex snapshot (sync DBs)
-│   ├── invoke.rs    spawn `pacman` (with sudo escalation)
-│   └── vercmp.rs    pacman version comparison
+├── pacman.rs        interop with system pacman (passthrough exec, alpm DB reads)
+├── pacman/
+│   ├── alpm_db.rs      open Alpm + PacmanIndex snapshot (sync DBs, size maps)
+│   ├── invoke.rs       spawn `pacman` (with sudo escalation)
+│   ├── sync.rs         rootless refresh of the official sync DBs (checkupdates-style)
+│   └── verdiff.rs      structural parse + display-diff of Arch versions
 │
-├── config/          ~/.config/gitaur/config.toml + defaults
+├── config.rs        ~/.config/gitaur/config.toml loader
+├── config/
+│   └── defaults.rs     built-in defaults when a field/file is absent
+│
+├── ui.rs            colored CLI output (banners, package lists, bars, prompts)
+├── ui/
+│   ├── tables.rs       aligned install/upgrade tables + the interactive picker
+│   ├── change_set.rs   pre-apply change-set preview for the upgrade loop
+│   ├── cost.rs         per-row cost cells shared by tables.rs + change_set.rs
+│   ├── progress.rs     indicatif bars / spinners
+│   ├── gix_progress.rs adapter wiring gix's progress traits onto our bars
+│   └── prompts.rs      y/n + per-pkgname pickers
+│
+├── logging.rs       tracing subscriber setup
+├── logging/
+│   └── chrome.rs       OTEL SpanExporter → Chrome/Perfetto trace JSON
+│
+├── bin/trace.rs     `gitaur-trace` binary: read-side trace analysis
 ├── error.rs         single Error enum (anyhow-free; we own the variants)
-├── logging.rs       per-run rotating debug log under state_dir/logs
+├── git.rs           centralized, instrumented system-`git` invocation
+├── names.rs         typed PkgName / PkgBase / PkgTarget / VirtualName
+├── version.rs       typed [epoch:]pkgver-pkgrel with vercmp baked in
 ├── paths.rs         XDG-aware state/config path helpers
-├── ui.rs            pacman/yay-style banners, prompts, progress bars
+├── rotate.rs        per-run file creation + retention (logs, traces)
+├── runopts.rs       per-invocation CLI options via a thread-local
+├── trace.rs         read-side span-trace analysis (shared by bin/trace.rs)
 └── testing.rs       #[doc(hidden)] shared test helpers (git CLI runner)
 ```
 
@@ -549,12 +579,31 @@ The catalog is rebuilt incrementally — `index::update::incremental_update`
 applies the `RefUpdate` deltas produced by `mirror::fetch::incremental_fetch`,
 so a `gaur -Sy` doesn't re-parse the 99 % of pkgbases that didn't move.
 
-### Why a state DB (SQLite) for builds?
+### Why no build state DB — idempotency keys on the artifact filename
 
-`build/state_db.rs` records `last_built_commit_oid` per pkgbase. Lets us
-skip `makepkg` when the worktree is already at that commit AND the
-`.pkg.tar.zst` is still on disk — idempotent re-runs after a declined
-`pacman -U` or interrupted install.
+There is deliberately **no** sidecar "what did we build" database. A
+pkgbase counts as already-built when its worktree holds a
+`.pkg.tar.{zst,xz}` named at the AUR index's exact `[epoch:]pkgver-pkgrel`
+for *every* required pkgname; `prepare_one` (`src/build.rs`) makes that
+check via `install::find_produced` + `install::matches_pkg` and returns
+`Disposition::Cached`, skipping `makepkg`. The artifact filename
+(`<pkgname>-<version>-<arch>.pkg.tar.zst`) *is* the cache key, so a
+declined `pacman -U` or interrupted install just replays the install step
+with no rebuild. VCS pkgbases never hit this cache — their static
+`pkgver` differs from the dynamic one `pkgver()` writes into the filename
+— so `-git`/`-svn`/etc. always rebuild, which is correct.
+
+`build::artifacts_built` is a read-only mirror of the same check, used by
+the upgrade picker / change-set preview to flag rows whose build is
+already done (see `docs/UPDATE_LOOP.md`). Keeping idempotency derived
+from on-disk artifacts rather than a stored `last_built_commit` follows
+the "minimize persisted state" rule: nothing is recorded that the
+artifacts themselves don't already say.
+
+The one thing that genuinely *can't* be derived from a pacman DB or an
+artifact — per-pkgbase **build duration** — is the sole persisted build
+metric, in `metrics.db` (`src/build/metrics.rs`, `rusqlite`). It is a
+cost-visibility hint for the picker, never a gate on what gets built.
 
 ### Why gix instead of libgit2 / shelling out to `git`?
 
@@ -590,9 +639,10 @@ to plumb it through both.
 | --------------------------------------------- | ---------------- | ------------------------------------- |
 | `~/.local/state/gitaur/aur/`                  | gix bare clone   | AUR mirror, branches under `refs/heads/<pkgbase>` |
 | `~/.local/state/gitaur/index.bin`             | `index::save`    | rkyv-archived `IndexFile`             |
-| `~/.local/state/gitaur/pkgs/<pkgbase>/`       | linked worktrees | per-pkgbase build dir                 |
-| `~/.local/state/gitaur/state.db`              | rusqlite         | last-built commit per pkgbase         |
+| `~/.local/state/gitaur/pkgs/<pkgbase>/`       | linked worktrees | per-pkgbase build dir (+ cached `.pkg.tar.*` — the build cache key) |
+| `~/.local/state/gitaur/metrics.db`            | rusqlite         | per-pkgbase build duration (cost hint only) |
 | `~/.local/state/gitaur/logs/`                 | logging          | last 10 invocation logs               |
+| `~/.local/state/gitaur/traces/`               | logging          | per-run Chrome/Perfetto span traces   |
 | `~/.config/gitaur/config.toml`                | user             | overrides for `config::defaults`      |
 
 ## Common gotchas for new maintainers

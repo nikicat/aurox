@@ -299,7 +299,8 @@ worth adding (in roughly priority order):
 - `install_hook_runs.sh`
 - `provides_virtual_resolves.sh`
 - `cycle_in_aur_deps_errors.sh` (we have one for cycle-makedep already)
-- `rebuild_cached_skips.sh` (state.db idempotency)
+- `rebuild_cached_skips.sh` (artifact-cache idempotency — a pkgbase whose
+  `.pkg.tar.*` is already on disk at the index version skips makepkg)
 - `mirror_unreachable.sh` (rm /srv/mock-aur mid-test)
 
 Pick from `tests/container/extended/.scope` for the full backlog.

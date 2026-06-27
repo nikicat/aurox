@@ -1,5 +1,19 @@
 # gitaur — yay-like AUR helper backed by the GitHub mirror
 
+> **Historical planning document.** This is the original master plan /
+> brainstorm that kicked off gitaur. It is kept for context only — the
+> "Status (updated)" section near the bottom is a stale snapshot (it still
+> mentions a `build/state_db.rs`, a never-completed bootstrap clone, "43
+> tests", and features long since exercised end-to-end). For the current,
+> maintained picture see:
+> [`README.md`](README.md) (usage),
+> [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) (internals),
+> [`docs/TESTING.md`](docs/TESTING.md),
+> [`docs/COMPARISON.md`](docs/COMPARISON.md),
+> [`docs/UPDATE_LOOP.md`](docs/UPDATE_LOOP.md), and
+> [`docs/FETCH_OPTIMIZATION.md`](docs/FETCH_OPTIMIZATION.md).
+> Don't trust the status claims below; trust the code and `docs/`.
+
 ## Context
 
 `aur.archlinux.org` has poor uptime; the user prefers the github.com/archlinux/aur monorepo (one branch per package, ~155k branches, ~2 GiB pack) as the source of truth. No mainstream AUR helper uses it. We benchmarked:
