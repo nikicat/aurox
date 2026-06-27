@@ -332,10 +332,17 @@ Each phase is independently shippable and leaves the flag CLI fully working.
      reachable (no dead code) until phases 3–4 replace it with cart staging.
    - *Session hoist + startup refresh deferred to phase 2*, when `search` first
      needs the loaded index. The cart-staging verbs are acknowledged stubs for now.
-2. **Read-only commands + selector core.** `search` (reuse `search.rs` query →
-   numbered output, remember list), `info`, and the `Selector` parse+resolve
-   (numbers/ranges/names/globs) — the reusable core every later command needs.
-   Tab-completion of verbs + names.
+2. **Read-only commands + selector core. — DONE (tab-completion pending).**
+   The session is hoisted once via `UpgradeSession`; `search` runs the combined
+   repo+AUR query (reusing `search.rs`'s `Row`/labels) and prints a numbered
+   list the session remembers; `info` resolves number/range/name/glob through
+   the new `Selector` core (`src/cli/shell/selector.rs`) against the remembered
+   list + a name universe built once at session start. Search terms now carry a
+   dedicated `SearchTerm` type and `info`/`-Si` targets are `PkgTarget` (threaded
+   through `search_sync`/`cmd_search`/`cmd_info`), so the command surface stays
+   typed end to end. Landed in `src/cli/shell.rs` + `selector.rs` + `command.rs`.
+   **Still pending:** the rustyline `Completer` (verbs + names) — the sorted name
+   universe is already built and ready for it.
 3. **Cart + apply (interim, pacman calls).** `add`/`drop`/`remove`/`clear`/`show`
    building the `Cart`; `apply` = resolve (`build::resolve_targets`) →
    `ui::change_set_table` preview (incl. "will remove" rows from a read-only

@@ -8,7 +8,7 @@
 use super::sync;
 use crate::error::{Error, Result};
 use crate::index::schema::IndexEntry;
-use crate::names::{PkgName, PkgTarget};
+use crate::names::{PkgName, PkgTarget, SearchTerm};
 use crate::version::{Ver, Version};
 use alpm::Alpm;
 use std::collections::{HashMap, HashSet};
@@ -85,7 +85,7 @@ pub struct RepoHit {
 /// by the `gaur <term>` picker to show repo packages alongside AUR ones the
 /// way yay/paru do.
 #[instrument]
-pub fn search_sync(terms: &[String]) -> Result<Vec<RepoHit>> {
+pub fn search_sync(terms: &[SearchTerm]) -> Result<Vec<RepoHit>> {
     let alpm = open()?;
     let installed: HashSet<String> = alpm
         .localdb()
@@ -97,7 +97,7 @@ pub fn search_sync(terms: &[String]) -> Result<Vec<RepoHit>> {
     let mut seen: HashSet<String> = HashSet::new();
     for db in alpm.syncdbs() {
         let matches = db
-            .search(terms.iter().map(String::as_str))
+            .search(terms.iter().map(SearchTerm::as_str))
             .map_err(|e| Error::other(format!("search {}: {e}", db.name())))?;
         for p in &matches {
             // First DB declaring the name wins, matching pacman's repo

@@ -43,7 +43,7 @@
 //!     are typed as `Vec<PkgTarget>` (versioned dep specs), with their
 //!     bare name retrievable via [`PkgTarget::bare`].
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use rkyv::{Archive, Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::fmt;
@@ -91,6 +91,59 @@ pub struct PkgBase(String);
 #[rkyv(compare(PartialEq, PartialOrd))]
 pub struct PkgTarget(String);
 
+/// A freeform search pattern the user typed — `-Ss`, the shell's `search`, and
+/// the bare-term picker all take these.
+///
+/// It's a regex fragment, **not** a package name: keeping it distinct from
+/// [`PkgName`] / [`PkgBase`] / [`PkgTarget`] stops a query string from being
+/// passed where a classified package reference is expected (and vice versa).
+/// Transparent over `String`; the one `str`-shaped operation it owns is
+/// compiling itself to the case-insensitive [`Regex`] search uses, so that
+/// policy lives in exactly one place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchTerm(String);
+
+impl SearchTerm {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// The raw pattern as a slice — for the alpm `db.search` API, which takes
+    /// `&str` terms directly.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Compile to the case-insensitive regex search matches with (name + desc).
+    /// Centralizing the case-insensitive policy here keeps every search path —
+    /// `-Ss`, the shell, the picker — matching identically.
+    pub fn compile(&self) -> Result<Regex, regex::Error> {
+        RegexBuilder::new(&self.0).case_insensitive(true).build()
+    }
+}
+
+impl From<&str> for SearchTerm {
+    fn from(s: &str) -> Self {
+        Self(s.to_owned())
+    }
+}
+
+impl From<String> for SearchTerm {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
+
+impl fmt::Display for SearchTerm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A virtual name declared in an AUR pkg's `provides=` array — **not** a pkgname.
 ///
 /// It's a "this package satisfies the name X" claim, and multiple pkgs can
@@ -116,6 +169,12 @@ macro_rules! impl_name_wrapper {
             }
             pub fn into_inner(self) -> String {
                 self.0
+            }
+            /// Borrow the wrapped value as a string slice — the sanctioned
+            /// escape hatch for `&str`-typed APIs (there's deliberately no
+            /// `AsRef<str>` / `Deref`, so this call site stays visible).
+            pub fn as_str(&self) -> &str {
+                &self.0
             }
             pub const fn is_empty(&self) -> bool {
                 self.0.is_empty()

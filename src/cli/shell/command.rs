@@ -5,11 +5,13 @@
 //! argument-bearing verbs keep their args as raw strings; later phases parse
 //! them into `Selector`s (numbers / ranges / names / globs).
 
+use crate::names::SearchTerm;
+
 /// One parsed shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// `search <terms…>` — find packages across repos + AUR.
-    Search(Vec<String>),
+    Search(Vec<SearchTerm>),
     /// `info <pkg…>` — show package details.
     Info(Vec<String>),
     /// `add <pkg…>` — stage packages to install.
@@ -81,7 +83,7 @@ pub fn parse(line: &str) -> Command {
     };
     let args = args.to_vec();
     match verb.to_ascii_lowercase().as_str() {
-        "search" => Command::Search(args),
+        "search" => Command::Search(args.into_iter().map(SearchTerm::from).collect()),
         "info" => Command::Info(args),
         "add" | "install" => Command::Add(args),
         "drop" | "unstage" => Command::Drop(args),
@@ -106,9 +108,16 @@ mod tests {
         parts.iter().map(|s| (*s).to_owned()).collect()
     }
 
+    fn terms(parts: &[&str]) -> Vec<SearchTerm> {
+        parts.iter().map(|s| SearchTerm::from(*s)).collect()
+    }
+
     #[test]
     fn parses_verb_and_args() {
-        assert_eq!(parse("search foo bar"), Command::Search(v(&["foo", "bar"])));
+        assert_eq!(
+            parse("search foo bar"),
+            Command::Search(terms(&["foo", "bar"]))
+        );
     }
 
     #[test]
@@ -119,7 +128,7 @@ mod tests {
 
     #[test]
     fn verb_is_case_insensitive() {
-        assert_eq!(parse("SEARCH x"), Command::Search(v(&["x"])));
+        assert_eq!(parse("SEARCH x"), Command::Search(terms(&["x"])));
         assert_eq!(parse("Quit"), Command::Quit);
     }
 

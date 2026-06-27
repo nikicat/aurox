@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index;
 use crate::mirror;
+use crate::names::{PkgTarget, SearchTerm};
 use crate::pacman::invoke;
 use crate::ui;
 use std::io::IsTerminal;
@@ -49,8 +50,21 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
         // fuzzy search across the AUR index → interactive multi-select →
         // install. The empty-positional branch above already absorbed the
         // no-op-and-no-target case, so reaching here means we have terms.
-        None => search::cmd_search_install(cfg, cli, &f.positional),
+        None => search::cmd_search_install(cfg, cli, &search_terms(&f.positional)),
     }
+}
+
+/// Promote raw positional argv into typed [`SearchTerm`]s — the boundary where
+/// unclassified CLI strings become search patterns for the `-Ss` / bare-search
+/// paths.
+fn search_terms(positional: &[String]) -> Vec<SearchTerm> {
+    positional.iter().cloned().map(SearchTerm::from).collect()
+}
+
+/// Promote raw positional argv into unclassified [`PkgTarget`]s — the boundary
+/// where CLI strings become package references for the `-Si` path.
+fn pkg_targets(positional: &[String]) -> Vec<PkgTarget> {
+    positional.iter().cloned().map(PkgTarget::from).collect()
 }
 
 /// Handle the `-S` family (`-S`, `-Sy`, `-Syu`, `-Ss`, `-Si`, `-Sc`).
@@ -74,10 +88,10 @@ fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8
     }
 
     if f.has('s') {
-        return index::cmd_search(cfg, &f.positional);
+        return index::cmd_search(cfg, &search_terms(&f.positional));
     }
     if f.has('i') {
-        return index::cmd_info(cfg, &f.positional);
+        return index::cmd_info(cfg, &pkg_targets(&f.positional));
     }
     if f.has('c') {
         return build::cmd_clean(cfg, argv);

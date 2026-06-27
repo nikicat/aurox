@@ -6,6 +6,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::mirror;
+use crate::names::{PkgTarget, SearchTerm};
 use crate::paths;
 use crate::runopts;
 use crate::ui;
@@ -100,7 +101,7 @@ pub fn save(idx: &IndexFile, path: &Path) -> Result<()> {
 }
 
 /// `-Ss` search across pkgnames/pkgdesc/provides, with pacman-style output.
-pub fn cmd_search(cfg: &Config, terms: &[String]) -> Result<u8> {
+pub fn cmd_search(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
     let path = paths::index_path();
     if !path.exists() {
         ui::warn("no index; run `gaur -Sy` first");
@@ -110,7 +111,7 @@ pub fn cmd_search(cfg: &Config, terms: &[String]) -> Result<u8> {
     let by = secondary::Secondary::build(&idx);
     let regexes: Vec<regex::Regex> = terms
         .iter()
-        .map(|t| regex::RegexBuilder::new(t).case_insensitive(true).build())
+        .map(SearchTerm::compile)
         .collect::<std::result::Result<_, _>>()?;
     let hits = by.search(&idx, &regexes);
     info!(count = hits.len(), "search results");
@@ -140,23 +141,46 @@ fn write_search_result<W: std::io::Write>(out: &mut W, entry: &IndexEntry) -> st
     Ok(())
 }
 
-/// `-Si` info for one or more pkgnames.
-pub fn cmd_info(cfg: &Config, targets: &[String]) -> Result<u8> {
+/// `-Si` info for one or more targets.
+pub fn cmd_info(cfg: &Config, targets: &[PkgTarget]) -> Result<u8> {
     let idx = load_or_resync(cfg, &paths::index_path())?;
     let by = secondary::Secondary::build(&idx);
+    // Pacman-style exit code: non-zero when a requested target wasn't in the AUR.
+    let missing = info_targets(&idx, &by, targets);
+    Ok(u8::from(!missing.is_empty()))
+}
+
+/// Print `-Si`-style info for each target found against an already-loaded index,
+/// warning about any that aren't in the AUR.
+///
+/// Returns the unmatched targets (empty ⇒ all found), so [`cmd_info`] can derive
+/// an exit code while the interactive shell ignores it. Shared so both resolve a
+/// name (pkgname / provides / pkgbase) through [`secondary`] identically; the
+/// shell already holds the index, so it calls this directly instead of
+/// reloading.
+pub(crate) fn info_targets(
+    idx: &IndexFile,
+    by: &secondary::Secondary,
+    targets: &[PkgTarget],
+) -> Vec<PkgTarget> {
     let mut missing = Vec::new();
     for t in targets {
-        let Some(entry) = by.lookup(&idx, t) else {
-            missing.push(t.clone());
-            continue;
-        };
-        print_info(entry);
+        match by.lookup(idx, t.as_str()) {
+            Some(entry) => print_info(entry),
+            None => missing.push(t.clone()),
+        }
     }
     if !missing.is_empty() {
-        ui::warn(&format!("not in AUR: {}", missing.join(", ")));
-        return Ok(1);
+        ui::warn(&format!(
+            "not in AUR: {}",
+            missing
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
-    Ok(0)
+    missing
 }
 
 fn print_info(e: &IndexEntry) {

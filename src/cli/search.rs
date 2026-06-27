@@ -11,7 +11,7 @@ use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::{self, IndexEntry, secondary::Secondary};
-use crate::names::PkgTarget;
+use crate::names::{PkgTarget, SearchTerm};
 use crate::pacman::alpm_db::{self, RepoHit};
 use crate::paths;
 use crate::runopts;
@@ -25,8 +25,10 @@ use tracing::{debug, info, instrument};
 /// One search hit — either a sync-repo package or an AUR pkgbase.
 ///
 /// Borrows the AUR entry from the loaded index; repo hits are owned (their
-/// `Alpm` handle is already dropped by the time we build rows).
-enum Row<'a> {
+/// `Alpm` handle is already dropped by the time we build rows). `pub(crate)` so
+/// the interactive shell ([`crate::cli::shell`]) reuses the same row model +
+/// labels for its numbered result list.
+pub(crate) enum Row<'a> {
     Repo(RepoHit),
     Aur(&'a IndexEntry),
 }
@@ -38,10 +40,20 @@ impl Row<'_> {
     /// `From<&PkgName>` / `From<&PkgBase>` widening conversions, so this is the
     /// only place the two row kinds collapse into one type, and there's no
     /// second dispatch downstream.
-    fn picked(&self) -> PkgTarget {
+    pub(crate) fn picked(&self) -> PkgTarget {
         match self {
             Row::Repo(r) => PkgTarget::from(&r.name),
             Row::Aur(e) => PkgTarget::from(&e.pkgbase),
+        }
+    }
+
+    /// The display label for this row (no leading number/checkbox), colored
+    /// per `color`. The plain form is also what dialoguer measures for width.
+    pub(crate) fn label(&self, color: bool) -> String {
+        if color {
+            label_colored(self)
+        } else {
+            label_plain(self)
         }
     }
 }
@@ -67,13 +79,13 @@ enum PickOutcome {
 /// as an AND filter (same semantics as `-Ss`). Sync-repo and AUR matches land
 /// in a single picker so the user can pick across both sources in one pass.
 #[instrument(skip(cfg))]
-pub fn cmd_search_install(cfg: &Config, cli: &Cli, terms: &[String]) -> Result<u8> {
+pub fn cmd_search_install(cfg: &Config, cli: &Cli, terms: &[SearchTerm]) -> Result<u8> {
     let noconfirm = cli.noconfirm;
     let asdeps = cli.asdeps;
 
     let regexes: Vec<regex::Regex> = terms
         .iter()
-        .map(|t| regex::RegexBuilder::new(t).case_insensitive(true).build())
+        .map(SearchTerm::compile)
         .collect::<std::result::Result<_, _>>()?;
 
     // Repo + AUR searches are independent I/O — an alpm DB scan vs an index
@@ -119,7 +131,14 @@ pub fn cmd_search_install(cfg: &Config, cli: &Cli, terms: &[String]) -> Result<u
     );
 
     if repo_hits.is_empty() && aur_hits.is_empty() {
-        ui::info(&format!("no packages match `{}`", terms.join(" ")));
+        ui::info(&format!(
+            "no packages match `{}`",
+            terms
+                .iter()
+                .map(SearchTerm::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
         return Ok(0);
     }
 
