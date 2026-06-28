@@ -10,7 +10,7 @@ A yay-like AUR helper backed by the [`github.com/archlinux/aur`](https://github.
 
 ## Status
 
-Early — works end-to-end (search, info, install, `-Syu`, dep resolution, PKGBUILD review), but is **not** packaged for the AUR yet. Expect rough edges.
+Early — works end-to-end: AUR search/info/install (`-S`), recursive dep resolution, PKGBUILD review, and an interactive shell (`gaur` with no args) for staging + upgrading + applying. Repo/system upgrades go through `pacman` (`-Syu` is a passthrough). **Not** packaged for the AUR yet; expect rough edges.
 
 ## Install
 
@@ -24,27 +24,29 @@ cargo install --path . --locked
 
 ## Usage
 
-`gaur` accepts pacman's flag syntax. Operations it doesn't own (`-Q`, `-R`, `-T`, `-D`, `-F`, `-U`) are forwarded to `pacman` unchanged, so you can use it as a drop-in replacement.
+`gaur` accepts pacman's flag syntax. Operations it doesn't own (`-Q`, `-R`, `-T`, `-D`, `-F`, `-U`, and `-Su` system upgrades) are forwarded to `pacman` unchanged, so you can use it as a drop-in replacement.
 
 | Command               | What it does                                                  |
 | --------------------- | ------------------------------------------------------------- |
-| `gaur`                | Refresh the AUR mirror + index (same as `-Sy`)                |
+| `gaur`                | Open the interactive shell (search · stage · `upgrade` · `apply`) |
 | `gaur -S <pkg>...`    | Install AUR packages (recursive deps, batched sudo)           |
 | `gaur -Sy`            | Incremental fetch of the AUR mirror                           |
 | `gaur -Syy`           | Force a full re-clone (~8–9 min)                              |
-| `gaur -Syu`           | `pacman -Syu`, then AUR upgrades                              |
+| `gaur -Syu`           | Forwarded to `pacman -Syu` — AUR upgrades live in the shell's `upgrade` |
 | `gaur -Ss <regex>`    | Search the AUR by name / desc / provides                      |
 | `gaur -Si <pkg>`      | Show package info                                             |
 | `gaur -Sc` / `-Scc`   | Remove built worktrees + pass `-Sc`/`-Scc` through to `pacman` |
 | `gaur -Rns <pkg>`     | Forwarded to `pacman` unchanged                               |
 
-Global flags: `--devel` (include `-git`/`-svn`/`-hg`/`-bzr` in `-Syu`), `--noconfirm`, `--asdeps`, `--color {auto,always,never}`.
+AUR upgrades are an interactive flow now: run `gaur` (no args) to open the shell, then `upgrade` to stage the available AUR + repo upgrades, `review`/`approve` the AUR ones, and `apply`. The explicit `-Syu` flag is a plain `pacman -Syu` passthrough.
+
+Global flags: `--devel` (include `-git`/`-svn`/`-hg`/`-bzr` when the shell's `upgrade` computes candidates), `--noconfirm`, `--asdeps`, `--color {auto,always,never}`.
 
 ### Examples
 
 ```sh
 gaur -S yay-bin
-gaur -Syu --devel
+gaur --devel              # open the shell; `upgrade` then includes -git/-svn pkgs
 gaur -Ss '^claude-'
 gaur -Rns gitaur          # forwarded to pacman
 RUST_LOG=gitaur=debug gaur -Sy

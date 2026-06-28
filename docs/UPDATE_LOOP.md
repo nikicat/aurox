@@ -1,6 +1,21 @@
 # Update loop, change-set preview & build-cost estimates (design)
 
-Status: **phases 1–3 implemented; phase 4 pending.** The no-arg `gaur` loop,
+> **Superseded — historical design doc.** The no-arg `gaur` **loop driver** and
+> its `dialoguer` **picker** described here were retired: the interactive
+> upgrade flow is now the shell (`gaur` → `upgrade` → `apply`), and the explicit
+> `-Syu` flag is a plain `pacman -Syu` passthrough. See
+> [`docs/plans/shell-ui.md`](plans/shell-ui.md) for the current design.
+>
+> What this doc still describes accurately, because it was **ported** into the
+> shell's `apply`, not deleted: the **change-set preview** (`ui::change_set.rs`),
+> the **size sourcing** (`PacmanIndex::{installed_size,sync_download_size}`, the
+> synced-vs-system-db distinction), the **build-time metrics store**
+> (`build::metrics`, `state_dir()/metrics.db`), the staleness dim, and the
+> `built` tag. The preview + metrics overlay live in `src/cli/shell/upgrade.rs`
+> now; `src/cli/upgrade_loop.rs` no longer exists. Read the cost-machinery
+> rationale below as current; read the loop/picker mechanics as history.
+
+Status (historical): **phases 1–3 implemented; phase 4 pending.** The no-arg `gaur` loop,
 session state, reviewed-set gating, picker badges, change-set preview, and
 SIGINT-during-build → bail-to-table now live in `src/cli/upgrade_loop.rs` +
 `src/build/makepkg.rs` (backed by `build::UpgradeSession` and the
