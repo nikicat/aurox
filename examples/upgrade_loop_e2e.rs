@@ -8,6 +8,10 @@
 //! both *drives* the loop and *asserts the UI rendered*: if a stage's text
 //! never appears, the harness dumps the screen and panics.
 //!
+//! No-arg `gaur` opens the interactive shell, so the loop is reached by typing
+//! `upgrade` at the prompt — which bridges to `upgrade_loop` (refresh + picker)
+//! until phase 4 folds the procedure into the shell's cart.
+//!
 //! `$GITAUR` (or argv[1]) points at the binary; the container test sets up an
 //! installed-but-outdated repo package first so the loop has something to show.
 
@@ -15,6 +19,10 @@ use pty_harness::Pty;
 
 fn main() {
     let mut pty = Pty::spawn_gaur();
+
+    // 0. The shell prompt; `upgrade` runs the (refresh +) loop.
+    pty.expect("shell banner", |s| s.contains("gitaur shell"));
+    pty.send(b"upgrade\r");
 
     // 1. Picker renders with the outdated package as a candidate.
     pty.expect("picker", |s| {
@@ -46,11 +54,14 @@ fn main() {
     pty.expect("sudo gate", |s| s.contains("Continue?"));
     pty.send(b"\r"); // accept (default Y)
 
-    // 4. The upgrade applied and the loop's next pass found nothing left.
+    // 4. The upgrade applied and the loop's next pass found nothing left; the
+    //    loop then returns to the shell prompt (not straight to exit).
     pty.expect("loop completion", |s| {
         s.contains("all selected upgrades applied")
     });
 
+    // Back at the shell prompt — leave cleanly.
+    pty.send(b"quit\r");
     pty.finish_clean();
     println!("LOOP_E2E_OK");
 }
