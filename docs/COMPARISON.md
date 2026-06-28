@@ -117,9 +117,10 @@ The provenance shapes the review header ("upgrade: foo-ng 1.0-1 → 2.0-1
 and surfaces in the noconfirm trace for container tests.
 
 **Hint plumbing.** When multiple installed pkgs match the same pkgbase's
-`provides=`, the user's typed name (from `-S foo` argv or the `-Syu`
-picker row) is plumbed as a `Target::hint` through expand → resolve →
-prepare, biasing the lookup to the pkgname the user actually meant. Two
+`provides=`, the user's typed name (from `-S foo` argv, or the foreign
+pkgname a shell `upgrade` row carries) is plumbed as a `Target::hint`
+through expand → resolve → prepare, biasing the lookup to the pkgname the
+user actually meant. Two
 `tracing::warn!` diagnostics fire when this kicks in:
 
 - `multiple installed pkgs match this pkgbase's provides` — there's

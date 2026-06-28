@@ -91,9 +91,13 @@ gaur> quit
 
 ## Why this fits the codebase
 
-The no-arg upgrade path (`src/cli/upgrade_loop.rs`) is *already* a loop that
-hoists the expensive once-per-session work (mirror fetch, index+secondary load,
-`MirrorRepo`, metrics store) out of the iteration and only re-snapshots the
+*(Design rationale, written when the no-arg `upgrade_loop` still existed. Phase
+4 retired that driver; its reusable machinery moved to `src/cli/shell/upgrade.rs`.
+The derivation below is the original motivation, kept as history.)*
+
+The no-arg upgrade path (then `src/cli/upgrade_loop.rs`) was a loop that
+hoisted the expensive once-per-session work (mirror fetch, index+secondary load,
+`MirrorRepo`, metrics store) out of the iteration and only re-snapshotted the
 localdb per pass (`UpgradeSession` + `recompute_remaining`). The shell is the
 **generalization** of that loop: the fixed recompute→pick→confirm→apply sequence
 becomes a command dispatch loop, and the dialoguer multi-select table is replaced

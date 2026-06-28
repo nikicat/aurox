@@ -10,7 +10,7 @@ A yay-like AUR helper backed by the [`github.com/archlinux/aur`](https://github.
 
 ## Status
 
-Early — works end-to-end (search, info, install, `-Syu`, dep resolution, PKGBUILD review), but is **not** packaged for the AUR yet. Expect rough edges.
+Early — works end-to-end: AUR search/info/install (`-S`), recursive dep resolution, PKGBUILD review, and an interactive shell (`gaur` with no args) for staging + upgrading + applying. Repo/system upgrades go through `pacman` (`-Syu` is a passthrough). **Not** packaged for the AUR yet; expect rough edges.
 
 ## Install
 

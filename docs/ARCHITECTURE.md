@@ -416,7 +416,7 @@ make future bugs of this shape visible in the trace:
   the first declared`** — fired from the unhinted walk when the
   Provides tier has 2+ installed candidates. Always shows the picked
   pkgname and the alternatives so the user can spot the dotnet-runtime
-  shape even outside the `-Syu` picker flow.
+  shape even outside the shell's `upgrade` flow.
 
 Neither warning changes behaviour: the picked counterpart is unchanged.
 They exist so the trace tells the truth about a heuristic-driven choice.
@@ -605,8 +605,8 @@ with no rebuild. VCS pkgbases never hit this cache — their static
 — so `-git`/`-svn`/etc. always rebuild, which is correct.
 
 `build::artifacts_built` is a read-only mirror of the same check, used by
-the upgrade picker / change-set preview to flag rows whose build is
-already done (see `docs/UPDATE_LOOP.md`). Keeping idempotency derived
+the shell's change-set preview to flag rows whose build is already done
+(see `src/cli/shell/upgrade.rs`). Keeping idempotency derived
 from on-disk artifacts rather than a stored `last_built_commit` follows
 the "minimize persisted state" rule: nothing is recorded that the
 artifacts themselves don't already say.
@@ -614,7 +614,7 @@ artifacts themselves don't already say.
 The one thing that genuinely *can't* be derived from a pacman DB or an
 artifact — per-pkgbase **build duration** — is the sole persisted build
 metric, in `metrics.db` (`src/build/metrics.rs`, `rusqlite`). It is a
-cost-visibility hint for the picker, never a gate on what gets built.
+cost-visibility hint for the change-set preview, never a gate on what gets built.
 
 ### Why gix instead of libgit2 / shelling out to `git`?
 
