@@ -28,19 +28,20 @@ use crate::cli::dispatch;
 use crate::cli::search::Row;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::index;
+use crate::index::{self, IndexEntry};
 use crate::mirror::{self, MirrorRepo};
 use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, SearchTerm};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke::{self, PkgUpgrade, REPO_AUR};
 use crate::paths;
+use crate::resolver::Plan;
 use crate::ui::{self, UpgradeSelection};
+use crate::version::Version;
 use cart::{
     ApplyOutcome, Approval, ApproveResult, AurApproval, Cart, CartItem, ReviewOutcome, Source,
-    StageClass,
+    StageClass, StageResult, UnstageResult,
 };
 use command::Command;
-use console::style;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::collections::{HashMap, HashSet};
@@ -290,7 +291,7 @@ impl State {
         let policy = env.aur_policy();
         let mut staged = 0;
         for u in to_seed {
-            if self.cart.add(CartItem::from_upgrade(u, policy)) {
+            if self.cart.add(CartItem::from_upgrade(u, policy)) == StageResult::Staged {
                 staged += 1;
             }
         }
@@ -327,10 +328,11 @@ impl State {
                     let label = repo
                         .clone()
                         .map_or_else(|| source.label().to_owned(), RepoName::into_inner);
-                    if self.cart.add(CartItem::new(t, source, repo, policy)) {
-                        env.print(&format!("staged {name} ({label})"));
-                    } else {
-                        env.print(&format!("{name} is already staged"));
+                    match self.cart.add(CartItem::new(t, source, repo, policy)) {
+                        StageResult::Staged => env.print(&format!("staged {name} ({label})")),
+                        StageResult::AlreadyStaged => {
+                            env.print(&format!("{name} is already staged"));
+                        }
                     }
                 }
                 None => env.print(&format!("unknown package `{}` — not staged", t.as_str())),
@@ -357,10 +359,9 @@ impl State {
             return;
         }
         for t in targets {
-            if self.cart.unstage(&t) {
-                env.print(&format!("dropped {}", t.as_str()));
-            } else {
-                env.print(&format!("{} wasn't staged", t.as_str()));
+            match self.cart.unstage(&t) {
+                UnstageResult::Unstaged => env.print(&format!("dropped {}", t.as_str())),
+                UnstageResult::NotStaged => env.print(&format!("{} wasn't staged", t.as_str())),
             }
         }
     }
@@ -386,10 +387,11 @@ impl State {
         }
         for t in targets {
             let name = PkgName::from(t.into_inner());
-            if self.cart.stage_remove(name.clone()) {
-                env.print(&format!("staged removal of {name}"));
-            } else {
-                env.print(&format!("{name} is already staged for removal"));
+            match self.cart.stage_remove(name.clone()) {
+                StageResult::Staged => env.print(&format!("staged removal of {name}")),
+                StageResult::AlreadyStaged => {
+                    env.print(&format!("{name} is already staged for removal"));
+                }
             }
         }
     }
@@ -941,210 +943,55 @@ impl ShellEnv for RealEnv<'_> {
     }
 
     fn render_cart(&mut self, cart: &Cart) {
-        let colored = Colored::detect();
-        let items = cart.items();
-        let now = SystemTime::now();
-
-        // Column widths over the plain (uncolored) cell text — padding is then
-        // applied on that plain width so embedded ANSI codes don't skew columns.
-        let repo_w = Width::widest(items.iter().map(|i| Width::of(i.repo_label().as_str())));
-        let appr_w = Width::widest(items.iter().map(|i| Width::of(i.approval.label())));
-        let name_w = Width::widest(items.iter().map(|i| Width::of(i.spec())));
-        let old_w = Width::widest(
-            items
-                .iter()
-                .filter_map(|i| i.upgrade.as_ref())
-                .map(|u| Width::of(&u.old_ver.to_string())),
-        );
-        let new_w = Width::widest(
-            items
-                .iter()
-                .filter_map(|i| i.upgrade.as_ref())
-                .map(|u| Width::of(&u.new_ver.to_string())),
-        );
-        // The fixed-width version block (`old → new`), so a fresh-install row's
-        // blank keeps the trailing age column aligned with the upgrade rows.
-        let ver_w = if old_w.is_zero() && new_w.is_zero() {
-            Width::ZERO
-        } else {
-            old_w + new_w + ARROW_PAD
-        };
-
-        for (i, it) in items.iter().enumerate() {
-            let repo = it.repo_label();
-            let repo_cell =
-                repo_w.pad_left(colored.paint(repo.as_str(), |s| ui::repo(s).to_string()));
-
-            let appr = it.approval.label();
-            let appr_cell = appr_w.pad_left(colored.paint(appr, |s| match it.approval {
-                Approval::Approved => style(s).green().to_string(),
-                Approval::NeedsReview => style(s).yellow().to_string(),
-            }));
-
-            let name = it.spec();
-            let name_cell = name_w.pad_left(colored.paint(name, |s| style(s).bold().to_string()));
-
-            let ver_cell = version_cell(it, old_w, new_w, ver_w, colored);
-            // "Last modified" age, AUR rows only (yay-style staleness hint).
-            let age_cell = match (it.source, self.aur_last_modified(it)) {
-                (Source::Aur, Some(modified)) => {
-                    let age = now.duration_since(modified).unwrap_or_default();
-                    let label = format!("({} ago)", ui::human_age(age));
-                    format!(
-                        "  {}",
-                        colored.paint(&label, |s| ui::dim(s).to_string()).rendered
-                    )
+        // Resolve the staged set into the full change set (roots + pulled-in
+        // deps + removals + cost) and render the one unified table. `show` must
+        // never error out, so a resolve failure degrades to the flat staged
+        // rows plus a note (UPDATE_LOOP goal #5 landing behind `show`).
+        match self.transaction_view(cart) {
+            Ok(table) => {
+                for line in table.lines() {
+                    self.print(line);
                 }
-                _ => String::new(),
-            };
-
-            self.print(&format!(
-                "{:>3}  {repo_cell}  {appr_cell}  {name_cell}{ver_cell}{age_cell}",
-                i + 1
-            ));
-        }
-
-        for name in cart.removals() {
-            let tag = colored
-                .paint("remove", |s| style(s).red().to_string())
-                .rendered;
-            self.print(&format!("     {tag}  {name}"));
+            }
+            Err(e) => {
+                debug!(error = %e, "show preview resolve failed; flat fallback");
+                for line in flat_cart_lines(cart, &e) {
+                    self.print(&line);
+                }
+            }
         }
     }
 
     fn apply(&mut self, cart: &Cart) -> Result<ApplyOutcome> {
-        let Some(session) = &self.session else {
+        let Some(session) = self.session.as_ref() else {
             ui::warn("no AUR index loaded; cannot apply");
             return Ok(ApplyOutcome::Failed);
         };
         let pac = upgrade::system_pac()?;
 
-        // The upgrade rows (repo + AUR) drive the cost-overlay preview and the
-        // partial `-Syu` lane; their absence means a pure fresh-install cart.
-        let roots: Vec<PkgUpgrade> = cart
-            .items()
-            .iter()
-            .filter_map(|i| i.upgrade.clone())
-            .collect();
+        // Resolve the build/install half (AUR + fresh installs); repo *upgrades*
+        // take the partial `-Syu` lane below, so they're excluded from the plan.
+        let plan = self.resolve_cart(session, &pac, cart)?;
 
-        let outcome = if roots.is_empty() {
-            self.apply_installs(session, &pac, cart)?
-        } else {
-            self.apply_upgrades(session, &pac, cart, &roots)?
-        };
-        if outcome != ApplyOutcome::Succeeded {
-            return Ok(outcome);
-        }
-
-        // Remove half (shared): `pacman -R`, filtered to packages actually
-        // installed so a retry after a partial failure doesn't trip on an
-        // already-gone target. One atomic add+remove transaction is the phase-6
-        // native-commit goal; until then this is separate transactions bridged
-        // by the sudo cache.
-        let removals: Vec<&PkgName> = cart
-            .removals()
-            .iter()
-            .filter(|n| pac.is_installed(n.as_str()))
-            .collect();
-        if !removals.is_empty() {
-            // Stringify only here, at pacman's argv boundary.
-            let mut args = vec!["-R".to_owned()];
-            args.extend(removals.iter().map(|n| n.as_str().to_owned()));
-            if invoke::exec_pacman(self.cfg, &args)? != 0 {
-                ui::warn("removal step did not complete");
-                return Ok(ApplyOutcome::Failed);
-            }
-        }
-        Ok(ApplyOutcome::Succeeded)
-    }
-}
-
-impl RealEnv<'_> {
-    /// When the AUR pkgbase a staged row resolves to was last modified (its
-    /// branch-tip commit time), for the `show` table's age column. `None` when
-    /// there's no index, the row isn't an AUR package, or the timestamp is
-    /// unrecorded (`0` in pre-`commit_time_unix` index archives).
-    fn aur_last_modified(&self, item: &CartItem) -> Option<SystemTime> {
-        let session = self.session.as_ref()?;
-        let entry = session.secondary().lookup(session.index(), item.spec())?;
-        let secs = u64::try_from(entry.commit_time_unix)
-            .ok()
-            .filter(|&s| s > 0)?;
-        Some(UNIX_EPOCH + Duration::from_secs(secs))
-    }
-
-    /// Pure fresh-install cart (no upgrade rows): the `-S` pipeline owns the
-    /// plan table + its only-when-deps confirm and the stratified build/install.
-    /// The cart's reviewed set rides along so approved AUR pkgbases aren't
-    /// re-prompted.
-    fn apply_installs(
-        &self,
-        session: &UpgradeSession,
-        pac: &PacmanIndex,
-        cart: &Cart,
-    ) -> Result<ApplyOutcome> {
-        let targets = cart.install_targets();
-        if targets.is_empty() {
-            return Ok(ApplyOutcome::Succeeded);
-        }
-        let mut reviewed = cart.reviewed().clone();
-        let opts = InstallOpts {
-            noconfirm: false,
-            asdeps: false,
-            gate: ConfirmGate::Ask,
-        };
-        match build::install_with_index(
-            self.cfg,
-            session.index(),
-            Some(session.secondary()),
-            pac,
-            &targets,
-            opts,
-            &mut reviewed,
-        ) {
-            Ok(report) => Ok(outcome_of(&report)),
-            // Declining the plan confirm aborts the whole apply, cart kept.
-            Err(Error::UserAbort) => Ok(ApplyOutcome::Declined),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Upgrade cart: resolve the AUR/build half once, render the cost-overlay
-    /// change-set preview, take one confirm, then run the partial `-Syu` repo
-    /// lane (so AUR builds link against the upgraded libs) and the build/install
-    /// lane.
-    fn apply_upgrades(
-        &self,
-        session: &UpgradeSession,
-        pac: &PacmanIndex,
-        cart: &Cart,
-        roots: &[PkgUpgrade],
-    ) -> Result<ApplyOutcome> {
-        // Resolve the AUR upgrades + any fresh installs once; repo *upgrades*
-        // are excluded (they take the `-Syu` lane below).
-        let targets = cart.install_targets();
-        let plan = build::resolve_targets(
-            self.cfg,
-            session.index(),
-            Some(session.secondary()),
-            pac,
-            &targets,
-            false,
-        )?;
-
-        // Sizes from the freshly-synced db (the new versions' real download
-        // cost); build-time from the metrics store.
+        // No table redraw — `show` is where the user looked. `apply` gates on the
+        // one-line cost summary plus a single confirm (phase 5a).
         let size_pac = upgrade::synced_pac()?;
-        let metrics = upgrade::preview_metrics(session, roots, Some(&plan));
-        upgrade::preview(roots, Some(&plan), &size_pac, &metrics);
+        let roots = txn_roots(cart, session, &size_pac);
+        let (repo_deps, aur_deps) = upgrade::dep_rows(plan.as_ref());
+        let removals: Vec<PkgName> = cart.removals().to_vec();
+        let metrics = upgrade::preview_metrics(session, &roots, plan.as_ref());
+        ui::info(&ui::cost_summary(
+            &roots, &repo_deps, &aur_deps, &removals, &size_pac, &metrics,
+        ));
         if !ui::confirm("Proceed with this transaction?", false)
             .map_err(|e| Error::other(format!("confirm: {e}")))?
         {
             return Ok(ApplyOutcome::Declined);
         }
 
-        // Repo upgrades first, via a partial `pacman -Syu` that ignores every
-        // repo candidate the user didn't stage.
+        // Repo upgrades first (so AUR builds link against the upgraded libs), via
+        // a partial `pacman -Syu` that ignores every repo candidate the user
+        // didn't stage.
         let repo_sel = self.repo_upgrade_selection(session, cart)?;
         if !repo_sel.repo.is_empty() {
             dispatch::run_repo_upgrade(self.cfg, &repo_sel)?;
@@ -1158,8 +1005,86 @@ impl RealEnv<'_> {
             asdeps: false,
             gate: ConfirmGate::AlreadyConfirmed,
         };
-        let report = build::apply_plan(self.cfg, session.index(), pac, &plan, opts, &mut reviewed)?;
-        Ok(outcome_of(&report))
+        let outcome = match &plan {
+            Some(plan) => {
+                let report =
+                    build::apply_plan(self.cfg, session.index(), &pac, plan, opts, &mut reviewed)?;
+                outcome_of(&report)
+            }
+            None => ApplyOutcome::Succeeded,
+        };
+        if outcome != ApplyOutcome::Succeeded {
+            return Ok(outcome);
+        }
+
+        // Remove half: `pacman -R`, filtered to packages actually installed so a
+        // retry after a partial failure doesn't trip on an already-gone target.
+        // One atomic add+remove transaction is the phase-6 native-commit goal;
+        // until then this is separate transactions bridged by the sudo cache.
+        let installed_removals: Vec<&PkgName> = cart
+            .removals()
+            .iter()
+            .filter(|n| pac.is_installed(n.as_str()))
+            .collect();
+        if !installed_removals.is_empty() {
+            // Stringify only here, at pacman's argv boundary.
+            let mut args = vec!["-R".to_owned()];
+            args.extend(installed_removals.iter().map(|n| n.as_str().to_owned()));
+            if invoke::exec_pacman(self.cfg, &args)? != 0 {
+                ui::warn("removal step did not complete");
+                return Ok(ApplyOutcome::Failed);
+            }
+        }
+        Ok(ApplyOutcome::Succeeded)
+    }
+}
+
+impl RealEnv<'_> {
+    /// Build the unified change-set table for `show`: resolve the staged set,
+    /// collect the pulled-in deps, sizes, and build-time overlay, and hand them
+    /// to [`ui::transaction_table`]. Errors bubble up so `render_cart` can fall
+    /// back to the flat rows — `show` must never abort.
+    fn transaction_view(&self, cart: &Cart) -> Result<ui::Table> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| Error::other("no AUR index loaded"))?;
+        let pac = upgrade::system_pac()?;
+        let plan = self.resolve_cart(session, &pac, cart)?;
+        // Sizes from the freshly-synced db (the new versions' real download cost).
+        let size_pac = upgrade::synced_pac()?;
+        let roots = txn_roots(cart, session, &size_pac);
+        let (repo_deps, aur_deps) = upgrade::dep_rows(plan.as_ref());
+        let removals: Vec<PkgName> = cart.removals().to_vec();
+        let metrics = upgrade::preview_metrics(session, &roots, plan.as_ref());
+        Ok(ui::transaction_table(
+            &roots, &repo_deps, &aur_deps, &removals, &size_pac, &metrics,
+        ))
+    }
+
+    /// Resolve the cart's install/build half into a [`Plan`] — the AUR rows and
+    /// fresh installs (repo *upgrades* take the `-Syu` lane, so they aren't
+    /// targets here). `None` when nothing needs the build pipeline (a
+    /// repo-upgrade-only or removal-only cart).
+    fn resolve_cart(
+        &self,
+        session: &UpgradeSession,
+        pac: &PacmanIndex,
+        cart: &Cart,
+    ) -> Result<Option<Plan>> {
+        let targets = cart.install_targets();
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        let plan = build::resolve_targets(
+            self.cfg,
+            session.index(),
+            Some(session.secondary()),
+            pac,
+            &targets,
+            false,
+        )?;
+        Ok(Some(plan))
     }
 
     /// Turn the staged repo upgrades into the partial-`-Syu` selection: the
@@ -1207,128 +1132,97 @@ fn outcome_of(report: &build::RunReport) -> ApplyOutcome {
     }
 }
 
-/// The ` → ` separator between the old and new version in an upgrade row.
-const ARROW: &str = " → ";
-/// Display width of [`ARROW`] (the arrow glyph is one column, flanked by two
-/// spaces). Separate from `ARROW.len()` (5 bytes) so the version-block width
-/// math and the rendered separator can't drift.
-const ARROW_PAD: Width = Width(3);
-
-/// A terminal column width in display cells, used to align the `show` table.
-///
-/// A newtype (not a bare `usize`) so a width can't be confused with an index or
-/// a count, and so the pad-on-visible-width policy lives in one place — see
-/// [`Self::pad_left`].
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct Width(usize);
-
-impl Width {
-    const ZERO: Self = Self(0);
-
-    /// Visible width of a plain (un-colored) cell. Cells are ASCII (names,
-    /// versions, repo labels), so char count equals display columns.
-    fn of(s: &str) -> Self {
-        Self(s.chars().count())
-    }
-
-    /// The widest of a set of cell widths — the column width. `ZERO` if empty.
-    fn widest(widths: impl Iterator<Item = Self>) -> Self {
-        widths.max().unwrap_or(Self::ZERO)
-    }
-
-    fn is_zero(self) -> bool {
-        self == Self::ZERO
-    }
-
-    /// `self` spaces — the blank for a fixed-width column with no content.
-    fn blanks(self) -> String {
-        " ".repeat(self.0)
-    }
-
-    /// The padding needed to widen a cell of width `inner` to `self`.
-    const fn gap(self, inner: Self) -> Self {
-        Self(self.0.saturating_sub(inner.0))
-    }
-
-    /// Left-justify `cell` to `self` (rendered text, then trailing spaces).
-    fn pad_left(self, cell: Cell) -> String {
-        let Cell { rendered, width } = cell;
-        format!("{rendered}{}", self.gap(width).blanks())
-    }
-
-    /// Right-justify `cell` to `self` (leading spaces, then rendered text).
-    fn pad_right(self, cell: Cell) -> String {
-        let Cell { rendered, width } = cell;
-        format!("{}{rendered}", self.gap(width).blanks())
+/// Map the cart's [`Approval`] to the renderer's presentation enum — the seam
+/// that keeps `ui::change_set` from depending on `cli::shell`.
+const fn approval_cell(approval: Approval) -> ui::ApprovalCell {
+    match approval {
+        Approval::Approved => ui::ApprovalCell::Approved,
+        Approval::NeedsReview => ui::ApprovalCell::NeedsReview,
     }
 }
 
-impl std::ops::Add for Width {
-    type Output = Self;
-    fn add(self, rhs: Self) -> Self {
-        Self(self.0 + rhs.0)
-    }
+/// Build the numbered root rows for the unified table from the (sorted) cart,
+/// resolving each row's version pair and AUR age. `size_pac` is the synced
+/// snapshot — it carries the new repo versions for fresh repo installs.
+fn txn_roots(cart: &Cart, session: &UpgradeSession, size_pac: &PacmanIndex) -> Vec<ui::TxnRoot> {
+    let now = SystemTime::now();
+    cart.items()
+        .iter()
+        .map(|it| {
+            let (old_ver, new_ver) = row_versions(it, session, size_pac);
+            ui::TxnRoot {
+                repo: it.repo_label(),
+                approval: approval_cell(it.approval),
+                name: PkgName::from(it.spec()),
+                old_ver,
+                new_ver,
+                age: aur_age(it, session, now),
+            }
+        })
+        .collect()
 }
 
-/// A rendered table cell: the (possibly colored) display string plus the width
-/// of its *plain* text, so [`Width::pad_left`] aligns on visible width even when
-/// `rendered` carries ANSI escapes.
-struct Cell {
-    rendered: String,
-    width: Width,
-}
-
-/// Whether the table renders with ANSI color — a two-state enum rather than a
-/// bare `bool`, so `Colored::No` reads as intent and the color branch lives in
-/// one place ([`Self::paint`]).
-#[derive(Clone, Copy)]
-enum Colored {
-    Yes,
-    No,
-}
-
-impl Colored {
-    /// Detect from the global color mode ([`ui::color_on`]).
-    fn detect() -> Self {
-        if ui::color_on() { Self::Yes } else { Self::No }
-    }
-
-    /// Render `plain`, applying `paint` only when color is enabled. The returned
-    /// [`Cell`] remembers `plain`'s visible width for later alignment.
-    fn paint(self, plain: &str, paint: impl FnOnce(&str) -> String) -> Cell {
-        Cell {
-            width: Width::of(plain),
-            rendered: match self {
-                Self::Yes => paint(plain),
-                Self::No => plain.to_owned(),
-            },
-        }
-    }
-}
-
-/// The version cell for one cart row: `old → new` for an upgrade, a blank of the
-/// same width for a fresh install (so the trailing age column stays aligned),
-/// or empty when the cart has no upgrade rows at all (`ver_w` is zero). Includes
-/// its own leading column separator.
-fn version_cell(
+/// The `(old, new)` versions for a row: an upgrade carries both; a fresh install
+/// has no `old` and takes `new` from the AUR index (AUR rows) or the synced
+/// syncdb (repo rows). Either fresh lookup may miss → `None` (the renderer then
+/// leaves the version cell blank but aligned).
+fn row_versions(
     it: &CartItem,
-    old_w: Width,
-    new_w: Width,
-    ver_w: Width,
-    colored: Colored,
-) -> String {
-    if ver_w.is_zero() {
-        return String::new();
+    session: &UpgradeSession,
+    size_pac: &PacmanIndex,
+) -> (Option<Version>, Option<Version>) {
+    if let Some(u) = &it.upgrade {
+        return (Some(u.old_ver.clone()), Some(u.new_ver.clone()));
     }
-    let Some(u) = it.upgrade.as_ref() else {
-        return format!("  {}", ver_w.blanks());
+    let new = match it.source {
+        Source::Aur => session
+            .secondary()
+            .lookup(session.index(), it.spec())
+            .map(IndexEntry::version),
+        Source::Repo => size_pac.sync_version(it.spec()).map(Version::from),
     };
-    let old = u.old_ver.to_string();
-    let new = u.new_ver.to_string();
-    let old_c = old_w.pad_right(colored.paint(&old, |s| style(s).red().to_string()));
-    let new_c = new_w.pad_left(colored.paint(&new, |s| style(s).green().to_string()));
-    let arrow = colored.paint(ARROW, |s| ui::dim(s).to_string()).rendered;
-    format!("  {old_c}{arrow}{new_c}")
+    (None, new)
+}
+
+/// The AUR pkgbase's "last modified" age (its branch-tip commit time vs `now`),
+/// for the table's age column. `None` for repo rows, when there's no matching
+/// index entry, or when the commit time is unrecorded (`0` in
+/// pre-`commit_time_unix` archives).
+fn aur_age(it: &CartItem, session: &UpgradeSession, now: SystemTime) -> Option<Duration> {
+    if it.source != Source::Aur {
+        return None;
+    }
+    let entry = session.secondary().lookup(session.index(), it.spec())?;
+    let secs = u64::try_from(entry.commit_time_unix)
+        .ok()
+        .filter(|&s| s > 0)?;
+    let modified = UNIX_EPOCH + Duration::from_secs(secs);
+    now.duration_since(modified).ok()
+}
+
+/// The graceful-degradation rendering for `show` when the resolve behind the
+/// unified table fails (unknown target, mirror gap): a note plus the flat staged
+/// rows, so `show` still tells the user what's in the cart instead of erroring.
+fn flat_cart_lines(cart: &Cart, err: &Error) -> Vec<String> {
+    let mut out = vec![format!(
+        "  (couldn't resolve the full change set: {err} — showing staged items)"
+    )];
+    for (i, it) in cart.items().iter().enumerate() {
+        let ver = it
+            .version_transition()
+            .map_or_else(String::new, |t| format!("  {t}"));
+        out.push(format!(
+            "{:>3}  {}  {}  {}{ver}",
+            i + 1,
+            it.repo_label(),
+            it.approval.label(),
+            it.spec(),
+        ));
+    }
+    for name in cart.removals() {
+        out.push(format!("     remove  {name}"));
+    }
+    out
 }
 
 #[cfg(test)]

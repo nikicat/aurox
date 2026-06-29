@@ -18,7 +18,7 @@ mod progress;
 mod prompts;
 mod tables;
 
-pub use change_set::change_set_table;
+pub use change_set::{ApprovalCell, TxnRoot, cost_summary, transaction_table};
 pub use cost::PreviewMetrics;
 pub use gix_progress::GixProgress;
 pub use progress::{
@@ -26,7 +26,7 @@ pub use progress::{
     promote_count_bar, spinner, tick,
 };
 pub use prompts::{confirm, select_pkgnames};
-pub use tables::{UpgradeSelection, install_table, pkg_list, upgrade_table};
+pub use tables::{Table, UpgradeSelection, install_table, pkg_list, upgrade_table};
 
 use console::{Term, style};
 use std::sync::OnceLock;
@@ -200,14 +200,17 @@ pub fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Format a wall-clock duration as the change-set preview shows it: `42s`,
-/// `3m 17s`, `2h 8m`.
+/// Format a build [`Duration`](std::time::Duration) as the change-set preview
+/// shows it: `42s`, `3m 17s`, `2h 8m`.
 ///
-/// Two units max (the leading non-zero plus the next down) — enough
-/// resolution for "is this a quick rebuild or an evening's worth of compile
-/// time?" without precision noise. Sub-second figures are not meaningful for
-/// builds (makepkg's own setup is ~1 s) so floors at `0s`.
-pub fn human_duration(seconds: u64) -> String {
+/// Takes a `Duration` (the time domain type, matching [`human_age`]) rather than
+/// a bare seconds count, so callers don't downgrade to `u64` at the boundary.
+/// Two units max (the leading non-zero plus the next down) — enough resolution
+/// for "is this a quick rebuild or an evening's worth of compile time?" without
+/// precision noise. Sub-second figures are not meaningful for builds (makepkg's
+/// own setup is ~1 s) so floors at `0s`.
+pub fn human_duration(d: std::time::Duration) -> String {
+    let seconds = d.as_secs();
     let h = seconds / 3600;
     let m = (seconds % 3600) / 60;
     let s = seconds % 60;

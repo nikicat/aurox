@@ -283,6 +283,41 @@ impl_name_wrapper!(PkgTarget);
 impl_name_wrapper!(VirtualName);
 impl_name_wrapper!(RepoName);
 
+/// Sort/display rank of a [`RepoName`]'s column position.
+///
+/// Variant declaration order *is* the sort order (derived `Ord` compares by
+/// position): the three canonical Arch repos in pacman's resolution order, then
+/// any other configured repo, then AUR last. Equal ranks (notably every
+/// [`Self::Other`] repo) tie-break by the concrete repo name and package name
+/// at the call site, so the `show` / upgrade tables and the staged cart group
+/// rows by repo. A typed rank rather than a bare integer so the ordering is
+/// self-documenting and can't be confused with a count or index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RepoRank {
+    Core,
+    Extra,
+    Multilib,
+    /// Any other configured sync repo (`testing`, a custom repo, …).
+    Other,
+    /// AUR-sourced rows sort last.
+    Aur,
+}
+
+impl RepoName {
+    /// This repo's [`RepoRank`] for display/sort order. The `"aur"` arm mirrors
+    /// [`crate::pacman::invoke::REPO_AUR`] (kept a literal so this low-level
+    /// module doesn't reach up into `pacman`).
+    pub fn rank(&self) -> RepoRank {
+        match self.0.as_str() {
+            "core" => RepoRank::Core,
+            "extra" => RepoRank::Extra,
+            "multilib" => RepoRank::Multilib,
+            "aur" => RepoRank::Aur,
+            _ => RepoRank::Other,
+        }
+    }
+}
+
 // Cross-type conversions, intentionally only in the "narrowing → widening"
 // direction. A classified `PkgBase` or `PkgName` can be re-presented as an
 // unclassified `PkgTarget` (e.g. when `expand_pkgbase_targets` rewrites a

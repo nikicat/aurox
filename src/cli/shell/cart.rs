@@ -207,6 +207,26 @@ pub enum ApplyOutcome {
     Failed,
 }
 
+/// What staging an item (`add` / `stage_remove`) did to the cart — a named
+/// outcome rather than a bare `bool` so the call site reads as intent and pairs
+/// with [`ApproveResult`] / [`UnstageResult`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum StageResult {
+    /// The item was newly staged.
+    Staged,
+    /// The spec was already staged — re-staging is an idempotent no-op.
+    AlreadyStaged,
+}
+
+/// What `drop` (`unstage`) did to the cart.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnstageResult {
+    /// A staged row was removed.
+    Unstaged,
+    /// Nothing in the cart matched the target.
+    NotStaged,
+}
+
 /// What `approve <spec>` did to a staged item — so the caller can report it and
 /// know whether it newly cleared the gate (and should record the pkgbase as
 /// reviewed).
@@ -268,28 +288,54 @@ impl Cart {
 
     /// Stage one install. Returns `false` (and stages nothing) when the spec is
     /// already in the cart — re-`add`ing is idempotent, not a duplicate row.
-    pub fn add(&mut self, item: CartItem) -> bool {
+    ///
+    /// Inserts keeping [`Self::items`] sorted (repo-rank → repo → name) so the
+    /// row number `show` prints *is* the vector index `resolve_against_cart`
+    /// addresses — the two can't drift (`docs/plans/shell-ui.md`, phase 5b).
+    pub fn add(&mut self, item: CartItem) -> StageResult {
         if self.items.iter().any(|i| i.spec() == item.spec()) {
-            return false;
+            return StageResult::AlreadyStaged;
         }
         self.items.push(item);
-        true
+        self.sort_items();
+        StageResult::Staged
     }
 
-    /// Unstage an install. Returns whether a row was removed.
-    pub fn unstage(&mut self, target: &PkgTarget) -> bool {
+    /// Re-establish the cart's sort invariant: rows grouped by repo
+    /// (repo-rank → concrete repo name), then by spec within a repo — the same
+    /// order the unified `show` table renders. The cart is tiny, so a full
+    /// re-sort per `add` is cheaper than threading a sorted-insert position.
+    /// `unstage` / `approve` / `clear_applied` preserve relative order, so only
+    /// the inserting paths need this.
+    fn sort_items(&mut self) {
+        self.items.sort_by(|a, b| {
+            let (ra, rb) = (a.repo_label(), b.repo_label());
+            ra.rank()
+                .cmp(&rb.rank())
+                .then_with(|| ra.as_str().cmp(rb.as_str()))
+                .then_with(|| a.spec().cmp(b.spec()))
+        });
+    }
+
+    /// Unstage an install. Reports whether a row was removed.
+    pub fn unstage(&mut self, target: &PkgTarget) -> UnstageResult {
         let before = self.items.len();
         self.items.retain(|i| i.spec() != target.as_str());
-        self.items.len() != before
+        if self.items.len() == before {
+            UnstageResult::NotStaged
+        } else {
+            UnstageResult::Unstaged
+        }
     }
 
-    /// Stage a removal (uninstall). Returns `false` when already staged.
-    pub fn stage_remove(&mut self, name: PkgName) -> bool {
+    /// Stage a removal (uninstall). [`StageResult::AlreadyStaged`] when it was
+    /// already staged for removal.
+    pub fn stage_remove(&mut self, name: PkgName) -> StageResult {
         if self.remove.contains(&name) {
-            return false;
+            return StageResult::AlreadyStaged;
         }
         self.remove.push(name);
-        true
+        StageResult::Staged
     }
 
     /// Empty everything — installs, removals, and the reviewed set.
@@ -392,8 +438,12 @@ mod tests {
     #[test]
     fn add_dedups_by_spec() {
         let mut cart = Cart::default();
-        assert!(cart.add(item("foo", Source::Aur)));
-        assert!(!cart.add(item("foo", Source::Aur)), "re-add is a no-op");
+        assert_eq!(cart.add(item("foo", Source::Aur)), StageResult::Staged);
+        assert_eq!(
+            cart.add(item("foo", Source::Aur)),
+            StageResult::AlreadyStaged,
+            "re-add is a no-op"
+        );
         assert_eq!(cart.items().len(), 1);
     }
 
@@ -402,8 +452,12 @@ mod tests {
         let mut cart = Cart::default();
         cart.add(item("foo", Source::Aur));
         cart.add(item("bar", Source::Repo));
-        assert!(cart.unstage(&target("foo")));
-        assert!(!cart.unstage(&target("foo")), "second drop finds nothing");
+        assert_eq!(cart.unstage(&target("foo")), UnstageResult::Unstaged);
+        assert_eq!(
+            cart.unstage(&target("foo")),
+            UnstageResult::NotStaged,
+            "second drop finds nothing"
+        );
         assert_eq!(cart.items().len(), 1);
         assert_eq!(cart.items()[0].spec(), "bar");
     }
@@ -411,8 +465,11 @@ mod tests {
     #[test]
     fn stage_remove_dedups() {
         let mut cart = Cart::default();
-        assert!(cart.stage_remove(PkgName::from("old")));
-        assert!(!cart.stage_remove(PkgName::from("old")));
+        assert_eq!(cart.stage_remove(PkgName::from("old")), StageResult::Staged);
+        assert_eq!(
+            cart.stage_remove(PkgName::from("old")),
+            StageResult::AlreadyStaged
+        );
         assert_eq!(cart.removals().len(), 1);
     }
 
@@ -482,7 +539,34 @@ mod tests {
         cart.add(item("bar", Source::Repo));
         let targets = cart.install_targets();
         let specs: Vec<&str> = targets.iter().map(|t| t.spec.as_str()).collect();
-        assert_eq!(specs, vec!["foo", "bar"]);
+        // Sorted-cart invariant: `bar` (repo, ranks before AUR) precedes `foo`
+        // (aur, sorts last) regardless of staging order.
+        assert_eq!(specs, vec!["bar", "foo"]);
+    }
+
+    #[test]
+    fn add_keeps_items_sorted_by_repo_then_name() {
+        let mut cart = Cart::default();
+        // Stage in deliberately scrambled order across repos.
+        cart.add(CartItem::from_upgrade(
+            upgrade("aur", "yay-bin"),
+            AurApproval::Review,
+        ));
+        cart.add(CartItem::from_upgrade(
+            upgrade("extra", "vim"),
+            AurApproval::Review,
+        ));
+        cart.add(CartItem::from_upgrade(
+            upgrade("core", "zlib"),
+            AurApproval::Review,
+        ));
+        cart.add(CartItem::from_upgrade(
+            upgrade("core", "glibc"),
+            AurApproval::Review,
+        ));
+        // core (alphabetical within repo) → extra → aur last.
+        let order: Vec<&str> = cart.items().iter().map(CartItem::spec).collect();
+        assert_eq!(order, vec!["glibc", "zlib", "vim", "yay-bin"]);
     }
 
     fn upgrade(repo: &str, name: &str) -> PkgUpgrade {
@@ -547,7 +631,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["glibc"]
         );
+        // Sorted-cart invariant: firefox (repo, ranks before AUR) precedes
+        // yay-bin (aur, sorts last).
         let install: Vec<String> = cart.install_targets().into_iter().map(|t| t.spec).collect();
-        assert_eq!(install, vec!["yay-bin", "firefox"]);
+        assert_eq!(install, vec!["firefox", "yay-bin"]);
     }
 }

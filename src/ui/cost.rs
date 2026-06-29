@@ -1,22 +1,22 @@
-//! Per-row cost cells shared by the upgrade picker ([`super::tables`]) and the
-//! change-set preview ([`super::change_set`]).
+//! Per-row build-time cost cells for the change-set table ([`super::change_set`]).
 //!
-//! A leaf module: it depends only on the `ui` color helpers and the typed
-//! names, never on `tables`/`change_set` — so both of those can pull from it
-//! without a cycle. Two things live here:
+//! Borrows the [`Paint`]/[`Width`] rendering primitives from [`super::tables`]
+//! but nothing flows back the other way — `tables` never imports `cost`, so
+//! there's no cycle. Two things live here:
 //!
-//! - [`PreviewMetrics`] — the per-AUR-row overlay the upgrade loop fills in:
-//!   last build duration (the only persisted cost — sizes come straight from
-//!   the pacman DBs) and which rows already have artifacts on disk.
+//! - [`PreviewMetrics`] — the per-AUR-row overlay the shell fills in: last
+//!   build duration (the only persisted cost — sizes come straight from the
+//!   pacman DBs) and which rows already have artifacts on disk.
 //! - [`TimeEst`] — the build-time cell, plus [`built_tag`], the trailing
-//!   `built` marker. The size cell ([`super::change_set::SizeEst`]) stays with
-//!   the preview because the picker never shows sizes.
+//!   `built` marker. The size cell ([`super::change_set`]'s `SizeEst`) stays
+//!   with the table since it's the only place sizes show.
 
 use super::human_duration;
-use crate::names::{PkgBase, PkgName};
-use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
+use super::tables::{Paint, Width};
+use crate::names::{PkgBase, PkgName, RepoName, RepoRank};
 use console::style;
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 /// Per-AUR-row cost overlay shared by the picker and the change-set preview.
 ///
@@ -93,20 +93,37 @@ impl TimeEst {
     /// [`Self::None`] returns empty so a padded column collapses neatly.
     pub(super) fn render(self) -> String {
         match self {
-            Self::Estimate(n) => format!("~{}", human_duration(n)),
+            Self::Estimate(n) => format!("~{}", human_duration(Duration::from_secs(n))),
             Self::Unknown => "~?".to_owned(),
             Self::None => String::new(),
         }
     }
 
     /// Whether the rendered cell should be passed through [`super::dim`]: only
-    /// when the user can see styling (`colored`), only when the figure is
-    /// `faded` (stale or already built), and only on a real `Estimate` —
-    /// dimming a `~?` Unknown would look like a render glitch, and there's
-    /// nothing to dim on `None`. Pulled out so the decision is testable without
-    /// depending on `console`'s global TTY gate.
-    pub(super) const fn should_dim(self, colored: bool, faded: bool) -> bool {
-        colored && faded && matches!(self, Self::Estimate(_))
+    /// when the user can see styling (`paint` is colored), only when the figure
+    /// is [`Fade::Faded`] (stale or already built), and only on a real
+    /// `Estimate` — dimming a `~?` Unknown would look like a render glitch, and
+    /// there's nothing to dim on `None`. Pulled out so the decision is testable
+    /// without depending on `console`'s global TTY gate.
+    pub(super) const fn should_dim(self, paint: Paint, fade: Fade) -> bool {
+        paint.colored() && matches!(fade, Fade::Faded) && matches!(self, Self::Estimate(_))
+    }
+}
+
+/// Whether a build-time cell is visually de-emphasized — its recorded duration
+/// is stale, or the artifact is already built so the rebuild cost is moot. A
+/// named two-state rather than a bare `bool` flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fade {
+    /// Render at full emphasis.
+    Normal,
+    /// Dim the cell.
+    Faded,
+}
+
+impl From<bool> for Fade {
+    fn from(faded: bool) -> Self {
+        if faded { Self::Faded } else { Self::Normal }
     }
 }
 
@@ -142,12 +159,15 @@ impl RowCost {
 
     /// The cell text as it renders for this row. The `to_string` round-trip
     /// respects `console`'s color gate, so piped output stays plain.
-    fn cell(self, colored: bool) -> String {
+    fn cell(self, paint: Paint) -> String {
         if self.built && matches!(self.time, TimeEst::Unknown) {
             return String::new();
         }
         let s = self.time.render();
-        if self.time.should_dim(colored, self.stale || self.built) {
+        if self
+            .time
+            .should_dim(paint, Fade::from(self.stale || self.built))
+        {
             super::dim(s).to_string()
         } else {
             s
@@ -157,38 +177,38 @@ impl RowCost {
     /// Visible width of [`Self::cell`] — measured from the plain form so ANSI
     /// escapes in a dimmed cell don't skew column padding. Callers max this
     /// across rows to size the build-time column.
-    pub(super) fn visible_len(self) -> usize {
-        self.cell(false).len()
+    pub(super) fn visible_width(self) -> Width {
+        Width::of(&self.cell(Paint::Plain))
     }
 }
 
-/// Resolve the [`RowCost`] for one upgrade root from the overlay. Repo rows
-/// never build → [`RowCost::none`]; an AUR row takes its recorded duration
-/// (`Unknown` when the store has never seen it) plus the stale / already-built
-/// flags. Shared by the picker and the change-set preview so a root renders
-/// identically in both. Pulled-in AUR *deps* are resolved separately (by
-/// pkgbase) in the preview — see `change_set::cost_of_aur_dep`.
-pub(super) fn cost_of_root(u: &PkgUpgrade, metrics: &PreviewMetrics) -> RowCost {
-    if u.repo != REPO_AUR {
+/// Resolve the [`RowCost`] for one transaction root from the overlay, keyed by
+/// its repo + pkgname (so a fresh install with no `PkgUpgrade` resolves the same
+/// way an upgrade row does). Non-AUR rows never build → [`RowCost::none`]; an
+/// AUR row takes its recorded duration (`Unknown` when the store has never seen
+/// it) plus the stale / already-built flags. Pulled-in AUR *deps* are resolved
+/// separately (by pkgbase) in the preview — see `change_set::cost_of_aur_dep`.
+pub(super) fn cost_of(repo: &RepoName, name: &PkgName, metrics: &PreviewMetrics) -> RowCost {
+    if repo.rank() != RepoRank::Aur {
         return RowCost::none();
     }
     let time = metrics
         .root_build_secs
-        .get(&u.name)
+        .get(name)
         .copied()
         .map_or(TimeEst::Unknown, TimeEst::Estimate);
     RowCost::aur(
         time,
-        metrics.stale.contains(&u.name),
-        metrics.built_roots.contains(&u.name),
+        metrics.stale.contains(name),
+        metrics.built_roots.contains(name),
     )
 }
 
 /// The trailing `built` tag for an already-built AUR row — green when colored,
 /// plain otherwise. Rendered unaligned at the end of the row, like the session
 /// badges, so it never perturbs column math.
-fn built_tag(colored: bool) -> String {
-    if colored {
+fn built_tag(paint: Paint) -> String {
+    if paint.colored() {
         style("built").green().to_string()
     } else {
         "built".to_owned()
@@ -198,19 +218,17 @@ fn built_tag(colored: bool) -> String {
 /// A right-justified build-time column padded to `width` visible columns. The
 /// pad is measured from the plain cell so a dimmed estimate's ANSI escapes
 /// don't skew it. AUR rows fill the column; repo rows ([`RowCost::none`])
-/// collapse to blanks that keep it aligned. Shared by the picker and the
-/// change-set preview so both lay the column out identically.
-pub(super) fn time_col(cost: RowCost, width: usize, colored: bool) -> String {
-    let pad = " ".repeat(width.saturating_sub(cost.visible_len()));
-    format!("{pad}{}", cost.cell(colored))
+/// collapse to blanks that keep it aligned.
+pub(super) fn time_col(cost: RowCost, width: Width, paint: Paint) -> String {
+    format!("{}{}", width.gap(cost.visible_width()), cost.cell(paint))
 }
 
 /// The trailing `  built` tag (with its leading gap) for an already-built row,
 /// or empty otherwise. Unaligned — appended after the last aligned column, like
 /// the session badges, so it never perturbs column math.
-pub(super) fn built_suffix(cost: RowCost, colored: bool) -> String {
+pub(super) fn built_suffix(cost: RowCost, paint: Paint) -> String {
     if cost.built {
-        format!("  {}", built_tag(colored))
+        format!("  {}", built_tag(paint))
     } else {
         String::new()
     }
@@ -232,40 +250,46 @@ mod tests {
     }
 
     /// `should_dim` is the decision behind the dim affordance. Only the exact
-    /// combination `(colored, faded=true, Estimate)` qualifies; the other axes
-    /// all suppress it.
+    /// combination `(Colored, Faded, Estimate)` qualifies; the other axes all
+    /// suppress it.
     #[test]
     fn time_est_should_dim_truth_table() {
         let est = TimeEst::Estimate(60);
-        assert!(est.should_dim(true, true));
-        assert!(!est.should_dim(false, true), "plain must skip dim");
-        assert!(!est.should_dim(true, false), "non-faded must skip dim");
+        assert!(est.should_dim(Paint::Colored, Fade::Faded));
         assert!(
-            !TimeEst::Unknown.should_dim(true, true),
+            !est.should_dim(Paint::Plain, Fade::Faded),
+            "plain must skip dim"
+        );
+        assert!(
+            !est.should_dim(Paint::Colored, Fade::Normal),
+            "non-faded must skip dim"
+        );
+        assert!(
+            !TimeEst::Unknown.should_dim(Paint::Colored, Fade::Faded),
             "Unknown must never dim — `~?` dimmed looks like a render glitch",
         );
         assert!(
-            !TimeEst::None.should_dim(true, true),
+            !TimeEst::None.should_dim(Paint::Colored, Fade::Faded),
             "None has no cell to dim"
         );
     }
 
     /// A built `Unknown` row renders an empty time cell (the `built` tag carries
-    /// the signal), while a built `Estimate` keeps its number; `visible_len`
+    /// the signal), while a built `Estimate` keeps its number; `visible_width`
     /// tracks the cell actually rendered, not the canonical `render()`.
     #[test]
     fn built_unknown_cell_is_empty() {
         let built_unknown = RowCost::aur(TimeEst::Unknown, false, true);
-        assert_eq!(built_unknown.cell(false), "");
-        assert_eq!(built_unknown.visible_len(), 0);
+        assert_eq!(built_unknown.cell(Paint::Plain), "");
+        assert_eq!(built_unknown.visible_width().cells(), 0);
         // Not built: the Unknown row still shows `~?`.
         let unknown = RowCost::aur(TimeEst::Unknown, false, false);
-        assert_eq!(unknown.cell(false), "~?");
-        assert_eq!(unknown.visible_len(), 2);
+        assert_eq!(unknown.cell(Paint::Plain), "~?");
+        assert_eq!(unknown.visible_width().cells(), 2);
         // A built estimate keeps its plain text (dimming only adds ANSI, which
         // the plain-paint path skips).
         assert_eq!(
-            RowCost::aur(TimeEst::Estimate(60), false, true).cell(false),
+            RowCost::aur(TimeEst::Estimate(60), false, true).cell(Paint::Plain),
             "~1m 0s"
         );
     }
@@ -275,13 +299,13 @@ mod tests {
     #[test]
     fn built_suffix_only_when_built() {
         assert_eq!(
-            built_suffix(RowCost::aur(TimeEst::Unknown, false, true), false),
+            built_suffix(RowCost::aur(TimeEst::Unknown, false, true), Paint::Plain),
             "  built"
         );
         assert_eq!(
-            built_suffix(RowCost::aur(TimeEst::Unknown, false, false), false),
+            built_suffix(RowCost::aur(TimeEst::Unknown, false, false), Paint::Plain),
             ""
         );
-        assert_eq!(built_suffix(RowCost::none(), false), "");
+        assert_eq!(built_suffix(RowCost::none(), Paint::Plain), "");
     }
 }

@@ -1,161 +1,387 @@
-//! Pre-apply change-set preview for the upgrade loop.
+//! The unified staged-transaction table for the interactive shell.
 //!
-//! Right before `pacman -Syu` / `pacman -U`, the loop renders this preview so
-//! the user sees what's about to happen and what it will cost.
+//! `show` resolves the cart into a change set and renders it through
+//! [`transaction_table`]: the numbered, approval-tagged root rows (repo + AUR,
+//! install + upgrade) over the same sort/verdiff/size/build-time machinery the
+//! old upgrade-loop preview used, plus the pulled-in dependency rows, the
+//! "will remove" rows, and a batch total. `apply` no longer redraws it — it
+//! gates on the one-line [`cost_summary`] instead (`docs/plans/shell-ui.md`,
+//! phase 5a). The renderers *return* their lines so the shell owns the output
+//! stream and the layout is unit-testable.
 //!
 //! Two cost figures live here:
-//! - **Size** (phase 2 of `docs/UPDATE_LOOP.md`) — exact `download_size` from
-//!   the syncdb for repo rows; `~`-estimated `isize` from localdb for AUR
-//!   rows; `~?` for never-installed pull-ins.
-//! - **Build time** (phase 3) — `~Xm Ys` from the cross-session
-//!   `MetricsStore` for AUR rows that have ever been built before; `~?` for
-//!   first-time builds the store can't predict; dimmed when the localdb
-//!   install date is old enough that the recorded duration is from a
-//!   different build flow.
-//!
-//! Split out of `tables.rs` (which still owns the picker / upgrade-table
-//! primitives) because the change-set rendering carries its own type cluster
-//! — `SizeEst`, `TimeEst`, `PreviewMetrics` — that doesn't apply anywhere
-//! else.
+//! - **Size** — exact `download_size` from the syncdb for repo rows;
+//!   `~`-estimated `isize` from localdb for AUR rows; `~?` for never-installed
+//!   pull-ins.
+//! - **Build time** — `~Xm Ys` from the cross-session `MetricsStore` for AUR
+//!   rows that have ever been built before; `~?` for first-time builds the
+//!   store can't predict; dimmed when the recorded duration is old enough that
+//!   it's a shaky predictor.
 
-use super::cost::{PreviewMetrics, RowCost, TimeEst, built_suffix, cost_of_root, time_col};
-use super::tables::{Paint, col_widths, render_row, sort_for_display};
-use super::{color_on, human_bytes, human_duration};
-use crate::names::{PkgBase, PkgName};
+use super::cost::{PreviewMetrics, RowCost, TimeEst, built_suffix, cost_of, time_col};
+use super::tables::{Cell, Paint, Table, Width, version_block};
+use super::{color_on, dim, human_age, human_bytes, human_duration, repo as repo_style};
+use crate::names::{PkgBase, PkgName, RepoName, RepoRank};
 use crate::pacman::alpm_db::PacmanIndex;
-use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
-use std::fmt::Write;
+use crate::version::Version;
+use console::style;
+use std::fmt::Write as _;
+use std::time::Duration;
 
-/// Render the change-set preview.
+/// The presentation half of the shell's `cart::Approval`.
 ///
-/// `roots` are the selected upgrade rows (repo + AUR mixed); `repo_deps` are
-/// concrete pkgnames `pacman -S` will install on top; `aur_deps` are the extra
-/// AUR pkgbases the resolver pulled in; `pac` is the snapshot the size figures
-/// are read from; `metrics` carries the per-AUR-row build-time overlay.
-pub fn change_set_table(
-    roots: &[PkgUpgrade],
+/// Kept here so the renderer owns the approval label + color without `ui`
+/// depending on `cli::shell`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalCell {
+    Approved,
+    NeedsReview,
+}
+
+impl ApprovalCell {
+    /// Plain column text — also what the column width is measured from.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::NeedsReview => "review",
+        }
+    }
+
+    /// The aligned cell: green when approved, yellow when pending; plain when
+    /// color is off.
+    fn cell(self, paint: Paint) -> Cell {
+        Cell::paint(self.label(), paint, |s| match self {
+            Self::Approved => style(s).green().to_string(),
+            Self::NeedsReview => style(s).yellow().to_string(),
+        })
+    }
+}
+
+/// One numbered root row of the staged transaction.
+///
+/// Built by the shell from a `cart::CartItem` plus index/db lookups: an upgrade
+/// row carries both versions, a fresh install leaves `old_ver` `None` (and the
+/// renderer drops the arrow). `age` is the AUR pkgbase's "last modified" age
+/// (the shell reads the wall clock); `None` for repo rows or when the index has
+/// no commit time.
+#[derive(Debug, Clone)]
+pub struct TxnRoot {
+    pub repo: RepoName,
+    pub approval: ApprovalCell,
+    pub name: PkgName,
+    /// `None` for a fresh install; `Some` for an upgrade.
+    pub old_ver: Option<Version>,
+    /// The version being installed; `None` only when we couldn't resolve one
+    /// (the renderer then leaves the version cell blank but aligned).
+    pub new_ver: Option<Version>,
+    /// AUR pkgbase "last modified" age, for the trailing `(Xd ago)` cell.
+    pub age: Option<Duration>,
+}
+
+/// Render the unified transaction table as display lines.
+///
+/// No trailing newline, and no top header — the shell's `show` prints its own
+/// header + approval summary around these. `roots` are rendered in the order
+/// given (the cart holds them sorted, so the row number *is* the cart index);
+/// `repo_deps` / `aur_deps` are the pulled-in dependencies the resolver added;
+/// `removals` are the staged uninstalls; `pac` backs the size figures and
+/// `metrics` the build-time ones.
+pub fn transaction_table(
+    roots: &[TxnRoot],
+    repo_deps: &[PkgName],
+    aur_deps: &[PkgBase],
+    removals: &[PkgName],
+    pac: &PacmanIndex,
+    metrics: &PreviewMetrics,
+) -> Table {
+    let paint = Paint::from(color_on());
+    let fig = figures(roots, repo_deps, aur_deps, pac, metrics);
+
+    // Column widths over the plain cell text — padding is applied on that visible
+    // width so embedded ANSI codes never skew the columns.
+    let num_w = Width::of(&roots.len().to_string());
+    let repo_w = Width::widest(roots.iter().map(|r| Width::of(r.repo.as_str())));
+    let appr_w = Width::widest(roots.iter().map(|r| Width::of(r.approval.label())));
+    let name_w = Width::widest(roots.iter().map(|r| Width::of(r.name.as_str())));
+    let old_w = Width::widest(
+        roots
+            .iter()
+            .filter_map(|r| r.old_ver.as_ref())
+            .map(|v| Width::of(v.as_str())),
+    );
+    let new_w = Width::widest(
+        roots
+            .iter()
+            .filter_map(|r| r.new_ver.as_ref())
+            .map(|v| Width::of(v.as_str())),
+    );
+    let size_w = Width::widest(
+        fig.root_sizes
+            .iter()
+            .chain(&fig.repo_dep_sizes)
+            .chain(&fig.aur_dep_sizes)
+            .map(|s| Width::of(&s.render())),
+    );
+    let time_w = Width::widest(
+        fig.root_costs
+            .iter()
+            .chain(&fig.aur_dep_costs)
+            .map(|c| c.visible_width()),
+    );
+
+    let mut out = Table::new();
+    for (i, ((root, size), cost)) in roots
+        .iter()
+        .zip(&fig.root_sizes)
+        .zip(&fig.root_costs)
+        .enumerate()
+    {
+        let repo_cell =
+            Cell::paint(root.repo.as_str(), paint, |s| repo_style(s).to_string()).pad_to(repo_w);
+        let appr_cell = root.approval.cell(paint).pad_to(appr_w);
+        let name_cell = Cell::plain(root.name.as_str()).pad_to(name_w);
+        let ver = version_block(
+            root.old_ver.as_ref(),
+            root.new_ver.as_ref(),
+            old_w,
+            new_w,
+            paint,
+        );
+        out.push(format!(
+            "{n:>num$}  {repo_cell}  {appr_cell}  {name_cell}  {ver}  {size:>sw$}  {time}{built}{age}",
+            n = i + 1,
+            num = num_w.cells(),
+            size = size.render(),
+            sw = size_w.cells(),
+            time = time_col(*cost, time_w, paint),
+            built = built_suffix(*cost, paint),
+            age = age_cell(root.age, paint),
+        ));
+    }
+
+    out.append(dep_lines(repo_deps, aur_deps, &fig, size_w, time_w, paint));
+    out.append(removal_lines(removals, paint));
+
+    out.push(total_line(&fig));
+    out
+}
+
+/// The indented "pulls in:" block: the repo deps (`(install)`) then the AUR
+/// build deps (`(build)`), each with its size and — for AUR rows — build-time
+/// cell. Empty (no marker) when nothing is pulled in. `size_w` / `time_w` are
+/// the columns shared with the root rows so the figures line up beneath them.
+fn dep_lines(
+    repo_deps: &[PkgName],
+    aur_deps: &[PkgBase],
+    fig: &Figures,
+    size_w: Width,
+    time_w: Width,
+    paint: Paint,
+) -> Table {
+    if repo_deps.is_empty() && aur_deps.is_empty() {
+        return Table::new();
+    }
+    let dep_w = Width::widest(
+        repo_deps
+            .iter()
+            .map(|n| Width::of(n.as_str()))
+            .chain(aur_deps.iter().map(|p| Width::of(p.as_str()))),
+    );
+    // "(install)" is the widest tag — pad both to it so the size column lines up
+    // across install and build rows.
+    let tag_w = Width::of("(install)");
+    let (dw, tw, sw, tmw) = (dep_w.cells(), tag_w.cells(), size_w.cells(), time_w.cells());
+    let mut out = Table::new();
+    out.push(marker("pulls in:"));
+    for (name, size) in repo_deps.iter().zip(&fig.repo_dep_sizes) {
+        out.push(format!(
+            "        {name:<dw$}  {tag:<tw$}  {size:>sw$}  {empty:>tmw$}",
+            tag = "(install)",
+            size = size.render(),
+            empty = "",
+        ));
+    }
+    for ((name, size), cost) in aur_deps
+        .iter()
+        .zip(&fig.aur_dep_sizes)
+        .zip(&fig.aur_dep_costs)
+    {
+        out.push(format!(
+            "        {name:<dw$}  {tag:<tw$}  {size:>sw$}  {time}{built}",
+            tag = "(build)",
+            size = size.render(),
+            time = time_col(*cost, time_w, paint),
+            built = built_suffix(*cost, paint),
+        ));
+    }
+    out
+}
+
+/// The indented "will remove:" block, red when colored; empty (no marker) when
+/// nothing is staged for removal.
+fn removal_lines(removals: &[PkgName], paint: Paint) -> Table {
+    if removals.is_empty() {
+        return Table::new();
+    }
+    let mut out = Table::new();
+    out.push(marker("will remove:"));
+    for name in removals {
+        let shown = if paint.colored() {
+            style(name.as_str()).red().to_string()
+        } else {
+            name.as_str().to_owned()
+        };
+        out.push(format!("        {shown}"));
+    }
+    out
+}
+
+/// The one-line cost summary `apply` gates on.
+///
+/// `show` is where the user looks; `apply` no longer redraws the table. E.g.
+/// `3 install, +2 deps, 1 remove · ~3.07 GiB · ~22m build`. The deps / remove /
+/// build terms are omitted when their count is zero.
+pub fn cost_summary(
+    roots: &[TxnRoot],
+    repo_deps: &[PkgName],
+    aur_deps: &[PkgBase],
+    removals: &[PkgName],
+    pac: &PacmanIndex,
+    metrics: &PreviewMetrics,
+) -> String {
+    let fig = figures(roots, repo_deps, aur_deps, pac, metrics);
+    let size = fig.size_total();
+    let time = fig.time_total();
+
+    let mut parts = vec![format!("{} install", roots.len())];
+    let deps = repo_deps.len() + aur_deps.len();
+    if deps > 0 {
+        parts.push(format!("+{deps} dep{}", if deps == 1 { "" } else { "s" }));
+    }
+    if !removals.is_empty() {
+        parts.push(format!("{} remove", removals.len()));
+    }
+    let mut line = parts.join(", ");
+    write!(line, " · {}{}", size.precision.prefix(), size.size.render()).ok();
+    if matches!(time.term, BuildTerm::Present) {
+        write!(
+            line,
+            " · {}{} build",
+            time.precision.prefix(),
+            human_duration(time.time),
+        )
+        .ok();
+    }
+    line
+}
+
+/// The per-row size + build-time figures for a change set, computed once and
+/// shared by [`transaction_table`] (per-cell + widths) and [`cost_summary`]
+/// (totals only).
+struct Figures {
+    root_sizes: Vec<SizeEst>,
+    root_costs: Vec<RowCost>,
+    repo_dep_sizes: Vec<SizeEst>,
+    aur_dep_sizes: Vec<SizeEst>,
+    aur_dep_costs: Vec<RowCost>,
+}
+
+impl Figures {
+    /// Total size across roots + repo deps + AUR deps.
+    fn size_total(&self) -> SizeTotal {
+        batch_size_total(
+            self.root_sizes
+                .iter()
+                .chain(&self.repo_dep_sizes)
+                .chain(&self.aur_dep_sizes)
+                .copied(),
+        )
+    }
+
+    /// Total build time across the AUR roots + AUR deps.
+    fn time_total(&self) -> TimeTotal {
+        batch_time_total(
+            self.root_costs
+                .iter()
+                .chain(&self.aur_dep_costs)
+                .map(|c| c.time),
+        )
+    }
+}
+
+fn figures(
+    roots: &[TxnRoot],
     repo_deps: &[PkgName],
     aur_deps: &[PkgBase],
     pac: &PacmanIndex,
     metrics: &PreviewMetrics,
-) {
-    let dep_count = repo_deps.len() + aur_deps.len();
-    let header = if dep_count == 0 {
-        format!("this batch — {} package(s)", roots.len())
-    } else {
-        format!(
-            "this batch — {} package(s), +{dep_count} dependenc{}",
-            roots.len(),
-            if dep_count == 1 { "y" } else { "ies" },
-        )
-    };
-    super::info(&header);
-
-    let ordered = sort_for_display(roots);
-    let (repo_w, name_w, old_w) = col_widths(&ordered);
-    let new_w = ordered.iter().map(|u| u.new_ver.len()).max().unwrap_or(0);
-    let paint = Paint::from(color_on());
-
-    // Resolve every row's size once: the figures drive the size-column width,
-    // the per-row cells, and the batch total in a single pass.
-    let root_sizes: Vec<SizeEst> = ordered.iter().map(|u| size_of_root(u, pac)).collect();
-    let repo_dep_sizes: Vec<SizeEst> = repo_deps.iter().map(|n| size_of_repo_dep(n, pac)).collect();
-    // Pulled-in AUR deps are unsatisfied builds — not yet installed — so their
-    // footprint is unknown (`~?`). See `docs/UPDATE_LOOP.md` § Cost estimates.
-    let aur_dep_sizes: Vec<SizeEst> = vec![SizeEst::Unknown; aur_deps.len()];
-    let size_w = root_sizes
-        .iter()
-        .chain(&repo_dep_sizes)
-        .chain(&aur_dep_sizes)
-        .map(|s| s.render().len())
-        .max()
-        .unwrap_or(0);
-
-    // Build-time + built state per row. Repo rows are [`RowCost::none`] (empty
-    // cell, no tag); AUR rows carry their Estimate / Unknown figure, the stale
-    // dim flag, and whether the artifact is already built.
-    let colored = paint.colored();
-    let root_costs: Vec<RowCost> = ordered.iter().map(|u| cost_of_root(u, metrics)).collect();
-    let aur_dep_costs: Vec<RowCost> = aur_deps
-        .iter()
-        .map(|pb| cost_of_aur_dep(pb, metrics))
-        .collect();
-    let time_w = root_costs
-        .iter()
-        .chain(&aur_dep_costs)
-        .map(|c| c.visible_len())
-        .max()
-        .unwrap_or(0);
-
-    for ((u, size), cost) in ordered.iter().zip(&root_sizes).zip(&root_costs) {
-        let row = render_row(u, repo_w, name_w, old_w, paint);
-        let new_pad = " ".repeat(new_w.saturating_sub(u.new_ver.len()));
-        eprintln!(
-            "    {row}{new_pad}  {size:>size_w$}  {time}{tag}",
-            size = size.render(),
-            time = time_col(*cost, time_w, colored),
-            tag = built_suffix(*cost, colored),
-        );
-    }
-
-    if dep_count > 0 {
-        super::note("pulls in:");
-        let dep_w = repo_deps
+) -> Figures {
+    Figures {
+        root_sizes: roots
             .iter()
-            .map(PkgName::len)
-            .chain(aur_deps.iter().map(PkgBase::len))
-            .max()
-            .unwrap_or(0);
-        // "(install)" is the widest tag — pad both to it so the size column
-        // lines up across install and build rows.
-        let tag_w = "(install)".len();
-        for (name, size) in repo_deps.iter().zip(&repo_dep_sizes) {
-            // Repo deps don't build — render the time cell as empty padding so
-            // the AUR-dep rows below still align.
-            eprintln!(
-                "      {name:<dep_w$}  {tag:<tag_w$}  {size:>size_w$}  {empty:>time_w$}",
-                tag = "(install)",
-                size = size.render(),
-                empty = "",
-            );
-        }
-        for ((name, size), cost) in aur_deps.iter().zip(&aur_dep_sizes).zip(&aur_dep_costs) {
-            eprintln!(
-                "      {name:<dep_w$}  {tag:<tag_w$}  {size:>size_w$}  {time}{built}",
-                tag = "(build)",
-                size = size.render(),
-                time = time_col(*cost, time_w, colored),
-                built = built_suffix(*cost, colored),
-            );
-        }
-    }
-
-    let (total_bytes, size_approx) = batch_size_total(
-        root_sizes
+            .map(|r| size_of(&r.repo, &r.name, pac))
+            .collect(),
+        root_costs: roots
             .iter()
-            .chain(&repo_dep_sizes)
-            .chain(&aur_dep_sizes)
-            .copied(),
+            .map(|r| cost_of(&r.repo, &r.name, metrics))
+            .collect(),
+        repo_dep_sizes: repo_deps.iter().map(|n| size_of_repo_dep(n, pac)).collect(),
+        // Pulled-in AUR deps are unsatisfied builds — not yet installed — so
+        // their footprint is unknown (`~?`).
+        aur_dep_sizes: vec![SizeEst::Unknown; aur_deps.len()],
+        aur_dep_costs: aur_deps
+            .iter()
+            .map(|pb| cost_of_aur_dep(pb, metrics))
+            .collect(),
+    }
+}
+
+/// The batch `total` line for the table.
+fn total_line(fig: &Figures) -> String {
+    let size = fig.size_total();
+    let time = fig.time_total();
+    let mut line = format!(
+        "-> total  {}{}",
+        size.precision.prefix(),
+        size.size.render()
     );
-    let (total_secs, time_approx, time_any) =
-        batch_time_total(root_costs.iter().chain(&aur_dep_costs).map(|c| c.time));
-    let size_prefix = if size_approx { "~" } else { "" };
-    let mut total_line = format!("total  {size_prefix}{}", human_bytes(total_bytes));
-    // The build-time term joins the size term only when at least one AUR row
-    // exists in the batch — pure-repo batches don't need a `0s build` tail.
-    if time_any {
-        let time_prefix = if time_approx { "~" } else { "" };
-        // Write into a String can only fail if the allocator does, which would
-        // already be aborting the process — explicit `expect` over a silent
-        // `let _ =` makes that contract visible.
+    // The build-time term joins only when the batch has at least one AUR row —
+    // a pure-repo batch doesn't need a `0s build` tail.
+    if matches!(time.term, BuildTerm::Present) {
         write!(
-            total_line,
-            "   {time_prefix}{} build",
-            human_duration(total_secs),
+            line,
+            "   {}{} build",
+            time.precision.prefix(),
+            human_duration(time.time),
         )
-        .expect("writing to String is infallible");
+        .ok();
     }
-    super::note(&total_line);
+    line
+}
+
+/// A section marker line (`-> pulls in:` / `-> will remove:`), dimmed when color
+/// is on.
+fn marker(text: &str) -> String {
+    let body = format!("-> {text}");
+    if color_on() {
+        dim(&body).to_string()
+    } else {
+        body
+    }
+}
+
+/// The trailing `  (Xd ago)` age cell for an AUR row, dimmed when colored; empty
+/// when there's no age.
+fn age_cell(age: Option<Duration>, paint: Paint) -> String {
+    let Some(age) = age else {
+        return String::new();
+    };
+    let label = format!("({} ago)", human_age(age));
+    if paint.colored() {
+        format!("  {}", dim(&label))
+    } else {
+        format!("  {label}")
+    }
 }
 
 /// A change-set row's size figure.
@@ -163,7 +389,7 @@ pub fn change_set_table(
 /// Repo rows are [`Self::Exact`] (the bytes pacman will download); AUR rows are
 /// an [`Self::Estimate`] from the installed version's on-disk size, rendered
 /// with a leading `~`; a pulled-in dep that was never installed is
-/// [`Self::Unknown`] (`~?`). See `docs/UPDATE_LOOP.md` § Cost estimates.
+/// [`Self::Unknown`] (`~?`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SizeEst {
     Exact(u64),
@@ -197,16 +423,14 @@ impl SizeEst {
     }
 }
 
-/// Size of a selected root: AUR rows estimate from the installed footprint,
-/// repo rows take the exact download size. Either lookup can miss (an AUR pkg
-/// pacman has no localdb size for, a repo pkg absent from this db snapshot) →
-/// [`SizeEst::Unknown`].
-fn size_of_root(u: &PkgUpgrade, pac: &PacmanIndex) -> SizeEst {
-    if u.repo == REPO_AUR {
-        pac.installed_size(&u.name)
+/// Size of a transaction root: AUR rows estimate from the installed footprint,
+/// repo rows take the exact download size. Either lookup can miss → [`SizeEst::Unknown`].
+fn size_of(repo: &RepoName, name: &PkgName, pac: &PacmanIndex) -> SizeEst {
+    if repo.rank() == RepoRank::Aur {
+        pac.installed_size(name)
             .map_or(SizeEst::Unknown, SizeEst::Estimate)
     } else {
-        pac.sync_download_size(&u.name)
+        pac.sync_download_size(name)
             .map_or(SizeEst::Unknown, SizeEst::Exact)
     }
 }
@@ -217,17 +441,92 @@ fn size_of_repo_dep(name: &PkgName, pac: &PacmanIndex) -> SizeEst {
         .map_or(SizeEst::Unknown, SizeEst::Exact)
 }
 
-/// Sum a change set's figures into `(bytes, approximate)`. `bytes` is a lower
-/// bound whenever a row is an estimate or unknown; `approximate` flags that so
-/// the caller can prefix the total with `~`.
-fn batch_size_total(sizes: impl IntoIterator<Item = SizeEst>) -> (u64, bool) {
-    let mut total = 0u64;
+/// A byte count. A newtype (not a bare `u64`) so a size can't be mixed up with a
+/// package count or a duration; renders through [`human_bytes`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Bytes(u64);
+
+impl Bytes {
+    const fn saturating_add(self, other: Self) -> Self {
+        Self(self.0.saturating_add(other.0))
+    }
+
+    fn render(self) -> String {
+        human_bytes(self.0)
+    }
+}
+
+/// Whether a summed figure is exact, or an approximate lower bound because some
+/// row was an estimate / unknown. Replaces a bare `approx: bool`; supplies the
+/// leading `~` on the rendered total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Precision {
+    Exact,
+    Approximate,
+}
+
+impl Precision {
+    /// The `~` (or empty) prefix the rendered total carries.
+    const fn prefix(self) -> &'static str {
+        match self {
+            Self::Exact => "",
+            Self::Approximate => "~",
+        }
+    }
+}
+
+impl From<bool> for Precision {
+    fn from(approximate: bool) -> Self {
+        if approximate {
+            Self::Approximate
+        } else {
+            Self::Exact
+        }
+    }
+}
+
+/// Whether a batch contains any buildable (AUR) row — gates the trailing
+/// build-time term, so a pure-repo batch shows just the size total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildTerm {
+    Absent,
+    Present,
+}
+
+impl From<bool> for BuildTerm {
+    fn from(any: bool) -> Self {
+        if any { Self::Present } else { Self::Absent }
+    }
+}
+
+/// The summed download/footprint size of a change set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SizeTotal {
+    size: Bytes,
+    precision: Precision,
+}
+
+/// The summed build time of a change set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeTotal {
+    time: Duration,
+    precision: Precision,
+    /// Whether the build-time term applies at all (any AUR row present).
+    term: BuildTerm,
+}
+
+/// Sum a change set's size figures.
+fn batch_size_total(sizes: impl IntoIterator<Item = SizeEst>) -> SizeTotal {
+    let mut size = Bytes::default();
     let mut approx = false;
     for s in sizes {
-        total = total.saturating_add(s.bytes());
+        size = size.saturating_add(Bytes(s.bytes()));
         approx |= s.approximate();
     }
-    (total, approx)
+    SizeTotal {
+        size,
+        precision: approx.into(),
+    }
 }
 
 /// Cost cell for one pulled-in AUR build dep — by definition an AUR build, so
@@ -242,39 +541,39 @@ fn cost_of_aur_dep(pb: &PkgBase, metrics: &PreviewMetrics) -> RowCost {
     RowCost::aur(time, false, metrics.built_deps.contains(pb))
 }
 
-/// Sum a change set's build-time figures into `(seconds, approximate, any)`.
-/// `seconds` is a lower bound when any row is `Unknown`; `approximate` flags
-/// that so the caller can prefix the total with `~`; `any` reports whether the
-/// batch has at least one applicable row (so a pure-repo batch can suppress
-/// the trailing `~0s build` term entirely).
-fn batch_time_total(times: impl IntoIterator<Item = TimeEst>) -> (u64, bool, bool) {
-    let mut total = 0u64;
+/// Sum a change set's build-time figures.
+fn batch_time_total(times: impl IntoIterator<Item = TimeEst>) -> TimeTotal {
+    let mut secs = 0u64;
     let mut approx = false;
     let mut any = false;
     for t in times {
-        total = total.saturating_add(t.secs());
+        secs = secs.saturating_add(t.secs());
         approx |= t.approximate();
         any |= t.applicable();
     }
-    (total, approx, any)
+    TimeTotal {
+        time: Duration::from_secs(secs),
+        precision: approx.into(),
+        term: any.into(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::version::Version;
 
-    fn up(repo: &str, name: &str, old: &str, new: &str) -> PkgUpgrade {
-        PkgUpgrade {
-            repo: repo.into(),
-            name: name.into(),
-            old_ver: Version::from(old),
-            new_ver: Version::from(new),
+    fn root(repo: &str, name: &str, old: Option<&str>, new: Option<&str>) -> TxnRoot {
+        TxnRoot {
+            repo: RepoName::from(repo),
+            approval: ApprovalCell::Approved,
+            name: PkgName::from(name),
+            old_ver: old.map(Version::from),
+            new_ver: new.map(Version::from),
+            age: None,
         }
     }
 
-    /// Each `SizeEst` variant renders its expected cell: bare exact,
-    /// `~`-prefixed estimate, `~?` for unknown.
+    /// Each `SizeEst` variant renders its expected cell.
     #[test]
     fn size_est_renders_each_variant() {
         assert_eq!(SizeEst::Exact(1024).render(), "1.00 KiB");
@@ -286,7 +585,7 @@ mod tests {
     /// `isize`, repo rows take the exact syncdb download size, and a miss in
     /// either map falls back to unknown.
     #[test]
-    fn size_of_root_picks_source_by_repo() {
+    fn size_of_picks_source_by_repo() {
         let mut pac = PacmanIndex::default();
         pac.installed_size
             .insert("paru-bin".into(), 9 * 1024 * 1024);
@@ -294,35 +593,32 @@ mod tests {
             .insert("glibc".into(), 12 * 1024 * 1024);
 
         assert_eq!(
-            size_of_root(&up(REPO_AUR, "paru-bin", "1-1", "2-1"), &pac),
+            size_of(&"aur".into(), &"paru-bin".into(), &pac),
             SizeEst::Estimate(9 * 1024 * 1024)
         );
         assert_eq!(
-            size_of_root(&up("core", "glibc", "2.40-1", "2.41-1"), &pac),
+            size_of(&"core".into(), &"glibc".into(), &pac),
             SizeEst::Exact(12 * 1024 * 1024)
         );
         // AUR row with no localdb size (manually built / never installed).
         assert_eq!(
-            size_of_root(&up(REPO_AUR, "ghost", "1-1", "2-1"), &pac),
+            size_of(&"aur".into(), &"ghost".into(), &pac),
             SizeEst::Unknown
         );
     }
 
     /// Regression guard for the stale-db size bug: a repo row whose pkgname is
-    /// present in the size index with a `download_size` of 0 (libalpm's answer
-    /// for an already-cached archive) is `Exact(0)` → renders `0 B`, a real
-    /// value — distinct from a *missing* pkgname, which is `Unknown` → `~?`.
-    /// The distinction is why a preview full of `0 B` rows points at the size
-    /// source (a stale syncdb whose versions are already cached), not the
-    /// formatter.
+    /// present with a `download_size` of 0 (libalpm's answer for an already-cached
+    /// archive) is `Exact(0)` → renders `0 B`, distinct from a *missing* pkgname,
+    /// which is `Unknown` → `~?`.
     #[test]
     fn repo_zero_size_is_exact_not_missing() {
         let mut pac = PacmanIndex::default();
         pac.sync_download_size.insert("cached".into(), 0);
-        let cached = size_of_root(&up("core", "cached", "1-1", "1-2"), &pac);
+        let cached = size_of(&"core".into(), &"cached".into(), &pac);
         assert_eq!(cached, SizeEst::Exact(0));
         assert_eq!(cached.render(), "0 B");
-        let missing = size_of_root(&up("core", "absent", "1-1", "1-2"), &pac);
+        let missing = size_of(&"core".into(), &"absent".into(), &pac);
         assert_eq!(missing, SizeEst::Unknown);
         assert_eq!(missing.render(), "~?");
     }
@@ -331,22 +627,30 @@ mod tests {
     /// moment a non-exact row (estimate or unknown) is in the mix.
     #[test]
     fn batch_size_total_sums_and_flags_approximate() {
-        let (exact, approx) = batch_size_total([SizeEst::Exact(100), SizeEst::Exact(200)]);
-        assert_eq!(exact, 300);
-        assert!(!approx, "all-exact total must not be marked approximate");
+        let exact = batch_size_total([SizeEst::Exact(100), SizeEst::Exact(200)]);
+        assert_eq!(exact.size, Bytes(300));
+        assert_eq!(
+            exact.precision,
+            Precision::Exact,
+            "all-exact total must not be marked approximate"
+        );
 
-        let (mixed, approx) =
+        let mixed =
             batch_size_total([SizeEst::Exact(100), SizeEst::Estimate(50), SizeEst::Unknown]);
-        assert_eq!(mixed, 150, "unknown contributes 0 to the total");
-        assert!(approx, "an estimate makes the total approximate");
+        assert_eq!(mixed.size, Bytes(150), "unknown contributes 0 to the total");
+        assert_eq!(
+            mixed.precision,
+            Precision::Approximate,
+            "an estimate makes the total approximate"
+        );
     }
 
     /// Source selection for the root cost cell: repo rows are not-applicable
-    /// (`None`, never built); AUR rows resolve their figure through
-    /// `root_build_secs`, an unrecorded AUR row is `Unknown`, and the
-    /// stale/built flags come straight from the overlay sets.
+    /// (`None`, never built); AUR rows resolve through `root_build_secs`, an
+    /// unrecorded AUR row is `Unknown`, and the stale/built flags come from the
+    /// overlay sets.
     #[test]
-    fn cost_of_root_picks_by_repo_and_flags() {
+    fn cost_of_picks_by_repo_and_flags() {
         let mut metrics = PreviewMetrics::empty();
         metrics
             .root_build_secs
@@ -354,27 +658,22 @@ mod tests {
         metrics.built_roots.insert(PkgName::from("paru-bin"));
         metrics.stale.insert(PkgName::from("first-time"));
 
-        // Repo row → no build, so no cell and no flags.
-        let repo = cost_of_root(&up("core", "glibc", "1-1", "2-1"), &metrics);
+        let repo = cost_of(&"core".into(), &"glibc".into(), &metrics);
         assert_eq!(repo.time, TimeEst::None);
         assert!(!repo.built);
 
-        // AUR row with a recorded duration, flagged built.
-        let recorded = cost_of_root(&up(REPO_AUR, "paru-bin", "1-1", "2-1"), &metrics);
+        let recorded = cost_of(&"aur".into(), &"paru-bin".into(), &metrics);
         assert_eq!(recorded.time, TimeEst::Estimate(90));
         assert!(recorded.built);
         assert!(!recorded.stale);
 
-        // AUR row the store has never seen, flagged stale (e.g. from an older
-        // sibling measurement) but not built.
-        let first = cost_of_root(&up(REPO_AUR, "first-time", "0-1", "1-1"), &metrics);
+        let first = cost_of(&"aur".into(), &"first-time".into(), &metrics);
         assert_eq!(first.time, TimeEst::Unknown);
         assert!(first.stale);
         assert!(!first.built);
     }
 
-    /// Pulled-in AUR build deps don't have a `repo` field to switch on — they
-    /// are always AUR builds — so the figure is Estimate or Unknown but never
+    /// Pulled-in AUR build deps are always AUR builds — Estimate or Unknown, never
     /// None; the built flag tracks `built_deps`.
     #[test]
     fn cost_of_aur_dep_resolves_or_unknown() {
@@ -393,73 +692,124 @@ mod tests {
         assert!(!unknown.built);
     }
 
-    /// The build-time total reports (sum, approximate, any). `None` doesn't
-    /// count toward `any`; either `Estimate` or `Unknown` marks the total
+    /// The build-time total reports (sum, precision, build-term presence). `None`
+    /// doesn't make the term apply; either `Estimate` or `Unknown` marks the total
     /// approximate.
     #[test]
     fn batch_time_total_tallies_approx_and_applicability() {
-        // Pure-repo batch: no AUR rows ⇒ no build-time term at all.
-        let (sec, approx, any) = batch_time_total([TimeEst::None, TimeEst::None]);
-        assert_eq!(sec, 0);
-        assert!(!approx);
-        assert!(!any, "pure-repo batch should suppress the build-time term");
+        let none = batch_time_total([TimeEst::None, TimeEst::None]);
+        assert_eq!(none.time, Duration::ZERO);
+        assert_eq!(none.precision, Precision::Exact);
+        assert_eq!(
+            none.term,
+            BuildTerm::Absent,
+            "pure-repo batch should suppress the build-time term"
+        );
 
-        // Mixed AUR batch: sum, marked approximate, applicable.
-        let (sec, approx, any) = batch_time_total([
+        let mixed = batch_time_total([
             TimeEst::Estimate(60),
             TimeEst::Estimate(120),
             TimeEst::Unknown,
             TimeEst::None,
         ]);
-        assert_eq!(sec, 180, "unknown contributes 0 but estimates sum");
-        assert!(
-            approx,
-            "an estimate or unknown row makes the total approximate"
+        assert_eq!(
+            mixed.time.as_secs(),
+            180,
+            "unknown contributes 0 but estimates sum"
         );
-        assert!(any);
+        assert_eq!(mixed.precision, Precision::Approximate);
+        assert_eq!(mixed.term, BuildTerm::Present);
     }
 
-    /// `change_set_table` must survive the cases most likely to break the
-    /// width/zip math: a mixed root + dep batch, the no-deps path, an empty
-    /// change set, a stale-marked AUR row, and already-built root + dep rows
-    /// (which dim the time cell and append the `built` tag). Output goes to
-    /// stderr so we assert "doesn't panic," as the other table smokes do.
+    /// One numbered row per root, in the given order; a fresh install (no `old`)
+    /// drops the arrow while an upgrade keeps `old → new`; the deps + removals +
+    /// total lines all appear. Plain (un-colored) so the assertions are stable.
     #[test]
-    fn change_set_table_smoke() {
+    fn transaction_table_renders_rows_deps_and_total() {
         let mut pac = PacmanIndex::default();
-        pac.installed_size
-            .insert("cuda".into(), 3 * 1024 * 1024 * 1024);
         pac.sync_download_size
             .insert("glibc".into(), 12 * 1024 * 1024);
         pac.sync_download_size
             .insert("gcc13".into(), 50 * 1024 * 1024);
+        pac.installed_size
+            .insert("cuda".into(), 3 * 1024 * 1024 * 1024);
+
         let roots = vec![
-            up(REPO_AUR, "cuda", "12.6-1", "12.8-1"),
-            up("core", "glibc", "2.40-1", "2.41-1"),
+            root("core", "glibc", Some("2.40-1"), Some("2.41-1")),
+            root("aur", "cuda", Some("12.6-1"), Some("12.8-1")),
+            root("extra", "newpkg", None, Some("1.0-1")), // fresh install
         ];
         let repo_deps = vec![PkgName::from("gcc13")];
         let aur_deps = vec![PkgBase::from("nvidia-utils")];
+        let removals = vec![PkgName::from("old-cuda")];
+        let metrics = PreviewMetrics::empty();
 
-        let mut metrics = PreviewMetrics::empty();
-        metrics.root_build_secs.insert(PkgName::from("cuda"), 2_700);
-        metrics
-            .dep_build_secs
-            .insert(PkgBase::from("nvidia-utils"), 480);
-        // Mark cuda's recorded time as stale → the cell renders dimmed.
-        metrics.stale.insert(PkgName::from("cuda"));
-        // cuda is already built (root) and nvidia-utils too (dep) → both gain a
-        // `built` tag, exercising the built rendering in both row kinds.
-        metrics.built_roots.insert(PkgName::from("cuda"));
-        metrics.built_deps.insert(PkgBase::from("nvidia-utils"));
-
-        change_set_table(&roots, &repo_deps, &aur_deps, &pac, &metrics);
-        change_set_table(&roots, &[], &[], &pac, &PreviewMetrics::empty());
-        change_set_table(
-            &[],
-            &[],
-            &[],
-            &PacmanIndex::default(),
-            &PreviewMetrics::empty(),
+        let table = transaction_table(&roots, &repo_deps, &aur_deps, &removals, &pac, &metrics);
+        let lines = table.lines();
+        // Three numbered roots; the number column is as wide as the row count's
+        // digit count (1 here), so rows read `1  …`, `2  …`, `3  …`.
+        assert!(lines[0].starts_with("1  "), "row 1: {:?}", lines[0]);
+        assert!(lines[0].contains("glibc") && lines[0].contains("2.40-1 -> 2.41-1"));
+        assert!(lines[1].starts_with("2  ") && lines[1].contains("cuda"));
+        // Fresh install: no arrow, just the new version.
+        assert!(lines[2].starts_with("3  ") && lines[2].contains("newpkg"));
+        assert!(
+            !lines[2].contains("->"),
+            "fresh install has no arrow: {:?}",
+            lines[2]
         );
+
+        let joined = lines.join("\n");
+        assert!(joined.contains("pulls in:"));
+        assert!(joined.contains("gcc13") && joined.contains("(install)"));
+        assert!(joined.contains("nvidia-utils") && joined.contains("(build)"));
+        assert!(joined.contains("will remove:") && joined.contains("old-cuda"));
+        assert!(joined.contains("-> total"));
+    }
+
+    /// A pure-repo cart with no deps/removals: just numbered rows + a total with
+    /// no build-time term.
+    #[test]
+    fn transaction_table_pure_repo_no_build_term() {
+        let mut pac = PacmanIndex::default();
+        pac.sync_download_size.insert("glibc".into(), 1024);
+        let roots = vec![root("core", "glibc", Some("1-1"), Some("1-2"))];
+        let table = transaction_table(&roots, &[], &[], &[], &pac, &PreviewMetrics::empty());
+        let total = table.lines().last().unwrap();
+        assert!(total.contains("-> total"));
+        assert!(
+            !total.contains("build"),
+            "pure-repo total has no build term: {total:?}"
+        );
+    }
+
+    /// The one-line summary lists counts + size, omits the deps/remove/build
+    /// terms when those are absent, and marks the size approximate when an AUR
+    /// estimate is in the mix.
+    #[test]
+    fn cost_summary_counts_and_terms() {
+        let mut pac = PacmanIndex::default();
+        pac.sync_download_size.insert("glibc".into(), 100);
+        let roots = vec![root("core", "glibc", Some("1-1"), Some("1-2"))];
+        let plain = cost_summary(&roots, &[], &[], &[], &pac, &PreviewMetrics::empty());
+        assert_eq!(plain, "1 install · 100 B");
+
+        pac.installed_size.insert("cuda".into(), 1024);
+        let roots = vec![
+            root("core", "glibc", Some("1-1"), Some("1-2")),
+            root("aur", "cuda", Some("1-1"), Some("2-1")),
+        ];
+        let mut metrics = PreviewMetrics::empty();
+        metrics.root_build_secs.insert(PkgName::from("cuda"), 120);
+        let s = cost_summary(
+            &roots,
+            &[PkgName::from("gcc13")],
+            &[],
+            &[PkgName::from("old")],
+            &pac,
+            &metrics,
+        );
+        assert!(s.starts_with("2 install, +1 dep, 1 remove · ~"), "{s}");
+        assert!(s.contains("build"), "AUR row adds a build term: {s}");
     }
 }

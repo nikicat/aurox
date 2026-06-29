@@ -1,8 +1,8 @@
 # Plan: shell-like (REPL) UI for interactive `gaur`
 
-Status: phases 1–4 implemented; phase 5 (polish + the [`show`/`apply` table
-unification](#unifying-the-show--apply-tables)) + native combined commit
-(phase 6) remain.
+Status: phases 1–4 implemented; phase 5a (one unified renderer) + 5b (sorted-cart
+invariant) **done**; phase 5c (tab-completion, `refresh`, history `Hinter`,
+`help <topic>`, config knobs) + native combined commit (phase 6) remain.
 
 ## Goal
 
@@ -590,16 +590,23 @@ Each phase is independently shippable and leaves the flag CLI fully working.
      the pulled-in/dep section.
 5. **Polish + table unification.** The [unified `show`/`apply`
    table](#unifying-the-show--apply-tables) is the headline item:
-   - *5a — one renderer.* Fold `render_cart` + `change_set_table` into one
-     renderer (number/approval/age columns over the sort/verdiff/size/time
-     machinery; row model carries `Option<old_ver>` for install-vs-upgrade).
-     `show`/`status`/`upgrade` resolve the staged set (cached, with graceful
-     fallback) and render it; `apply` drops the table and confirms on a one-line
-     cost summary.
-   - *5b — order consistency.* Hold the cart `Vec` sorted (repo-rank → name) as
-     its invariant, so the displayed `№` *is* the vector index that
-     `resolve_against_cart` already uses — number ↔ selector agree by
-     construction, no separate view to sync.
+   - *5a — one renderer. **DONE.*** `render_cart` + `change_set_table` are folded
+     into one renderer in `src/ui/change_set.rs`: [`ui::transaction_table`] takes
+     a `TxnRoot` row model (number/approval/age columns over the
+     sort/verdiff/size/time machinery; `Option<old_ver>` for
+     install-vs-upgrade) and *returns* its lines as a typed `ui::Table`. `show`
+     resolves the staged set (graceful fallback to flat rows when resolve fails)
+     and renders it via the `ShellEnv::render_cart` seam. `apply` no longer draws
+     a table — both the fresh-install and upgrade branches collapsed into one
+     `resolve_targets` → [`ui::cost_summary`] one-liner → single confirm →
+     `apply_plan` (gate `AlreadyConfirmed`), so the `-S` pipeline's `print::plan`
+     table is bypassed at apply time too (the "full de-table"). The rendering
+     primitives are typed end-to-end: `Width`/`Cell`/`Paint`/`Fade` for layout,
+     `Bytes`/`Precision`/`BuildTerm`/`Duration` for the totals, `RepoRank` for the
+     sort key, `StageResult`/`UnstageResult` for cart mutations.
+   - *5b — order consistency. **DONE.*** `Cart::add` keeps the `items` `Vec`
+     sorted (`RepoName::rank()` → repo → spec) as an invariant, so the displayed
+     `№` *is* the vector index `resolve_against_cart` addresses — they can't drift.
    - *5c — the rest.* Tab-completion (verbs + cart/universe), `refresh`, history
      `Hinter`, `help <topic>`, config knobs (`aur_approval`, prompt/history).
    ("will remove" rows read back via `trans_prepare` ride with phase 6.)

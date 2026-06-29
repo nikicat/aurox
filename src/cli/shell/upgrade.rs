@@ -2,9 +2,9 @@
 //!
 //! The cart replaces the old `upgrade_loop` driver (refresh → picker → apply
 //! loop), but the loop's *reusable* machinery lives on here: the refresh+reload
-//! step, the apply-time change-set preview, and the build-time cost overlay.
-//! Keeping these means `ui::change_set_table` + the metrics overlay stay wired
-//! to a real caller instead of being orphaned when the loop driver went away.
+//! step, the dep-row extraction the unified `show` table renders, and the
+//! build-time cost overlay. The shell's `show` feeds these into
+//! [`ui::transaction_table`]; `apply` feeds them into [`ui::cost_summary`].
 
 use crate::build;
 use crate::build::UpgradeSession;
@@ -12,12 +12,11 @@ use crate::build::metrics::MetricsStore;
 use crate::config::Config;
 use crate::error::Result;
 use crate::mirror;
-use crate::names::{PkgBase, PkgName};
+use crate::names::{PkgBase, PkgName, RepoRank};
 use crate::pacman::alpm_db::{self, PacmanIndex};
-use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
 use crate::paths;
 use crate::resolver::Plan;
-use crate::ui::{self, PreviewMetrics};
+use crate::ui::{PreviewMetrics, TxnRoot};
 use std::collections::HashSet;
 use std::time::SystemTime;
 use tracing::warn;
@@ -54,22 +53,10 @@ pub(crate) fn synced_pac() -> Result<PacmanIndex> {
 /// "anything older deserves the dim".
 const STALE_METRIC_AGE_SECS: u64 = 90 * 24 * 3_600;
 
-/// Render the apply-time change-set preview: the staged upgrade `roots` (repo +
-/// AUR) plus the deps the AUR builds pull in, with sizes from `pac` and
-/// build-time from `metrics`.
-pub(crate) fn preview(
-    roots: &[PkgUpgrade],
-    plan: Option<&Plan>,
-    pac: &PacmanIndex,
-    metrics: &PreviewMetrics,
-) {
-    let (repo_deps, aur_deps) = dep_rows(plan);
-    ui::change_set_table(roots, &repo_deps, &aur_deps, pac, metrics);
-}
-
-/// The dep rows the preview shows beneath the roots: concrete repo pkgnames the
-/// build pulls in, plus AUR pkgbases that were dragged in rather than named.
-fn dep_rows(plan: Option<&Plan>) -> (Vec<PkgName>, Vec<PkgBase>) {
+/// The dep rows the unified table shows beneath the roots: concrete repo
+/// pkgnames the build pulls in, plus AUR pkgbases that were dragged in rather
+/// than named.
+pub(crate) fn dep_rows(plan: Option<&Plan>) -> (Vec<PkgName>, Vec<PkgBase>) {
     let Some(plan) = plan else {
         return (Vec::new(), Vec::new());
     };
@@ -90,7 +77,7 @@ fn dep_rows(plan: Option<&Plan>) -> (Vec<PkgName>, Vec<PkgBase>) {
 /// then shows `~?` for AUR rows, which is correct and never blocks apply).
 pub(crate) fn preview_metrics(
     session: &UpgradeSession,
-    roots: &[PkgUpgrade],
+    roots: &[TxnRoot],
     plan: Option<&Plan>,
 ) -> PreviewMetrics {
     let store = MetricsStore::open(&paths::metrics_db_path())
@@ -102,15 +89,15 @@ pub(crate) fn preview_metrics(
     let now = SystemTime::now();
 
     // AUR roots only — repo upgrades have no build, so no build-time/built cell.
-    for u in roots.iter().filter(|u| u.repo == REPO_AUR) {
-        let Some(pb) = session.pkgbase_of(&u.name) else {
+    for r in roots.iter().filter(|r| r.repo.rank() == RepoRank::Aur) {
+        let Some(pb) = session.pkgbase_of(&r.name) else {
             continue;
         };
-        if row_built(pb, u) {
-            out.built_roots.insert(u.name.clone());
+        if row_built(pb, r) {
+            out.built_roots.insert(r.name.clone());
         }
         if let Some(store) = &store {
-            insert_root_time(&mut out, store, &u.name, pb, now);
+            insert_root_time(&mut out, store, &r.name, pb, now);
         }
     }
 
@@ -143,10 +130,13 @@ pub(crate) fn preview_metrics(
     out
 }
 
-/// Whether a single AUR upgrade row's artifact is already built on disk
+/// Whether a single AUR root row's artifact is already built on disk
 /// (per-pkgname, like the picker's `built` tag — see [`build::artifacts_built`]).
-fn row_built(pb: &PkgBase, u: &PkgUpgrade) -> bool {
-    build::artifacts_built(pb, &u.new_ver, std::slice::from_ref(&u.name))
+/// A row with no resolved `new_ver` (couldn't look one up) counts as not built.
+fn row_built(pb: &PkgBase, r: &TxnRoot) -> bool {
+    r.new_ver
+        .as_ref()
+        .is_some_and(|v| build::artifacts_built(pb, v, std::slice::from_ref(&r.name)))
 }
 
 /// Record `pkgbase`'s latest build duration into the root overlay keyed by
