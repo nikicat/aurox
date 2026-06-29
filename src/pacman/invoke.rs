@@ -9,7 +9,7 @@ use crate::ui;
 use crate::version::Version;
 use alpm::{Alpm, PrepareData, PrepareError, SigLevel, TransFlag};
 use console::strip_ansi_codes;
-use std::io::{Read, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use tracing::{debug, error, info, instrument, warn};
@@ -111,12 +111,43 @@ pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
     // the prepare ourselves. Best-effort: any failure is logged at debug
     // and we still hand off to the real pacman.
     preflight_dash_u(argv);
-    // Tee both stdout and stderr so the user keeps seeing live output AND
-    // the execution log gets a copy. Both channels matter — pacman prints
-    // the "X and Y are in conflict" pair on stdout (it's a prompt body),
-    // while the terminal "error: ..." lines go to stderr.
+
+    // On a real terminal, hand pacman the inherited TTY: it draws its own
+    // download + transaction progress bars and reads prompts (and the sudo
+    // password) natively. Capturing output means piping pacman's stdout, which
+    // forces its degraded line-by-line mode — and can kill pacman with "unable
+    // to write to pipe" if our reader closes first — so we only tee off a
+    // terminal (cron / CI / a pipe), where there are no bars to lose and the
+    // execution log still wants pacman's output on failure (the contract
+    // `tests/container/smoke/57_pacman_conflict_logged` pins).
+    if std::io::stdout().is_terminal() {
+        exec_pacman_inherited(program, &spawn_args)
+    } else {
+        exec_pacman_teed(program, &spawn_args)
+    }
+}
+
+/// Run pacman attached to the inherited stdio — its own progress bars and native
+/// prompts, no output capture (the user is watching live). Maps the exit status
+/// to gitaur's `Ok(0)` / [`Error::PacmanExit`].
+fn exec_pacman_inherited(program: &str, spawn_args: &[String]) -> Result<u8> {
+    let status = Command::new(program).args(spawn_args).status()?;
+    let code = status_to_exit_code(status);
+    if status.success() {
+        Ok(0)
+    } else {
+        Err(Error::PacmanExit(code))
+    }
+}
+
+/// Run pacman with stdout+stderr teed to ours *and* an in-memory copy, so a
+/// failure can be reconstructed from the execution log without scrollback. Both
+/// channels matter — pacman prints the "X and Y are in conflict" pair on stdout
+/// (a prompt body), while the terminal "error: ..." lines go to stderr. Used off
+/// a terminal, where pacman has no progress UI to lose to the pipe anyway.
+fn exec_pacman_teed(program: &str, spawn_args: &[String]) -> Result<u8> {
     let mut child = Command::new(program)
-        .args(&spawn_args)
+        .args(spawn_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
