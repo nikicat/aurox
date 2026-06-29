@@ -628,6 +628,38 @@ Each phase is independently shippable and leaves the flag CLI fully working.
    machinery. Behind `native_commit`; flip default once the container suite covers
    add+remove / group-swap. Satisfies decision 6 fully.
 
+## Backlog — shell UX refinements (post-5c)
+
+Found while using the shell; none block the phasing above.
+
+1. **`upgrade` should refresh on a TTL, not every time.** Now that `refresh` is
+   an explicit, always-fetch command (phase 5c), `upgrade` no longer needs to
+   re-fetch unconditionally — it calls `upgrade::refresh_and_reload` →
+   `mirror::cmd_refresh(cfg, false)` every time, a network round-trip on every
+   `upgrade`. Gate that fetch on `Config::refresh_max_age_secs` (already defined,
+   default 3600s — but **currently unread**, set only in `config/defaults.rs`):
+   skip the AUR-mirror fetch when its last fetch is younger than the TTL, still
+   reloading the in-memory session. `refresh` keeps forcing a fetch; `-Syy`
+   keeps forcing a full re-clone. Needs a last-fetch timestamp source (the AUR
+   clone's `FETCH_HEAD` mtime, or a tiny recorded stamp).
+2. **`add` / `drop` should print the whole cart.** Today they only print
+   per-item lines (`staged foo (aur)` / `dropped bar`); the user must type `show`
+   to see the resulting transaction. After a mutating
+   `add`/`drop`/`remove`/`clear`, print the **entire cart** — the full `show`
+   summary + table — so the current transaction is always on screen. This reprint
+   is also where (3)'s re-resolution happens.
+3. **Re-resolve on change, not on every `status`.** Move the cost off `show`:
+   resolve the cart **once per mutation** — the commands that change the staged
+   set or the upstream data (`add`/`drop`/`remove`/`clear`/`upgrade`/`refresh`) —
+   and stash the resolved `Plan` (+ size/build-time overlay) on the session;
+   `show`/`status` then just reprints that stash and is instant. Today
+   `RealEnv::transaction_view` does the opposite — `build::resolve_targets`
+   (dependency resolution) + `upgrade::synced_pac` (`alpm_db::open_synced`, a
+   rootless sync-db open) + the metrics SQLite store run on *every* `show`, which
+   is the delay. Note `approve`/`review` change only approval state, not the
+   package set, so they need a cheap re-render of the stashed `Plan`, not a
+   re-resolve. Keep the graceful flat-row fallback when a resolve fails.
+
 ## Testing
 
 Mirrors the existing two-tier philosophy (`docs/TESTING.md`) and the loop's seams:
