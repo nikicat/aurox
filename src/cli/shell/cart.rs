@@ -11,7 +11,7 @@
 //! live behind the [`super::ShellEnv`] trait.
 
 use crate::build::Target;
-use crate::names::{PkgBase, PkgName, PkgTarget};
+use crate::names::{PkgBase, PkgName, PkgTarget, RepoName};
 use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
 use std::collections::HashSet;
 
@@ -36,6 +36,19 @@ impl Source {
             Self::Aur => "aur",
         }
     }
+}
+
+/// Coarse staging classification of a name: the source lane plus, for repo
+/// packages, the concrete sync-DB it lives in (`core`, `extra`, …).
+///
+/// The concrete `repo` is display-only — it drives the `show` table's repo
+/// column and the `drop core`/`add extra` repo-filter selectors. The real
+/// install routing is still the resolver's call at apply time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageClass {
+    pub source: Source,
+    /// Concrete sync-repo for [`Source::Repo`]; `None` for AUR.
+    pub repo: Option<RepoName>,
 }
 
 /// How AUR packages enter the cart: needing review, or pre-approved.
@@ -94,6 +107,11 @@ pub struct CartItem {
     pub target: Target,
     pub source: Source,
     pub approval: Approval,
+    /// Concrete sync-repo (`core`, `extra`, …) for a repo package; `None` for
+    /// AUR rows and for repo rows staged before the source DB was known. Drives
+    /// the `show` table's repo column and the `drop core` repo filter — see
+    /// [`Self::repo_label`].
+    pub repo: Option<RepoName>,
     /// `Some` when this row came from `upgrade` — it carries the old→new
     /// versions for the `show` table and routes repo rows through the partial
     /// `pacman -Syu` lane at apply (rather than a fresh `pacman -S`).
@@ -102,14 +120,21 @@ pub struct CartItem {
 
 impl CartItem {
     /// Stage a fresh install of `target` from `source`, defaulting the approval
-    /// per `source` + the AUR policy. The build pipeline's [`Target`] starts
-    /// unhinted — `resolver::expand_pkgbase_targets` infers a counterpart hint
-    /// on rewrite if needed.
-    pub fn new(target: PkgTarget, source: Source, aur: AurApproval) -> Self {
+    /// per `source` + the AUR policy. `repo` is the concrete sync-DB for a repo
+    /// package (display only). The build pipeline's [`Target`] starts unhinted —
+    /// `resolver::expand_pkgbase_targets` infers a counterpart hint on rewrite
+    /// if needed.
+    pub fn new(
+        target: PkgTarget,
+        source: Source,
+        repo: Option<RepoName>,
+        aur: AurApproval,
+    ) -> Self {
         Self {
             target: Target::bare(target.into_inner()),
             source,
             approval: Approval::default_for(source, aur),
+            repo,
             upgrade: None,
         }
     }
@@ -128,10 +153,14 @@ impl CartItem {
             Source::Aur => Target::with_hint(u.name.as_str().to_owned(), u.name.clone()),
             Source::Repo => Target::bare(u.name.as_str().to_owned()),
         };
+        // AUR rows label as `aur` from the source; a repo row carries its
+        // concrete sync-DB so the table shows `core`/`extra`/… not just `repo`.
+        let repo = (source == Source::Repo).then(|| u.repo.clone());
         Self {
             target,
             source,
             approval: Approval::default_for(source, aur),
+            repo,
             upgrade: Some(u),
         }
     }
@@ -139,6 +168,17 @@ impl CartItem {
     /// The freeform user-typed spec this item stages.
     pub fn spec(&self) -> &str {
         &self.target.spec
+    }
+
+    /// The repo bucket this row displays in and a repo filter matches against:
+    /// the concrete sync-DB for a known repo package, `aur` for an AUR row, or
+    /// `repo` when a repo package was staged before its source DB was resolved.
+    pub fn repo_label(&self) -> RepoName {
+        match (self.source, &self.repo) {
+            (Source::Aur, _) => RepoName::from(REPO_AUR),
+            (Source::Repo, Some(r)) => r.clone(),
+            (Source::Repo, None) => RepoName::from("repo"),
+        }
     }
 
     /// A repo *upgrade* row — applied via the partial `pacman -Syu` lane, not a
@@ -165,6 +205,26 @@ pub enum ApplyOutcome {
     /// The transaction ran but something failed or was interrupted — the cart
     /// is kept intact so the user can `drop` the offender and `apply` the rest.
     Failed,
+}
+
+/// What staging an item (`add` / `stage_remove`) did to the cart — a named
+/// outcome rather than a bare `bool` so the call site reads as intent and pairs
+/// with [`ApproveResult`] / [`UnstageResult`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum StageResult {
+    /// The item was newly staged.
+    Staged,
+    /// The spec was already staged — re-staging is an idempotent no-op.
+    AlreadyStaged,
+}
+
+/// What `drop` (`unstage`) did to the cart.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UnstageResult {
+    /// A staged row was removed.
+    Unstaged,
+    /// Nothing in the cart matched the target.
+    NotStaged,
 }
 
 /// What `approve <spec>` did to a staged item — so the caller can report it and
@@ -228,28 +288,54 @@ impl Cart {
 
     /// Stage one install. Returns `false` (and stages nothing) when the spec is
     /// already in the cart — re-`add`ing is idempotent, not a duplicate row.
-    pub fn add(&mut self, item: CartItem) -> bool {
+    ///
+    /// Inserts keeping [`Self::items`] sorted (repo-rank → repo → name) so the
+    /// row number `show` prints *is* the vector index `resolve_against_cart`
+    /// addresses — the two can't drift (`docs/plans/shell-ui.md`, phase 5b).
+    pub fn add(&mut self, item: CartItem) -> StageResult {
         if self.items.iter().any(|i| i.spec() == item.spec()) {
-            return false;
+            return StageResult::AlreadyStaged;
         }
         self.items.push(item);
-        true
+        self.sort_items();
+        StageResult::Staged
     }
 
-    /// Unstage an install. Returns whether a row was removed.
-    pub fn unstage(&mut self, target: &PkgTarget) -> bool {
+    /// Re-establish the cart's sort invariant: rows grouped by repo
+    /// (repo-rank → concrete repo name), then by spec within a repo — the same
+    /// order the unified `show` table renders. The cart is tiny, so a full
+    /// re-sort per `add` is cheaper than threading a sorted-insert position.
+    /// `unstage` / `approve` / `clear_applied` preserve relative order, so only
+    /// the inserting paths need this.
+    fn sort_items(&mut self) {
+        self.items.sort_by(|a, b| {
+            let (ra, rb) = (a.repo_label(), b.repo_label());
+            ra.rank()
+                .cmp(&rb.rank())
+                .then_with(|| ra.as_str().cmp(rb.as_str()))
+                .then_with(|| a.spec().cmp(b.spec()))
+        });
+    }
+
+    /// Unstage an install. Reports whether a row was removed.
+    pub fn unstage(&mut self, target: &PkgTarget) -> UnstageResult {
         let before = self.items.len();
         self.items.retain(|i| i.spec() != target.as_str());
-        self.items.len() != before
+        if self.items.len() == before {
+            UnstageResult::NotStaged
+        } else {
+            UnstageResult::Unstaged
+        }
     }
 
-    /// Stage a removal (uninstall). Returns `false` when already staged.
-    pub fn stage_remove(&mut self, name: PkgName) -> bool {
+    /// Stage a removal (uninstall). [`StageResult::AlreadyStaged`] when it was
+    /// already staged for removal.
+    pub fn stage_remove(&mut self, name: PkgName) -> StageResult {
         if self.remove.contains(&name) {
-            return false;
+            return StageResult::AlreadyStaged;
         }
         self.remove.push(name);
-        true
+        StageResult::Staged
     }
 
     /// Empty everything — installs, removals, and the reviewed set.
@@ -330,7 +416,7 @@ mod tests {
     use super::*;
 
     fn item(spec: &str, source: Source) -> CartItem {
-        CartItem::new(PkgTarget::new(spec), source, AurApproval::Review)
+        CartItem::new(PkgTarget::new(spec), source, None, AurApproval::Review)
     }
 
     fn target(spec: &str) -> PkgTarget {
@@ -345,15 +431,19 @@ mod tests {
 
     #[test]
     fn aur_auto_approve_policy_skips_review() {
-        let it = CartItem::new(target("yay-bin"), Source::Aur, AurApproval::Auto);
+        let it = CartItem::new(target("yay-bin"), Source::Aur, None, AurApproval::Auto);
         assert_eq!(it.approval, Approval::Approved);
     }
 
     #[test]
     fn add_dedups_by_spec() {
         let mut cart = Cart::default();
-        assert!(cart.add(item("foo", Source::Aur)));
-        assert!(!cart.add(item("foo", Source::Aur)), "re-add is a no-op");
+        assert_eq!(cart.add(item("foo", Source::Aur)), StageResult::Staged);
+        assert_eq!(
+            cart.add(item("foo", Source::Aur)),
+            StageResult::AlreadyStaged,
+            "re-add is a no-op"
+        );
         assert_eq!(cart.items().len(), 1);
     }
 
@@ -362,8 +452,12 @@ mod tests {
         let mut cart = Cart::default();
         cart.add(item("foo", Source::Aur));
         cart.add(item("bar", Source::Repo));
-        assert!(cart.unstage(&target("foo")));
-        assert!(!cart.unstage(&target("foo")), "second drop finds nothing");
+        assert_eq!(cart.unstage(&target("foo")), UnstageResult::Unstaged);
+        assert_eq!(
+            cart.unstage(&target("foo")),
+            UnstageResult::NotStaged,
+            "second drop finds nothing"
+        );
         assert_eq!(cart.items().len(), 1);
         assert_eq!(cart.items()[0].spec(), "bar");
     }
@@ -371,8 +465,11 @@ mod tests {
     #[test]
     fn stage_remove_dedups() {
         let mut cart = Cart::default();
-        assert!(cart.stage_remove(PkgName::from("old")));
-        assert!(!cart.stage_remove(PkgName::from("old")));
+        assert_eq!(cart.stage_remove(PkgName::from("old")), StageResult::Staged);
+        assert_eq!(
+            cart.stage_remove(PkgName::from("old")),
+            StageResult::AlreadyStaged
+        );
         assert_eq!(cart.removals().len(), 1);
     }
 
@@ -442,13 +539,40 @@ mod tests {
         cart.add(item("bar", Source::Repo));
         let targets = cart.install_targets();
         let specs: Vec<&str> = targets.iter().map(|t| t.spec.as_str()).collect();
-        assert_eq!(specs, vec!["foo", "bar"]);
+        // Sorted-cart invariant: `bar` (repo, ranks before AUR) precedes `foo`
+        // (aur, sorts last) regardless of staging order.
+        assert_eq!(specs, vec!["bar", "foo"]);
+    }
+
+    #[test]
+    fn add_keeps_items_sorted_by_repo_then_name() {
+        let mut cart = Cart::default();
+        // Stage in deliberately scrambled order across repos.
+        cart.add(CartItem::from_upgrade(
+            upgrade("aur", "yay-bin"),
+            AurApproval::Review,
+        ));
+        cart.add(CartItem::from_upgrade(
+            upgrade("extra", "vim"),
+            AurApproval::Review,
+        ));
+        cart.add(CartItem::from_upgrade(
+            upgrade("core", "zlib"),
+            AurApproval::Review,
+        ));
+        cart.add(CartItem::from_upgrade(
+            upgrade("core", "glibc"),
+            AurApproval::Review,
+        ));
+        // core (alphabetical within repo) → extra → aur last.
+        let order: Vec<&str> = cart.items().iter().map(CartItem::spec).collect();
+        assert_eq!(order, vec!["glibc", "zlib", "vim", "yay-bin"]);
     }
 
     fn upgrade(repo: &str, name: &str) -> PkgUpgrade {
         use crate::version::Version;
         PkgUpgrade {
-            repo: repo.to_owned(),
+            repo: RepoName::from(repo),
             name: PkgName::from(name),
             old_ver: Version::from("1-1"),
             new_ver: Version::from("2-1"),
@@ -465,12 +589,26 @@ mod tests {
             Some("yay-bin")
         );
         assert!(!aur.is_repo_upgrade());
+        // AUR rows label `aur` from the source, not a stored concrete repo.
+        assert_eq!(aur.repo, None);
+        assert_eq!(aur.repo_label(), "aur");
 
         let repo = CartItem::from_upgrade(upgrade("core", "glibc"), AurApproval::Review);
         assert_eq!(repo.source, Source::Repo);
         assert_eq!(repo.approval, Approval::Approved);
         assert!(repo.is_repo_upgrade());
         assert_eq!(repo.version_transition().as_deref(), Some("1-1 → 2-1"));
+        // A repo row carries its concrete sync-DB for the table's repo column.
+        assert_eq!(repo.repo_label(), "core");
+    }
+
+    #[test]
+    fn repo_label_falls_back_when_source_db_unknown() {
+        // A repo package staged without a concrete repo (e.g. a fresh `add`
+        // before classification surfaced the DB) still labels as `repo`.
+        assert_eq!(item("glibc", Source::Repo).repo_label(), "repo");
+        // AUR always labels `aur`.
+        assert_eq!(item("yay-bin", Source::Aur).repo_label(), "aur");
     }
 
     #[test]
@@ -493,7 +631,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["glibc"]
         );
+        // Sorted-cart invariant: firefox (repo, ranks before AUR) precedes
+        // yay-bin (aur, sorts last).
         let install: Vec<String> = cart.install_targets().into_iter().map(|t| t.spec).collect();
-        assert_eq!(install, vec!["yay-bin", "firefox"]);
+        assert_eq!(install, vec!["firefox", "yay-bin"]);
     }
 }

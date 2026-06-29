@@ -161,6 +161,19 @@ impl fmt::Display for SearchTerm {
 #[rkyv(compare(PartialEq, PartialOrd))]
 pub struct VirtualName(String);
 
+/// One pacman sync-repo name (`core`, `extra`, `multilib`, …) or the `aur`
+/// sentinel for AUR-sourced rows.
+///
+/// Distinct from the package-name newtypes because it identifies a *source
+/// bucket*, not a package: a repo name labels the `show`/upgrade table's first
+/// column and backs the `drop core` / `add extra` repo-filter selectors. Typing
+/// it stops a repo name from being passed where a [`PkgName`] / [`PkgBase`] is
+/// expected (they share lexical shape — there's a `base`/`extra` package too).
+/// Not archived: repo names come from the live alpm sync DBs and the upgrade
+/// scan, never from the rkyv index.
+#[derive(Debug, Clone, Default, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RepoName(String);
+
 macro_rules! impl_name_wrapper {
     ($ty:ident) => {
         impl $ty {
@@ -268,6 +281,42 @@ impl_name_wrapper!(PkgName);
 impl_name_wrapper!(PkgBase);
 impl_name_wrapper!(PkgTarget);
 impl_name_wrapper!(VirtualName);
+impl_name_wrapper!(RepoName);
+
+/// Sort/display rank of a [`RepoName`]'s column position.
+///
+/// Variant declaration order *is* the sort order (derived `Ord` compares by
+/// position): the three canonical Arch repos in pacman's resolution order, then
+/// any other configured repo, then AUR last. Equal ranks (notably every
+/// [`Self::Other`] repo) tie-break by the concrete repo name and package name
+/// at the call site, so the `show` / upgrade tables and the staged cart group
+/// rows by repo. A typed rank rather than a bare integer so the ordering is
+/// self-documenting and can't be confused with a count or index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RepoRank {
+    Core,
+    Extra,
+    Multilib,
+    /// Any other configured sync repo (`testing`, a custom repo, …).
+    Other,
+    /// AUR-sourced rows sort last.
+    Aur,
+}
+
+impl RepoName {
+    /// This repo's [`RepoRank`] for display/sort order. The `"aur"` arm mirrors
+    /// [`crate::pacman::invoke::REPO_AUR`] (kept a literal so this low-level
+    /// module doesn't reach up into `pacman`).
+    pub fn rank(&self) -> RepoRank {
+        match self.0.as_str() {
+            "core" => RepoRank::Core,
+            "extra" => RepoRank::Extra,
+            "multilib" => RepoRank::Multilib,
+            "aur" => RepoRank::Aur,
+            _ => RepoRank::Other,
+        }
+    }
+}
 
 // Cross-type conversions, intentionally only in the "narrowing → widening"
 // direction. A classified `PkgBase` or `PkgName` can be re-presented as an

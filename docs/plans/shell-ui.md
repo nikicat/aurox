@@ -1,7 +1,10 @@
 # Plan: shell-like (REPL) UI for interactive `gaur`
 
-Status: phases 1–4 implemented; polish (phase 5) + native combined commit
-(phase 6) remain.
+Status: phases 1–4 implemented; phase 5a (one unified renderer) + 5b (sorted-cart
+invariant) **done**; phase 5c partially done — **tab-completion** (the rustyline
+`Completer`) and the **`refresh`** command are in; history `Hinter`, `help
+<topic>`, and config knobs (`aur_approval`) remain, alongside the native combined
+commit (phase 6).
 
 ## Goal
 
@@ -72,13 +75,18 @@ gaur> quit
    `apply` interrupted (Ctrl+C) or failed mid-build drops back to the *shell*
    with the cart intact and the offending pkgbase badged, so the user can
    `discard` it and `apply` the rest — never restart the command.
-5. **Selection by numbers *and* package names with wildcards.** Commands that
-   present a list (`search`, `upgrade`, `show`) remember it; selector arguments
-   accept numbers (`3`), ranges (`5-8`), names (`glibc`), and globs (`python-*`).
-   Numbers/ranges index the last list. The *universe* a name/glob resolves
-   against is verb-scoped: `add` resolves against the AUR index + sync DBs (you
-   can add anything); `discard`/`review`/`approve` resolve against the **cart**
-   (you act on what's staged); `approve *` means "every staged AUR package".
+5. **Selection by numbers *and* package names with wildcards *and* repo names.**
+   Commands that present a list (`search`, `upgrade`, `show`) remember it;
+   selector arguments accept numbers (`3`), ranges (`5-8`), names (`glibc`),
+   globs (`python-*`), and **repo names** (`aur`, `core`, `extra`, …) that select
+   every row from that repo — `drop aur` un-stages all AUR rows, `add extra`
+   stages every `extra` row from the last list. Numbers/ranges index the last
+   list. The *universe* a name/glob/repo resolves against is verb-scoped: `add`
+   resolves against the last list + AUR index + sync DBs (you can add anything);
+   `discard`/`review`/`approve` resolve against the **cart** (you act on what's
+   staged); `approve *` means "every staged AUR package". A repo-name token only
+   expands when something in the verb's scope is from that repo, so a real
+   package sharing a repo's name still resolves normally otherwise.
 6. **`apply` is one atomic add+remove transaction** (target state) — a single
    native libalpm transaction carrying repo adds, AUR file adds, *and* removals,
    so "package(group) X replaces package(group) Y" lands without a window where
@@ -177,9 +185,15 @@ session, so discarding and re-adding (or a post-failure retry) doesn't re-prompt
 1. **Gate.** Refuse while any staged item is `NeedsReview`, listing them
    (`needs review: firefox-git, cuda — run \`review\` or \`approve\``). Repo-only
    carts are always ready.
-2. **Resolve + preview.** `build::resolve_targets` over the approved set →
-   `ui::change_set_table` (roots + pulled-in deps + "will remove" rows + sizes +
-   build-time), then a final `ui::confirm`.
+2. **Confirm — no table re-draw.** `show` already rendered the full resolved
+   change-set table (see [Unifying the show / apply
+   tables](#unifying-the-show--apply-tables)), so `apply` does **not** re-draw it
+   — the user just curated that exact list, and `show`/`status` reprints it on
+   demand. `apply` resolves the approved set (`build::resolve_targets`) only to
+   recompute the **one-line cost summary** (`13 install, +2 deps, 1 remove ·
+   ~3.4 GiB · ~22m build`) and takes a single `ui::confirm` before the
+   irreversible build/sudo step. `show` is where you look; `apply` is where you
+   commit.
 3. **Run.** Build AUR (stratified, `apply_plan`), install repo + AUR (+ removals)
    — one transaction in the target state (see next section).
 4. **Resume on failure.** Ctrl+C or a build failure folds the partial
@@ -188,6 +202,115 @@ session, so discarding and re-adding (or a post-failure retry) doesn't re-prompt
    — the cart keeps everything not-yet-installed staged. The user `discard`s the
    offender (or fixes its PKGBUILD via `review … → edit`) and `apply`s again.
    Successfully-installed items drop out of the cart on the next recompute.
+
+## Unifying the `show` / `apply` tables
+
+Phases 3–4 left the shell with **two** divergent package tables:
+
+| | `show` / `status` / `upgrade` | `apply` (upgrade cart) |
+| --- | --- | --- |
+| renderer | `RealEnv::render_cart` (`src/cli/shell.rs`) | `ui::change_set_table` (`src/ui/change_set.rs`) |
+| order | cart staging order | sorted: repo → bump-severity → name |
+| version | naive full-string `old`(red) `→` `new`(green) | verdiff: common prefix dimmed, changed suffix colored by bump kind, aligned via `col_widths` |
+| columns | `№  repo  approval  name  old → new  age` | `repo  name  old → new  size  build-time` + pulled-in deps + batch total |
+| resolves deps? | no (cart roots only) | yes (`resolver::resolve` → repo/AUR dep rows) |
+
+Two problems with this split:
+
+1. **`apply` re-draws a table the user just curated.** They built the cart with
+   `upgrade`/`add`/`drop`/`review` and watched it in `show`; making `apply`
+   reprint a (differently-shaped!) table is noise. If they want to re-check, that's
+   what `status` is for.
+2. **The two renderers look nothing alike** — different sort, different version
+   coloring, different columns — so the cart the user curated and the thing
+   `apply` shows read as two unrelated screens.
+
+### Decision: one table, owned by `show`; `apply` only confirms
+
+There is **one** transaction-table renderer, rendered by `show`/`status`/`upgrade`.
+`apply` stops drawing it and gates on a one-line cost summary instead (see `apply`
+step 2 above). `show` becomes the genuine pre-commit preview — it resolves the
+staged set so the user sees **the whole change set** (roots + pulled-in deps +
+removals) with cost, which is UPDATE_LOOP goal #5 finally landing in the shell.
+
+The unified table is the **union** of the two renderers' good parts:
+
+| Feature | Kept from |
+| --- | --- |
+| `№` (row number) + `approval` columns | `render_cart` |
+| AUR `last-modified` age column | `render_cart` |
+| concrete `RepoName` repo column (yay-hashed color) | `render_cart` |
+| **sort by repo, then name** | `change_set_table` (drop the bump-severity middle key — decision below) |
+| verdiff version coloring + column alignment | `change_set_table` / `tables::render_row` |
+| **size** column + batch total | `change_set_table` |
+| build-time column + total, `built` tag | `change_set_table` |
+| pulled-in deps block (`(install)`/`(build)`) | `change_set_table` |
+| "will remove" rows | `change_set_table` (read-back still phase 6) |
+
+Resulting layout (roots numbered + approval-tagged; deps indented, unnumbered):
+
+```
+gaur> show
+:: transaction — 3 install, +2 deps, 1 remove · all approved
+   1  core   approved  glibc      2.40-1 → 2.41-1     12.00 MiB
+   2  aur    approved  yay-bin    12.4-1 → 12.5-1      ~9.00 MiB  (3d ago)
+   3  aur    review    cuda       12.6-1 → 12.8-1      ~3.00 GiB  (1d ago)  ~18m build
+-> pulls in:
+        gcc13          (install)   50.00 MiB
+        nvidia-utils   (build)           ~?            ~4m build
+-> will remove:
+        old-cuda
+-> total  ~3.07 GiB   ~22m build
+```
+
+### Open decisions, with recommended defaults
+
+- **Sort key.** Recommend **repo → name** (per the request); drop the
+  bump-severity middle key `change_set_table` uses today. Severity sorting fights
+  the user's "find this package in the list" mental model and is the kind of thing
+  the per-row color already signals.
+- **Number ↔ selector consistency.** Once `show` numbers rows in sorted order,
+  `drop 3` must index *that* order, not staging order. The simplest fix is to
+  **keep the cart's `Vec<CartItem>` sorted** (repo-rank → name) as its invariant,
+  not to compute a sorted *view* on the side: then the displayed `№` is literally
+  the vector index, and `resolve_against_cart` already indexes that same vector,
+  so the two **can't diverge by construction** — no second order to keep in sync.
+  (Today they agree precisely because both iterate the `Vec` in staging order;
+  this keeps that property, just under a sorted invariant.) `Cart::add` /
+  `upgrade`-seed insert in sorted position (or push-then-resort per batch — the
+  cart is tiny). Staging order is dropped, and nothing depends on it:
+  `install_targets`, `pending_review`, `repo_upgrades`, and the resolver are all
+  order-insensitive. Reusing `repo_rank` for the sort key makes the cart's order
+  identical to the table's column sort. **Tradeoff:** a sorted-insert `add` can
+  shift the numbers of existing rows (append wouldn't), so the habit is `show`
+  then numeric `drop`; `drop <name>`/`<repo>`/`<glob>` sidestep numbering
+  entirely.
+- **Resolve on every `show`?** Yes — `show` resolves the staged set to surface
+  deps + sizes. It's one resolve (what `apply` does anyway); cache the resolved
+  `Plan` keyed on cart contents and invalidate on any cart mutation so repeated
+  `show`s are free. **Graceful degradation:** if resolve fails (unknown target,
+  mirror gap), fall back to the flat cart rows (today's `render_cart` output) plus
+  a warning — `show` must never error out.
+- **Install vs upgrade row shape.** The renderer must handle both a fresh install
+  (no `old`, render `→ new` or just `new`, no verdiff split) and an upgrade
+  (`old → new`, verdiff). Today fresh-install carts dodge this by using the `-S`
+  pipeline's `print::plan` table at apply; unifying means the row model carries an
+  `Option<old_ver>` and `render_row` degrades to the install shape when it's
+  `None`. This also retires the fresh-vs-upgrade branch in `apply`.
+
+### Implementation shape
+
+Fold both renderers into one in `src/ui/change_set.rs` (or a renamed
+`ui::transaction`): extend its row model with the `№`/`approval`/`age` cells and
+the install-vs-upgrade `Option<old_ver>`, keep its sort/verdiff/size/time
+machinery. Retire `RealEnv::render_cart`'s bespoke table — `show` now feeds the
+cart + the resolved `Plan` + the cost overlay (`upgrade::{preview_metrics,
+synced_pac}`, already built) into the one renderer. `apply` drops its
+`change_set_table` call and renders only the summary line (reuse the existing
+`batch_size_total` / `batch_time_total`). The `-Qu` / `-Syu` **flag** path keeps
+`tables::upgrade_table` + `render_row` untouched — it has no cart, number, or
+approval concept, and `render_row` stays the shared version-rendering primitive
+both tables call.
 
 ## Custom types
 
@@ -256,8 +379,8 @@ Argument-bearing cart verbs keep raw `String` tokens that the handlers feed to
 ## Dependencies
 
 - **`rustyline`** (added, v18) for the line editor: history
-  (`$XDG_STATE_HOME/gitaur/shell_history`), emacs keybindings, and a `Completer`
-  (pending) over verbs + names.
+  (`$XDG_STATE_HOME/gitaur/shell_history`), emacs keybindings, and the
+  `ShellHelper` `Completer` over verbs + names (phase 5c).
 - **`shell-words`** (added) for tokenizing the input line.
 - Globs reuse the existing **`regex`** dep — no `globset`/`glob` added.
 
@@ -272,7 +395,7 @@ src/cli/shell/command.rs    Command enum + parse() (shell-words → verb)       
 src/cli/shell/selector.rs   Selector enum + resolve()                             [done]
 src/cli/shell/cart.rs       Cart + CartItem + Source/Approval/ApplyOutcome         [done]
 src/cli/shell/upgrade.rs    refresh+reload, cost-overlay preview (ex-upgrade_loop) [done]
-src/cli/shell/complete.rs   rustyline Completer over verbs + the name universe    [pending]
+src/cli/shell/complete.rs   rustyline Completer over verbs + the name universe    [done]
 ```
 
 The control flow is split like `upgrade_loop`'s `drive`/`LoopEnv`: a pure
@@ -396,7 +519,7 @@ Each phase is independently shippable and leaves the flag CLI fully working.
    core against the remembered list + the name universe. `SearchTerm` for query
    patterns, `PkgTarget` for `info`/`-Si` targets — threaded through
    `search_sync`/`cmd_search`/`cmd_info`. (`shell.rs` + `selector.rs` + `command.rs`.)
-   **Pending:** the rustyline `Completer`.
+   The rustyline `Completer` over this universe landed in phase 5c.
 3. **Cart + approval + apply (interim, pacman calls). — DONE.**
    `add`/`drop`(alias `discard`)/`remove`/`clear`/`show` build the `Cart` with
    per-item `Source` + `Approval`; `review <sel>` runs `build::review::review`
@@ -446,22 +569,112 @@ Each phase is independently shippable and leaves the flag CLI fully working.
 
    **As implemented (deviations / deferred):**
    - The cost overlay lands in the **apply preview**, not the `upgrade` list (the
-     shell has no picker to carry per-row cost cells) — `upgrade`/`show` render
-     each row as `№  source  approval  name  old → new`.
+     shell has no picker to carry per-row cost cells) — `upgrade`/`show` render a
+     colored, column-aligned table: `№  repo  approval  name  old → new  (age)`.
+     The `repo` cell is the **concrete** sync-DB (`core`/`extra`/…, yay-style
+     hashed color) rather than the coarse `repo`/`aur`; the `name` and `old → new`
+     versions are separate aligned columns; and AUR rows carry a dimmed "last
+     modified" age (`(3d ago)`) from the pkgbase's branch-tip commit time. The
+     table body renders behind the `ShellEnv::render_cart` seam (color + width
+     math + wall-clock age are I/O-shaped), while `show`'s header + approval
+     summary stay in the pure dispatch core. Repo names are a typed
+     `names::RepoName`, and the table aligns via a `Width`/`Colored`/`Cell`
+     cluster so padding is on visible width, not byte length. **This bespoke
+     `render_cart` table is superseded by the unified renderer** — see
+     [Unifying the show / apply tables](#unifying-the-show--apply-tables) (phase
+     5): `show` adopts `change_set_table`'s sort/verdiff/size while keeping the
+     number/approval/age columns, and `apply` stops re-drawing a table.
    - Repo `repo_skipped` (the `--ignore` set) is **recomputed** at apply from the
      live candidate set minus the staged repo upgrades, so a stale cart can't pin
      the wrong packages.
    - A cart mixing fresh `add`s with `upgrade` rows applies correctly, but the
      change-set preview's roots are the upgrade rows; fresh installs show under
      the pulled-in/dep section.
-5. **Polish.** Tab-completion (verbs + cart/universe), `refresh`, per-root dep
-   nesting in `show`, history `Hinter`, `help <topic>`, config knobs
-   (`aur_approval`, prompt/history).
+5. **Polish + table unification.** The [unified `show`/`apply`
+   table](#unifying-the-show--apply-tables) is the headline item:
+   - *5a — one renderer. **DONE.*** `render_cart` + `change_set_table` are folded
+     into one renderer in `src/ui/change_set.rs`: [`ui::transaction_table`] takes
+     a `TxnRoot` row model (number/approval/age columns over the
+     sort/verdiff/size/time machinery; `Option<old_ver>` for
+     install-vs-upgrade) and *returns* its lines as a typed `ui::Table`. `show`
+     resolves the staged set (graceful fallback to flat rows when resolve fails)
+     and renders it via the `ShellEnv::render_cart` seam. `apply` no longer draws
+     a table — both the fresh-install and upgrade branches collapsed into one
+     `resolve_targets` → [`ui::cost_summary`] one-liner → single confirm →
+     `apply_plan` (gate `AlreadyConfirmed`), so the `-S` pipeline's `print::plan`
+     table is bypassed at apply time too (the "full de-table"). The rendering
+     primitives are typed end-to-end: `Width`/`Cell`/`Paint`/`Fade` for layout,
+     `Bytes`/`Precision`/`BuildTerm`/`Duration` for the totals, `RepoRank` for the
+     sort key, `StageResult`/`UnstageResult` for cart mutations.
+   - *5b — order consistency. **DONE.*** `Cart::add` keeps the `items` `Vec`
+     sorted (`RepoName::rank()` → repo → spec) as an invariant, so the displayed
+     `№` *is* the vector index `resolve_against_cart` addresses — they can't drift.
+   - *5c — the rest.* **Tab-completion** (verbs + cart/universe) **DONE** — the
+     rustyline `Completer` in `src/cli/shell/complete.rs` is context-aware and
+     positional (verbs for word 1 / `help`; the name universe for
+     `search`/`add`/`info`/`remove`; the cart for `drop`/`review`/`approve`/
+     `upgrade`; nothing for a numeric token or a no-arg verb), recovering the
+     active verb by re-parsing the pre-cursor line so aliases resolve for free.
+     The universe is shared with the session by `Rc<[PkgTarget]>` and the cart
+     snapshot is re-synced after each command, so completion and the selector
+     resolver can't drift. **`refresh` DONE** — re-fetches the mirror + reloads
+     the session (fresh data for `search`/`info`/`upgrade`/completion) without
+     touching the cart. *Remaining:* history `Hinter`, `help <topic>`, config
+     knobs (`aur_approval`, prompt/history).
+   ("will remove" rows read back via `trans_prepare` ride with phase 6.)
 6. **Native combined commit (atomic add+remove).** Internal `__commit-txn`
    privileged subcommand: one libalpm transaction over repo adds + AUR file adds +
    removals, owning the install progress UI. Reuses `invoke.rs`'s transaction
    machinery. Behind `native_commit`; flip default once the container suite covers
    add+remove / group-swap. Satisfies decision 6 fully.
+
+## Backlog — shell UX refinements (post-5c)
+
+Found while using the shell; none block the phasing above. **All three DONE.**
+
+1. **`upgrade` should refresh on a TTL, not every time. — DONE.** `upgrade` now
+   defers its mirror fetch to `Config::refresh_max_age_secs` (default 3600s,
+   previously defined-but-unread). `upgrade::refresh_and_reload` takes a typed
+   `FetchPolicy`: `upgrade` passes `WhenStale` (skip the fetch when the last one
+   is younger than the TTL, still reloading the in-memory session from disk),
+   `refresh` passes `Always` (force a fetch, TTL-ignored); `-Syy` keeps forcing a
+   full re-clone via `cmd_refresh`'s `force_reclone`. The last-fetch timestamp is
+   a small stamp file (`paths::fetch_stamp_path` → `state_dir()/last-fetch`)
+   written by `mirror::cmd_refresh` on every successful refresh and read by
+   `mirror::last_fetch_age` — *not* an artifact mtime, because gix writes no
+   `FETCH_HEAD`, `packed-refs` is rewritten only every ~2000 fetches, and the
+   index/commit-graph are touched only when refs changed, so nothing on disk
+   reliably records the common no-op fetch. A missing/garbled stamp reads as
+   stale (fetch); a future stamp (clock skew) reads as a zero age (skip). Since
+   `cmd_refresh` does both the AUR fetch *and* the repo-db sync, a TTL-fresh
+   `upgrade` skips both network round-trips — the whole point being "no network
+   on a just-refreshed `upgrade`"; `refresh` or TTL expiry restores freshness.
+2. **`add` / `drop` should print the whole cart. — DONE.** After a *successful*
+   cart-changing `add`/`drop`/`remove` (i.e. something actually staged/unstaged —
+   a no-op `add nope` or `drop notincart` stays quiet), the dispatch core calls
+   `State::show`, reprinting the full header + table + approval summary, so the
+   current transaction is always on screen without typing `show`. The per-item
+   acknowledgments (`staged foo (aur)`, `dropped bar`, the exceptional
+   already-staged/unknown notes) are kept — they confirm each action and the
+   `shell_cart_e2e` PTY driver asserts on `staged …`. `clear` keeps its terse
+   `cart cleared` (reprinting an empty cart would just say "cart is empty").
+   `approve`/`review` aren't in scope here (they don't change the package set);
+   the user's next `show` reflects them — and is now a cache hit (see 3).
+3. **Re-resolve on change, not on every `show`. — DONE.** `RealEnv` caches the
+   expensive package-set-dependent half of the `show` view (`ResolvedTxn`: the
+   `synced_pac` size snapshot, the pulled-in dep rows, and the build-time
+   overlay) in `Option<CachedTxn>`, keyed by a `TxnKey` over the staged install
+   targets + removal names (**approval excluded** — it changes only the rendered
+   cell, not the resolution). `render_cart` → `transaction_view` → `ensure_view`
+   re-resolves only on a key miss; the cache is cleared on `reload`
+   (`upgrade`/`refresh` — upstream data moved) and at the start of `apply` (the
+   installed set may move). So a package-set mutation resolves **once** (the
+   reprint from item 2 is that one resolve), repeated `show`s are free, and
+   `approve`/`review` followed by `show` re-derive only the approval-bearing root
+   rows from the live cart against the cached snapshot — no re-resolve. The plan
+   itself isn't cached (only the dep rows/overlay derived from it; `apply`
+   resolves its own live plan). The graceful flat-row fallback on a resolve
+   failure is unchanged.
 
 ## Testing
 
@@ -488,14 +701,17 @@ Mirrors the existing two-tier philosophy (`docs/TESTING.md`) and the loop's seam
 
 | File | Anchor | Role |
 | --- | --- | --- |
-| `src/cli/shell.rs` | `dispatch`/`ShellEnv`/`run`, `State`, `ListItem` | REPL core (done); grows the cart + apply env methods |
-| `src/cli/shell/selector.rs` | `resolve` | numbers/ranges/names/globs → targets (done) |
-| `src/cli/shell/upgrade.rs` | `refresh_and_reload`, `preview`, `preview_metrics`, `system_pac`/`synced_pac` | refresh+reload + the apply cost-overlay preview (the reusable half of the retired `upgrade_loop`) |
+| `src/cli/shell.rs` | `dispatch`/`ShellEnv`/`run`, `State`, `ListItem`, `RealEnv::render_cart` | REPL core (done); `render_cart` is the bespoke `show` table the phase-5 unification retires |
+| `src/cli/shell/selector.rs` | `resolve` | numbers/ranges/names/globs/**repo** → targets (done) |
+| `src/cli/shell/complete.rs` | `ShellHelper`, `candidates`, `arg_kind` | context-aware tab-completion: verbs / universe / cart per position (done) |
+| `src/cli/shell/cart.rs` | `Cart` (`Vec<CartItem>`), `add`, `repo_label` | phase 5b keeps the `Vec` sorted (repo-rank → name) so `№` == index for `resolve_against_cart` |
+| `src/cli/shell/upgrade.rs` | `refresh_and_reload`, `preview`, `preview_metrics`, `system_pac`/`synced_pac` | refresh+reload + the cost-overlay preview; phase 5 moves `preview`/overlay behind `show`, not `apply` |
 | `src/build/upgrade.rs` | `UpgradeSession::{recompute_remaining,pkgbase_of}` | recompute candidates for `upgrade` |
 | `src/cli/search.rs` | `Row`, `label`, `picked` | reused for the shell's `search` rows (done) |
 | `src/build.rs` | `resolve_targets`, `apply_plan`, `cmd_install`, `Target::{with_hint,bare}`, `RunReport` | the apply engine + fold |
 | `src/build/review.rs` | `review()` → approve/skip/discard/view/edit | the `review` command's diff cycle |
-| `src/ui/change_set.rs` | `change_set_table` | the `show`/`apply` preview |
+| `src/ui/change_set.rs` | `change_set_table`, `batch_size_total`/`batch_time_total` | grows into the **one** unified transaction renderer (phase 5a); totals feed `apply`'s summary line |
+| `src/ui/tables.rs` | `render_row`, `col_widths`, `sort_for_display` | shared verdiff version-rendering primitive both tables call; unchanged for the `-Qu`/`-Syu` flag path |
 | `src/ui/tables.rs` | `select_upgrades` | **flag path only** — the shell never calls it |
 | `src/pacman/invoke.rs` | `preflight_dash_u_inner`, `exec_pacman`, `confirm_escalation` | native-txn template for `__commit-txn`; "will remove" preview |
 | `src/error.rs` | `Interrupted`, `UserAbort` | apply bail-to-prompt + decline |

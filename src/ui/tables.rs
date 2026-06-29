@@ -6,10 +6,137 @@
 
 use super::{color_on, dim};
 use crate::names::PkgName;
-use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
+use crate::pacman::invoke::PkgUpgrade;
 use crate::pacman::verdiff::{self, BumpKind};
+use crate::version::Version;
 
 use console::style;
+use std::ops::Add;
+
+/// A terminal column width, measured in display cells.
+///
+/// A newtype over `usize` (not a bare integer) so a width can't be confused
+/// with a row index or a package count, and so the pad-on-*visible*-width policy
+/// — cells are padded by char count, never byte length, so embedded ANSI
+/// escapes don't skew alignment — lives in one place. Shared by the unified
+/// transaction table ([`super::change_set`]) and [`version_block`].
+#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct Width(usize);
+
+impl Width {
+    pub(super) const ZERO: Self = Self(0);
+
+    /// Visible width of a plain (un-colored) cell. Table cells are ASCII
+    /// (names, versions, repo labels, sizes), so char count == display columns.
+    pub(super) fn of(s: &str) -> Self {
+        Self(s.chars().count())
+    }
+
+    /// The widest of a set of cell widths — i.e. the column width. [`Self::ZERO`]
+    /// when the iterator is empty.
+    pub(super) fn widest(widths: impl Iterator<Item = Self>) -> Self {
+        widths.max().unwrap_or(Self::ZERO)
+    }
+
+    /// The raw cell count, for the `{:>n}` / `{:<n}` width slots in `format!`.
+    pub(super) const fn cells(self) -> usize {
+        self.0
+    }
+
+    /// `self` blank cells — the filler for a fixed-width column with no content.
+    pub(super) fn blanks(self) -> String {
+        " ".repeat(self.0)
+    }
+
+    /// The padding string needed to widen a cell of visible width `inner` to
+    /// `self` (empty when `inner` already meets or exceeds `self`).
+    pub(super) fn gap(self, inner: Self) -> String {
+        " ".repeat(self.0.saturating_sub(inner.0))
+    }
+}
+
+impl Add for Width {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self(self.0 + rhs.0)
+    }
+}
+
+/// A rendered table cell: its (possibly ANSI-colored) display text plus the
+/// visible width of the *plain* text.
+///
+/// The domain type for a single aligned cell — instead of passing a
+/// `(plain, rendered)` pair around, the cell carries its own visible width so
+/// [`Self::pad_to`] aligns correctly even when the text holds color escapes.
+pub(super) struct Cell {
+    text: String,
+    width: Width,
+}
+
+impl Cell {
+    /// A plain (uncolored) cell; its width is its visible char count.
+    pub(super) fn plain(s: impl Into<String>) -> Self {
+        let text = s.into();
+        let width = Width::of(&text);
+        Self { text, width }
+    }
+
+    /// A cell rendered from `plain`: `f` paints it only when `paint` is colored,
+    /// and the cell remembers `plain`'s visible width either way.
+    pub(super) fn paint(plain: &str, paint: Paint, f: impl FnOnce(&str) -> String) -> Self {
+        Self {
+            width: Width::of(plain),
+            text: if paint.colored() {
+                f(plain)
+            } else {
+                plain.to_owned()
+            },
+        }
+    }
+
+    /// Left-justify to `width`: the rendered text followed by trailing blanks to
+    /// reach `width` visible columns.
+    pub(super) fn pad_to(self, width: Width) -> String {
+        format!("{}{}", self.text, width.gap(self.width))
+    }
+}
+
+/// The rendered lines of a table, top to bottom.
+///
+/// A domain newtype over the raw `Vec<String>` so rendered table output isn't
+/// passed around as an anonymous string list (which could be confused with, say,
+/// a list of package names), and so "how a table is emitted" lives behind one
+/// type. The shell prints each [`Self::lines`] entry; tests assert over them.
+pub struct Table(Vec<String>);
+
+impl Table {
+    /// An empty table to build up with [`Self::push`] / [`Self::append`].
+    pub(super) const fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Append one rendered line.
+    pub(super) fn push(&mut self, line: String) {
+        self.0.push(line);
+    }
+
+    /// Append another table's lines, consuming it. Lets a renderer assemble a
+    /// table from sub-sections (root rows, the deps block, removals) without
+    /// dropping to a bare `Vec<String>`.
+    pub(super) fn append(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    /// The display lines, top to bottom.
+    pub fn lines(&self) -> &[String] {
+        &self.0
+    }
+
+    /// Whether the render produced no lines (e.g. an empty change set).
+    pub const fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
 
 /// Whether a rendered row carries ANSI color.
 ///
@@ -157,8 +284,12 @@ impl UpgradeSelection {
 pub(super) fn sort_for_display(plan: &[PkgUpgrade]) -> Vec<&PkgUpgrade> {
     let mut rows: Vec<&PkgUpgrade> = plan.iter().collect();
     rows.sort_by(|a, b| {
-        repo_rank(&a.repo)
-            .cmp(&repo_rank(&b.repo))
+        a.repo
+            .rank()
+            .cmp(&b.repo.rank())
+            // Group same-rank `Other` repos by their concrete name; a no-op for
+            // the canonical repos and AUR (constant name within a rank).
+            .then_with(|| a.repo.as_str().cmp(b.repo.as_str()))
             .then_with(|| {
                 verdiff::classify_bump(&a.old_ver, &a.new_ver)
                     .cmp(&verdiff::classify_bump(&b.old_ver, &b.new_ver))
@@ -166,19 +297,6 @@ pub(super) fn sort_for_display(plan: &[PkgUpgrade]) -> Vec<&PkgUpgrade> {
             .then_with(|| a.name.cmp(&b.name))
     });
     rows
-}
-
-/// Sort key for `repo`. Pinned positions for the three canonical Arch repos
-/// and AUR last; any other configured repo (testing, custom, ...) lands in
-/// between and breaks ties alphabetically.
-fn repo_rank(repo: &str) -> (u8, &str) {
-    match repo {
-        "core" => (0, ""),
-        "extra" => (1, ""),
-        "multilib" => (2, ""),
-        REPO_AUR => (255, ""),
-        other => (10, other),
-    }
 }
 
 pub(super) fn col_widths(rows: &[&PkgUpgrade]) -> (usize, usize, usize) {
@@ -217,7 +335,7 @@ pub(super) fn render_row(
     let repo_pad = " ".repeat(repo_w.saturating_sub(u.repo.len()));
     format!(
         "{repo}{repo_pad}  {name:<name_w$}  {old_pre}{old_suf}{old_pad}  ->  {new_pre}{new_suf}",
-        repo = super::repo(&u.repo),
+        repo = super::repo(u.repo.as_str()),
         repo_pad = repo_pad,
         name = u.name,
         old_pre = style(old_pre).dim(),
@@ -236,6 +354,65 @@ fn paint_suffix(s: &str, kind: BumpKind) -> console::StyledObject<&str> {
         BumpKind::PkgRel => style(s).cyan(),
         BumpKind::Other => style(s),
     }
+}
+
+/// The display width of the ` → ` separator (arrow glyph flanked by two spaces):
+/// one column for the glyph plus one each side. A typed [`Width`] so the
+/// version-block padding math and the rendered separator can't drift.
+pub(super) const ARROW: Width = Width(3);
+
+/// Render one transaction row's version block, padded to a fixed
+/// `old_w + ARROW + new_w` visible width so the column after it aligns across
+/// install and upgrade rows.
+///
+/// - **Upgrade** (`old` present): verdiff coloring — common prefix dimmed, the
+///   diverging suffix colored by [`BumpKind`], joined by a dimmed ` → `. Shares
+///   the exact split logic with [`render_row`] so the shell's transaction table
+///   and the flag-path upgrade table read identically.
+/// - **Fresh install** (`old` is `None`): the arrow is suppressed (blank gap)
+///   and `new` renders green, matching [`install_table`].
+/// - **Unknown version** (`new` is `None`): an all-blank block of the same
+///   width, so a row we couldn't resolve a version for still aligns.
+pub(super) fn version_block(
+    old: Option<&Version>,
+    new: Option<&Version>,
+    old_w: Width,
+    new_w: Width,
+    paint: Paint,
+) -> String {
+    let Some(new) = new else {
+        return (old_w + ARROW + new_w).blanks();
+    };
+    let new_str = new.as_str();
+    let new_pad = new_w.gap(Width::of(new_str));
+
+    let Some(old) = old else {
+        // Fresh install: blank old slot + blank arrow gap, then green `new`.
+        let lead = (old_w + ARROW).blanks();
+        let shown = if paint.colored() {
+            style(new_str).green().to_string()
+        } else {
+            new_str.to_owned()
+        };
+        return format!("{lead}{shown}{new_pad}");
+    };
+
+    let old_pad = old_w.gap(Width::of(old.as_str()));
+    if !paint.colored() {
+        return format!("{}{old_pad} -> {new_str}{new_pad}", old.as_str());
+    }
+    let kind = verdiff::classify_bump(old, new);
+    let cut = verdiff::common_prefix_at_boundary(old, new);
+    let (old_pre, old_suf) = old.as_str().split_at(cut);
+    let (new_pre, new_suf) = new_str.split_at(cut);
+    format!(
+        "{}{}{old_pad}{}{}{}{new_pad}",
+        style(old_pre).dim(),
+        style(old_suf).red(),
+        dim(" → "),
+        style(new_pre).dim(),
+        paint_suffix(new_suf, kind),
+    )
 }
 
 #[cfg(test)]

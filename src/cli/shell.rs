@@ -28,24 +28,32 @@ use crate::cli::dispatch;
 use crate::cli::search::Row;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::index;
+use crate::index::{self, IndexEntry};
 use crate::mirror::{self, MirrorRepo};
-use crate::names::{PkgBase, PkgName, PkgTarget, SearchTerm};
+use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, SearchTerm};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke::{self, PkgUpgrade, REPO_AUR};
 use crate::paths;
+use crate::resolver::Plan;
 use crate::ui::{self, UpgradeSelection};
+use crate::version::Version;
 use cart::{
     ApplyOutcome, Approval, ApproveResult, AurApproval, Cart, CartItem, ReviewOutcome, Source,
+    StageClass, StageResult, UnstageResult,
 };
 use command::Command;
-use rustyline::DefaultEditor;
+use complete::ShellHelper;
+use rustyline::Editor;
 use rustyline::error::ReadlineError;
-use std::collections::HashSet;
+use rustyline::history::DefaultHistory;
+use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, instrument};
 
 pub mod cart;
 pub mod command;
+pub mod complete;
 pub mod selector;
 pub mod upgrade;
 
@@ -56,6 +64,10 @@ pub struct ListItem {
     pub target: PkgTarget,
     /// Preformatted display label (without the leading number).
     pub label: String,
+    /// Repo bucket (`core`, `extra`, …, or `aur`) this row came from, so a
+    /// repo-name selector (`add extra`) can filter the list. `None` for rows
+    /// whose source isn't a repo (e.g. cart-derived selector lists).
+    pub repo: Option<RepoName>,
 }
 
 /// Mutable per-session shell state the dispatch core threads between commands.
@@ -88,17 +100,22 @@ pub trait ShellEnv {
     /// fresh data too), and return the current upgrade candidates (repo ∪ AUR)
     /// for `upgrade` to seed into the cart.
     fn upgrade(&mut self) -> Result<Vec<PkgUpgrade>>;
+    /// Re-fetch the mirror + index and reload the session (fresh data for
+    /// `search`/`info`/classification/completion) **without** seeding the cart —
+    /// `upgrade` is the stage-the-upgrades variant; `refresh` is just the
+    /// re-fetch.
+    fn refresh(&mut self) -> Result<()>;
     /// Run a combined repo + AUR search; returns rows for the numbered list.
     fn search(&mut self, terms: &[SearchTerm]) -> Result<Vec<ListItem>>;
     /// Print `-Si`-style info for the already-resolved targets.
     fn show_info(&mut self, targets: &[PkgTarget]) -> Result<()>;
     /// Sorted universe of package targets, for glob resolution + completion.
     fn names(&self) -> &[PkgTarget];
-    /// Coarse-classify a target for staging: a sync-repo package, an AUR
-    /// package, or `None` when it's neither (a typo / unknown name). Only
-    /// decides the approval policy and the `show` label — the real install
-    /// routing is the resolver's call at `apply`.
-    fn classify(&self, target: &PkgTarget) -> Option<Source>;
+    /// Coarse-classify a target for staging: a sync-repo package (with its
+    /// concrete repo), an AUR package, or `None` when it's neither (a typo /
+    /// unknown name). Only decides the approval policy and the `show` label —
+    /// the real install routing is the resolver's call at `apply`.
+    fn classify(&self, target: &PkgTarget) -> Option<StageClass>;
     /// Whether AUR items stage pre-approved (config `review_default == "skip"`).
     fn aur_policy(&self) -> AurApproval;
     /// The pkgbase a staged AUR target resolves to, for the reviewed set fed
@@ -106,6 +123,12 @@ pub trait ShellEnv {
     fn pkgbase_of(&self, target: &PkgTarget) -> Option<PkgBase>;
     /// Run the PKGBUILD review (diff-or-full) for one staged AUR target.
     fn review(&mut self, target: &PkgTarget) -> Result<ReviewOutcome>;
+    /// Render the staged transaction table — the numbered install rows + the
+    /// removal rows — colored, column-aligned, with a per-AUR-row "last
+    /// modified" age. The header + approval summary stay in the pure dispatch
+    /// core ([`State::show`]); this is the I/O-shaped presentation (color,
+    /// width math, wall-clock age) that belongs behind the env seam.
+    fn render_cart(&mut self, cart: &Cart);
     /// Run the staged transaction: resolve + preview + confirm + build/install +
     /// removals. Reads the cart; the dispatch core updates it from the outcome.
     fn apply(&mut self, cart: &Cart) -> Result<ApplyOutcome>;
@@ -186,11 +209,12 @@ impl State {
                 Flow::Continue
             }
             Command::Refresh => {
-                // The mid-session re-fetch lands in phase 5; until then a fresh
-                // upstream snapshot is what restarting `gaur` is for.
-                env.print(
-                    "refresh isn't wired up yet (phase 5) — restart `gaur` to re-fetch the mirror",
-                );
+                // Re-fetch + reload the session; the cart is left untouched
+                // (`upgrade` is the seed-the-cart variant).
+                match env.refresh() {
+                    Ok(()) => env.print("mirror + index refreshed"),
+                    Err(e) => env.print(&format!("refresh: {e}")),
+                }
                 Flow::Continue
             }
         }
@@ -231,7 +255,7 @@ impl State {
             env.print("usage: info <pkg|number|range|glob>…");
             return;
         }
-        let targets = match selector::resolve(args, &self.last_list, env.names()) {
+        let targets = match self.resolve_against_list(args, env) {
             Ok(t) => t,
             Err(e) => {
                 env.print(&format!("info: {e}"));
@@ -277,7 +301,7 @@ impl State {
         let policy = env.aur_policy();
         let mut staged = 0;
         for u in to_seed {
-            if self.cart.add(CartItem::from_upgrade(u, policy)) {
+            if self.cart.add(CartItem::from_upgrade(u, policy)) == StageResult::Staged {
                 staged += 1;
             }
         }
@@ -293,7 +317,7 @@ impl State {
             env.print("usage: add <pkg|number|range|glob>…");
             return;
         }
-        let targets = match selector::resolve(args, &self.last_list, env.names()) {
+        let targets = match self.resolve_against_list(args, env) {
             Ok(t) => t,
             Err(e) => {
                 env.print(&format!("add: {e}"));
@@ -305,18 +329,34 @@ impl State {
             return;
         }
         let policy = env.aur_policy();
+        let mut changed = false;
         for t in targets {
             match env.classify(&t) {
-                Some(source) => {
+                Some(StageClass { source, repo }) => {
                     let name = t.as_str().to_owned();
-                    if self.cart.add(CartItem::new(t, source, policy)) {
-                        env.print(&format!("staged {name} ({})", source.label()));
-                    } else {
-                        env.print(&format!("{name} is already staged"));
+                    // Show the concrete repo (`core`/`extra`) when known, else
+                    // the coarse source label.
+                    let label = repo
+                        .clone()
+                        .map_or_else(|| source.label().to_owned(), RepoName::into_inner);
+                    match self.cart.add(CartItem::new(t, source, repo, policy)) {
+                        StageResult::Staged => {
+                            env.print(&format!("staged {name} ({label})"));
+                            changed = true;
+                        }
+                        StageResult::AlreadyStaged => {
+                            env.print(&format!("{name} is already staged"));
+                        }
                     }
                 }
                 None => env.print(&format!("unknown package `{}` — not staged", t.as_str())),
             }
+        }
+        // Keep the resulting transaction on screen so the user needn't `show`
+        // after every stage (post-5c UX). Skipped when nothing actually changed
+        // (all already-staged / unknown), so a no-op `add` stays quiet.
+        if changed {
+            self.show(env);
         }
     }
 
@@ -338,12 +378,20 @@ impl State {
             env.print("drop: nothing in the cart matched");
             return;
         }
+        let mut changed = false;
         for t in targets {
-            if self.cart.unstage(&t) {
-                env.print(&format!("dropped {}", t.as_str()));
-            } else {
-                env.print(&format!("{} wasn't staged", t.as_str()));
+            match self.cart.unstage(&t) {
+                UnstageResult::Unstaged => {
+                    env.print(&format!("dropped {}", t.as_str()));
+                    changed = true;
+                }
+                UnstageResult::NotStaged => env.print(&format!("{} wasn't staged", t.as_str())),
             }
+        }
+        // Reprint the remaining transaction (or "cart is empty" once the last row
+        // goes) so the current cart is always on screen — post-5c UX.
+        if changed {
+            self.show(env);
         }
     }
 
@@ -355,7 +403,7 @@ impl State {
             env.print("usage: remove <pkg|number|range|glob>…");
             return;
         }
-        let targets = match selector::resolve(args, &self.last_list, env.names()) {
+        let targets = match self.resolve_against_list(args, env) {
             Ok(t) => t,
             Err(e) => {
                 env.print(&format!("remove: {e}"));
@@ -366,13 +414,23 @@ impl State {
             env.print("remove: nothing matched");
             return;
         }
+        let mut changed = false;
         for t in targets {
             let name = PkgName::from(t.into_inner());
-            if self.cart.stage_remove(name.clone()) {
-                env.print(&format!("staged removal of {name}"));
-            } else {
-                env.print(&format!("{name} is already staged for removal"));
+            match self.cart.stage_remove(name.clone()) {
+                StageResult::Staged => {
+                    env.print(&format!("staged removal of {name}"));
+                    changed = true;
+                }
+                StageResult::AlreadyStaged => {
+                    env.print(&format!("{name} is already staged for removal"));
+                }
             }
+        }
+        // Show the resulting transaction (the new "will remove" row included) so
+        // the cart is always on screen — post-5c UX.
+        if changed {
+            self.show(env);
         }
     }
 
@@ -471,8 +529,14 @@ impl State {
         }
     }
 
-    /// `show`: render the staged transaction — installs (with source +
-    /// approval), removals, and whether `apply` is ready.
+    /// `show`: render the staged transaction — a header, the install/removal
+    /// table (delegated to the env for color + alignment + age), and whether
+    /// `apply` is ready.
+    ///
+    /// The header and the approval summary are deterministic and stay here in
+    /// the pure core (so they're unit-testable via the fake env); the table body
+    /// — color, column widths, per-AUR-row age — is I/O-shaped presentation and
+    /// goes through [`ShellEnv::render_cart`].
     fn show<E: ShellEnv>(&self, env: &mut E) {
         let cart = &self.cart;
         if cart.is_empty() {
@@ -484,23 +548,7 @@ impl State {
             cart.items().len(),
             cart.removals().len()
         ));
-        for (i, it) in cart.items().iter().enumerate() {
-            // Upgrade rows carry their old→new transition; fresh installs don't.
-            let ver = it
-                .version_transition()
-                .map(|v| format!("  {v}"))
-                .unwrap_or_default();
-            env.print(&format!(
-                "{:>3}  {:4}  {:8}  {}{ver}",
-                i + 1,
-                it.source.label(),
-                it.approval.label(),
-                it.spec()
-            ));
-        }
-        for name in cart.removals() {
-            env.print(&format!("     remove          {name}"));
-        }
+        env.render_cart(cart);
         let pending = cart.pending_review().len();
         if pending == 0 {
             env.print("all approved — run `apply`");
@@ -542,48 +590,119 @@ impl State {
         }
     }
 
-    /// Resolve selector `args` against the cart: numbers index the staged rows;
+    /// Resolve selector `args` against the cart: a repo name (`aur`, `core`, …)
+    /// selects every staged row from that repo; numbers index the staged rows;
     /// names/globs match staged specs. Mirrors the verb-scoping rule in the
     /// design (cart verbs act on what's staged, not the search list).
     fn resolve_against_cart(&self, args: &[String]) -> std::result::Result<Vec<PkgTarget>, String> {
-        let list: Vec<ListItem> = self
+        let rows: Vec<RepoRow> = self
             .cart
             .items()
             .iter()
-            .map(|it| ListItem {
+            .map(|it| RepoRow {
                 target: PkgTarget::new(it.spec()),
-                label: String::new(),
+                repo: Some(it.repo_label()),
             })
             .collect();
-        let universe: Vec<PkgTarget> = self
-            .cart
-            .items()
+        let args = expand_repo_tokens(args, &rows);
+        let list: Vec<ListItem> = rows
             .iter()
-            .map(|it| PkgTarget::new(it.spec()))
+            .map(|r| ListItem {
+                target: r.target.clone(),
+                label: String::new(),
+                repo: r.repo.clone(),
+            })
             .collect();
-        selector::resolve(args, &list, &universe)
+        let universe: Vec<PkgTarget> = rows.iter().map(|r| r.target.clone()).collect();
+        selector::resolve(&args, &list, &universe)
+    }
+
+    /// Resolve selector `args` against the last result list: a repo name selects
+    /// every list row from that repo; numbers/ranges index the list; names/globs
+    /// resolve against the full name universe. The list verbs (`add`, `info`,
+    /// `remove`) share this so `add extra` and `add 3` behave the same way.
+    fn resolve_against_list<E: ShellEnv>(
+        &self,
+        args: &[String],
+        env: &E,
+    ) -> std::result::Result<Vec<PkgTarget>, String> {
+        let rows: Vec<RepoRow> = self
+            .last_list
+            .iter()
+            .map(|it| RepoRow {
+                target: it.target.clone(),
+                repo: it.repo.clone(),
+            })
+            .collect();
+        let args = expand_repo_tokens(args, &rows);
+        selector::resolve(&args, &self.last_list, env.names())
     }
 }
 
-/// Filter `candidates` to those a selector matches: numbers index the candidate
-/// list, names/globs match candidate names. Reuses the selector core (the same
-/// one `add`/`info`/cart verbs use), so `upgrade glibc python-*` works the same.
+/// One `(target, repo)` pair fed to [`expand_repo_tokens`] — the minimal view of
+/// a cart row or list row a repo-name selector needs.
+struct RepoRow {
+    target: PkgTarget,
+    repo: Option<RepoName>,
+}
+
+/// Rewrite repo-name tokens (`aur`, `core`, `extra`, …) into the targets of the
+/// rows whose repo matches, so `drop aur` / `add extra` act on a whole repo.
+///
+/// A token that matches no row's repo is passed through unchanged for the
+/// number/range/name/glob selector to handle — so a real package that happens
+/// to share a repo's name still resolves normally when nothing in the current
+/// scope is from that repo. Matching is case-insensitive. The expansion emits
+/// selector tokens (the matched targets' names) so the one resolution path in
+/// [`selector::resolve`] still does the indexing, dedup, and ordering.
+fn expand_repo_tokens(args: &[String], rows: &[RepoRow]) -> Vec<String> {
+    args.iter()
+        .flat_map(|a| {
+            let matched: Vec<String> = rows
+                .iter()
+                .filter(|r| {
+                    r.repo
+                        .as_ref()
+                        .is_some_and(|repo| repo.as_str().eq_ignore_ascii_case(a))
+                })
+                .map(|r| r.target.as_str().to_owned())
+                .collect();
+            if matched.is_empty() {
+                vec![a.clone()]
+            } else {
+                matched
+            }
+        })
+        .collect()
+}
+
+/// Filter `candidates` to those a selector matches: a repo name (`aur`, `core`,
+/// …) selects every candidate from that repo; numbers index the candidate list;
+/// names/globs match candidate names. Reuses the selector core (the same one
+/// `add`/`info`/cart verbs use), so `upgrade glibc python-*` and `upgrade aur`
+/// work the same.
 fn select_from_candidates(
     args: &[String],
     candidates: &[PkgUpgrade],
 ) -> std::result::Result<Vec<PkgUpgrade>, String> {
-    let list: Vec<ListItem> = candidates
+    let rows: Vec<RepoRow> = candidates
         .iter()
-        .map(|u| ListItem {
+        .map(|u| RepoRow {
             target: PkgTarget::new(u.name.as_str()),
-            label: String::new(),
+            repo: Some(u.repo.clone()),
         })
         .collect();
-    let universe: Vec<PkgTarget> = candidates
+    let args = expand_repo_tokens(args, &rows);
+    let list: Vec<ListItem> = rows
         .iter()
-        .map(|u| PkgTarget::new(u.name.as_str()))
+        .map(|r| ListItem {
+            target: r.target.clone(),
+            label: String::new(),
+            repo: r.repo.clone(),
+        })
         .collect();
-    let picked = selector::resolve(args, &list, &universe)?;
+    let universe: Vec<PkgTarget> = rows.iter().map(|r| r.target.clone()).collect();
+    let picked = selector::resolve(&args, &list, &universe)?;
     let names: HashSet<&str> = picked.iter().map(PkgTarget::as_str).collect();
     Ok(candidates
         .iter()
@@ -610,8 +729,8 @@ commands:
   refresh             re-fetch the AUR mirror + index
   help                this list
   quit                leave the shell (also: Ctrl-D)
-selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob)
-note: `upgrade` still bridges to the old loop; `refresh` lands in a later phase.";
+selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
+           `aur`/`core`/… (whole repo — e.g. `drop aur`, `add extra`)";
 
 /// Run the interactive shell. Returns the desired process exit code.
 #[instrument(skip(cfg))]
@@ -632,6 +751,7 @@ pub fn run(cfg: &Config, devel: bool) -> Result<u8> {
         devel,
         session,
         caches,
+        view: None,
     };
     let mut state = State::default();
 
@@ -640,8 +760,10 @@ pub fn run(cfg: &Config, devel: bool) -> Result<u8> {
         env.print("no AUR index yet — run `gaur -Sy` to enable AUR search/info");
     }
 
-    let mut rl =
-        DefaultEditor::new().map_err(|e| Error::other(format!("shell: init line editor: {e}")))?;
+    let helper = ShellHelper::new(Rc::clone(&env.caches.universe));
+    let mut rl: Editor<ShellHelper, DefaultHistory> =
+        Editor::new().map_err(|e| Error::other(format!("shell: init line editor: {e}")))?;
+    rl.set_helper(Some(helper));
     let history = paths::shell_history_path();
     // A missing history file on first run is expected, not an error.
     rl.load_history(&history).ok();
@@ -653,7 +775,15 @@ pub fn run(cfg: &Config, devel: bool) -> Result<u8> {
                     // Best-effort: a full history ring shouldn't abort input.
                     rl.add_history_entry(line.as_str()).ok();
                 }
-                if let Flow::Exit(code) = state.dispatch(&command::parse(&line), &mut env) {
+                let flow = state.dispatch(&command::parse(&line), &mut env);
+                // Refresh Tab's view for the next line: the just-mutated cart,
+                // and the universe (a cheap `Rc` clone — only `upgrade`/`refresh`
+                // actually swaps it). Sharing the same sources the selector
+                // resolver uses keeps "what Tab offers" == "what the verb accepts".
+                if let Some(helper) = rl.helper_mut() {
+                    helper.sync(Rc::clone(&env.caches.universe), cart_targets(&state));
+                }
+                if let Flow::Exit(code) = flow {
                     break code;
                 }
             }
@@ -676,10 +806,15 @@ pub fn run(cfg: &Config, devel: bool) -> Result<u8> {
 struct NameCaches {
     /// Sorted, de-duplicated — every AUR pkgname + pkgbase from the index plus
     /// sync-repo names, each as a [`PkgTarget`] (the universe a user can name).
-    /// Backs glob resolution and, later, tab-completion.
-    universe: Vec<PkgTarget>,
-    /// Sync-repo pkgnames, for `add`'s coarse repo/AUR classification.
-    sync: HashSet<PkgName>,
+    /// Backs glob resolution and tab-completion. An `Rc<[_]>` so the rustyline
+    /// completer shares it without copying ~100k names, and a re-`build` on
+    /// `upgrade`/`refresh` just swaps the pointer.
+    universe: Rc<[PkgTarget]>,
+    /// Sync-repo pkgname → its repo (`core`, `extra`, …), for `add`'s coarse
+    /// repo/AUR classification and the concrete repo column. The first sync DB
+    /// (pacman.conf order) that declares a name wins, matching what pacman would
+    /// pull.
+    sync: HashMap<PkgName, RepoName>,
 }
 
 /// Build the [`NameCaches`] for a session. A missing index or unreadable alpm
@@ -691,18 +826,36 @@ fn build_universe(session: Option<&UpgradeSession>) -> NameCaches {
         universe.extend(by.by_name.keys().map(PkgTarget::from));
         universe.extend(by.by_pkgbase.keys().map(PkgTarget::from));
     }
-    let mut sync = HashSet::new();
+    let mut sync = HashMap::new();
     if let Ok(alpm) = alpm_db::open() {
         for db in alpm.syncdbs() {
             for pkg in db.pkgs() {
                 universe.push(PkgTarget::new(pkg.name()));
-                sync.insert(PkgName::new(pkg.name()));
+                // First DB to declare the name wins (pacman.conf precedence),
+                // so `core` shadows a later `testing` carrying the same pkg.
+                sync.entry(PkgName::new(pkg.name()))
+                    .or_insert_with(|| RepoName::from(db.name()));
             }
         }
     }
     universe.sort_unstable();
     universe.dedup();
-    NameCaches { universe, sync }
+    NameCaches {
+        universe: Rc::from(universe.into_boxed_slice()),
+        sync,
+    }
+}
+
+/// The staged specs as the typed [`PkgTarget`]s the completer offers for cart
+/// verbs (`drop`/`review`/`approve`). Recomputed after each command since the
+/// cart is tiny.
+fn cart_targets(state: &State) -> Vec<PkgTarget> {
+    state
+        .cart
+        .items()
+        .iter()
+        .map(|it| PkgTarget::new(it.spec()))
+        .collect()
 }
 
 /// Production [`ShellEnv`]: the loaded session + stdout, bridging `upgrade` to
@@ -712,6 +865,65 @@ struct RealEnv<'a> {
     devel: bool,
     session: Option<UpgradeSession>,
     caches: NameCaches,
+    /// Cached resolution of the cart's package set for `show` — see
+    /// [`CachedTxn`]. `None` until the first render, after a reload, or after an
+    /// `apply` (which may have changed the installed set).
+    view: Option<CachedTxn>,
+}
+
+/// The expensive, package-set-dependent half of the `show` transaction view:
+/// the synced-db size snapshot, the pulled-in dependency rows, and the
+/// build-time overlay. Built by [`RealEnv::resolve_view`] and cached so repeated
+/// `show`s and the post-mutation cart reprint don't redo the resolver + the two
+/// alpm opens + the metrics-store read.
+///
+/// The resolved [`Plan`] itself isn't kept — the render only needs the dep rows
+/// and overlay derived from it, and `apply` resolves its own live plan against
+/// the system db. The approval-bearing root rows aren't stored either: they're
+/// re-derived per render from the live cart, so `approve`/`review` show up on
+/// the next `show` without a re-resolve (only the approval cell changed, not the
+/// resolution).
+struct ResolvedTxn {
+    size_pac: PacmanIndex,
+    repo_deps: Vec<PkgName>,
+    aur_deps: Vec<PkgBase>,
+    metrics: ui::PreviewMetrics,
+}
+
+/// A [`ResolvedTxn`] tagged with the cart package set it was resolved for, so
+/// [`RealEnv::render_cart`] reuses it while that set is unchanged and discards it
+/// the moment `add`/`drop`/`remove`/`clear` (or a reload) moves the set.
+struct CachedTxn {
+    key: TxnKey,
+    resolved: ResolvedTxn,
+}
+
+/// Identity of a cart's *resolution-relevant* state: the staged install targets
+/// plus the removal names. Approval is excluded — it doesn't change what
+/// resolves, only the rendered cell — so `approve`/`review` are a cache hit. Two
+/// carts with equal keys resolve identically against unchanged mirror/db data,
+/// which is why [`RealEnv::reload`] also clears the cache when that data may have
+/// moved.
+#[derive(PartialEq, Eq)]
+struct TxnKey {
+    installs: Vec<PkgTarget>,
+    removals: Vec<PkgName>,
+}
+
+impl TxnKey {
+    fn of(cart: &Cart) -> Self {
+        // The cart keeps `items` sorted (phase 5b), but normalise defensively so
+        // the key is order-independent however it was assembled.
+        let mut installs: Vec<PkgTarget> = cart
+            .items()
+            .iter()
+            .map(|it| PkgTarget::new(it.spec()))
+            .collect();
+        installs.sort_unstable();
+        let mut removals: Vec<PkgName> = cart.removals().to_vec();
+        removals.sort_unstable();
+        Self { installs, removals }
+    }
 }
 
 impl ShellEnv for RealEnv<'_> {
@@ -720,17 +932,22 @@ impl ShellEnv for RealEnv<'_> {
     }
 
     fn upgrade(&mut self) -> Result<Vec<PkgUpgrade>> {
-        // Refresh the mirror + index and reload the session in place, so the
-        // fresh data backs subsequent `search`/`info`/classification too.
-        let session = upgrade::refresh_and_reload(self.cfg)?;
-        self.caches = build_universe(session.as_ref());
-        self.session = session;
+        // `upgrade` defers to the refresh TTL — a fetch within
+        // `refresh_max_age_secs` is skipped (the session still reloads), so
+        // back-to-back `upgrade`s don't each pay a network round-trip. The
+        // explicit `refresh` command forces a fetch.
+        self.reload(upgrade::FetchPolicy::WhenStale)?;
         match &self.session {
             Some(session) => session.recompute_remaining(self.devel),
             // No AUR index even after a refresh: repo upgrades are still
             // queryable straight from the synced db.
             None => invoke::query_repo_upgrades(),
         }
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        // `refresh` is the always-fetch command — it ignores the TTL.
+        self.reload(upgrade::FetchPolicy::Always)
     }
 
     fn search(&mut self, terms: &[SearchTerm]) -> Result<Vec<ListItem>> {
@@ -759,6 +976,7 @@ impl ShellEnv for RealEnv<'_> {
             .map(|r| ListItem {
                 target: r.picked(),
                 label: r.label(color),
+                repo: Some(RepoName::from(r.repo_name())),
             })
             .collect())
     }
@@ -778,17 +996,23 @@ impl ShellEnv for RealEnv<'_> {
         &self.caches.universe
     }
 
-    fn classify(&self, target: &PkgTarget) -> Option<Source> {
+    fn classify(&self, target: &PkgTarget) -> Option<StageClass> {
         // Repo wins ties: pacman owns sync packages, and the resolver routes a
         // shared name to the repo lane anyway, so auto-approving it is honest.
-        if self.caches.sync.contains(target.bare()) {
-            return Some(Source::Repo);
+        if let Some(repo) = self.caches.sync.get(target.bare()) {
+            return Some(StageClass {
+                source: Source::Repo,
+                repo: Some(repo.clone()),
+            });
         }
         let session = self.session.as_ref()?;
         session
             .secondary()
             .lookup(session.index(), target.as_str())
-            .map(|_| Source::Aur)
+            .map(|_| StageClass {
+                source: Source::Aur,
+                repo: None,
+            })
     }
 
     fn aur_policy(&self) -> AurApproval {
@@ -847,126 +1071,61 @@ impl ShellEnv for RealEnv<'_> {
         }
     }
 
+    fn render_cart(&mut self, cart: &Cart) {
+        // Render the unified change-set table from the cached resolution (roots
+        // + pulled-in deps + removals + cost), re-resolving only when the cart's
+        // package set moved. `show` must never error out, so a resolve failure
+        // degrades to the flat staged rows plus a note (UPDATE_LOOP goal #5
+        // landing behind `show`).
+        match self.transaction_view(cart) {
+            Ok(table) => {
+                for line in table.lines() {
+                    self.print(line);
+                }
+            }
+            Err(e) => {
+                debug!(error = %e, "show preview resolve failed; flat fallback");
+                for line in flat_cart_lines(cart, &e) {
+                    self.print(&line);
+                }
+            }
+        }
+    }
+
     fn apply(&mut self, cart: &Cart) -> Result<ApplyOutcome> {
-        let Some(session) = &self.session else {
+        // The build/install (and any removals) may change the installed set, so
+        // the cached resolution is stale once apply runs whatever its outcome;
+        // drop it so the next `show` re-resolves against the new system state.
+        self.view = None;
+        let Some(session) = self.session.as_ref() else {
             ui::warn("no AUR index loaded; cannot apply");
             return Ok(ApplyOutcome::Failed);
         };
         let pac = upgrade::system_pac()?;
 
-        // The upgrade rows (repo + AUR) drive the cost-overlay preview and the
-        // partial `-Syu` lane; their absence means a pure fresh-install cart.
-        let roots: Vec<PkgUpgrade> = cart
-            .items()
-            .iter()
-            .filter_map(|i| i.upgrade.clone())
-            .collect();
+        // Resolve the build/install half (AUR + fresh installs); repo *upgrades*
+        // take the partial `-Syu` lane below, so they're excluded from the plan.
+        let plan = self.resolve_cart(session, &pac, cart)?;
 
-        let outcome = if roots.is_empty() {
-            self.apply_installs(session, &pac, cart)?
-        } else {
-            self.apply_upgrades(session, &pac, cart, &roots)?
-        };
-        if outcome != ApplyOutcome::Succeeded {
-            return Ok(outcome);
-        }
-
-        // Remove half (shared): `pacman -R`, filtered to packages actually
-        // installed so a retry after a partial failure doesn't trip on an
-        // already-gone target. One atomic add+remove transaction is the phase-6
-        // native-commit goal; until then this is separate transactions bridged
-        // by the sudo cache.
-        let removals: Vec<&PkgName> = cart
-            .removals()
-            .iter()
-            .filter(|n| pac.is_installed(n.as_str()))
-            .collect();
-        if !removals.is_empty() {
-            // Stringify only here, at pacman's argv boundary.
-            let mut args = vec!["-R".to_owned()];
-            args.extend(removals.iter().map(|n| n.as_str().to_owned()));
-            if invoke::exec_pacman(self.cfg, &args)? != 0 {
-                ui::warn("removal step did not complete");
-                return Ok(ApplyOutcome::Failed);
-            }
-        }
-        Ok(ApplyOutcome::Succeeded)
-    }
-}
-
-impl RealEnv<'_> {
-    /// Pure fresh-install cart (no upgrade rows): the `-S` pipeline owns the
-    /// plan table + its only-when-deps confirm and the stratified build/install.
-    /// The cart's reviewed set rides along so approved AUR pkgbases aren't
-    /// re-prompted.
-    fn apply_installs(
-        &self,
-        session: &UpgradeSession,
-        pac: &PacmanIndex,
-        cart: &Cart,
-    ) -> Result<ApplyOutcome> {
-        let targets = cart.install_targets();
-        if targets.is_empty() {
-            return Ok(ApplyOutcome::Succeeded);
-        }
-        let mut reviewed = cart.reviewed().clone();
-        let opts = InstallOpts {
-            noconfirm: false,
-            asdeps: false,
-            gate: ConfirmGate::Ask,
-        };
-        match build::install_with_index(
-            self.cfg,
-            session.index(),
-            Some(session.secondary()),
-            pac,
-            &targets,
-            opts,
-            &mut reviewed,
-        ) {
-            Ok(report) => Ok(outcome_of(&report)),
-            // Declining the plan confirm aborts the whole apply, cart kept.
-            Err(Error::UserAbort) => Ok(ApplyOutcome::Declined),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Upgrade cart: resolve the AUR/build half once, render the cost-overlay
-    /// change-set preview, take one confirm, then run the partial `-Syu` repo
-    /// lane (so AUR builds link against the upgraded libs) and the build/install
-    /// lane.
-    fn apply_upgrades(
-        &self,
-        session: &UpgradeSession,
-        pac: &PacmanIndex,
-        cart: &Cart,
-        roots: &[PkgUpgrade],
-    ) -> Result<ApplyOutcome> {
-        // Resolve the AUR upgrades + any fresh installs once; repo *upgrades*
-        // are excluded (they take the `-Syu` lane below).
-        let targets = cart.install_targets();
-        let plan = build::resolve_targets(
-            self.cfg,
-            session.index(),
-            Some(session.secondary()),
-            pac,
-            &targets,
-            false,
-        )?;
-
-        // Sizes from the freshly-synced db (the new versions' real download
-        // cost); build-time from the metrics store.
+        // No table redraw — `show` is where the user looked. `apply` gates on the
+        // one-line cost summary plus a single confirm (phase 5a).
         let size_pac = upgrade::synced_pac()?;
-        let metrics = upgrade::preview_metrics(session, roots, Some(&plan));
-        upgrade::preview(roots, Some(&plan), &size_pac, &metrics);
+        let roots = txn_roots(cart, session, &size_pac);
+        let (repo_deps, aur_deps) = upgrade::dep_rows(plan.as_ref());
+        let removals: Vec<PkgName> = cart.removals().to_vec();
+        let metrics = upgrade::preview_metrics(session, &roots, plan.as_ref());
+        ui::info(&ui::cost_summary(
+            &roots, &repo_deps, &aur_deps, &removals, &size_pac, &metrics,
+        ));
         if !ui::confirm("Proceed with this transaction?", false)
             .map_err(|e| Error::other(format!("confirm: {e}")))?
         {
             return Ok(ApplyOutcome::Declined);
         }
 
-        // Repo upgrades first, via a partial `pacman -Syu` that ignores every
-        // repo candidate the user didn't stage.
+        // Repo upgrades first (so AUR builds link against the upgraded libs), via
+        // a partial `pacman -Syu` that ignores every repo candidate the user
+        // didn't stage.
         let repo_sel = self.repo_upgrade_selection(session, cart)?;
         if !repo_sel.repo.is_empty() {
             dispatch::run_repo_upgrade(self.cfg, &repo_sel)?;
@@ -980,8 +1139,149 @@ impl RealEnv<'_> {
             asdeps: false,
             gate: ConfirmGate::AlreadyConfirmed,
         };
-        let report = build::apply_plan(self.cfg, session.index(), pac, &plan, opts, &mut reviewed)?;
-        Ok(outcome_of(&report))
+        let outcome = match &plan {
+            Some(plan) => {
+                let report =
+                    build::apply_plan(self.cfg, session.index(), &pac, plan, opts, &mut reviewed)?;
+                outcome_of(&report)
+            }
+            None => ApplyOutcome::Succeeded,
+        };
+        if outcome != ApplyOutcome::Succeeded {
+            return Ok(outcome);
+        }
+
+        // Remove half: `pacman -R`, filtered to packages actually installed so a
+        // retry after a partial failure doesn't trip on an already-gone target.
+        // One atomic add+remove transaction is the phase-6 native-commit goal;
+        // until then this is separate transactions bridged by the sudo cache.
+        let installed_removals: Vec<&PkgName> = cart
+            .removals()
+            .iter()
+            .filter(|n| pac.is_installed(n.as_str()))
+            .collect();
+        if !installed_removals.is_empty() {
+            // Stringify only here, at pacman's argv boundary.
+            let mut args = vec!["-R".to_owned()];
+            args.extend(installed_removals.iter().map(|n| n.as_str().to_owned()));
+            if invoke::exec_pacman(self.cfg, &args)? != 0 {
+                ui::warn("removal step did not complete");
+                return Ok(ApplyOutcome::Failed);
+            }
+        }
+        Ok(ApplyOutcome::Succeeded)
+    }
+}
+
+impl RealEnv<'_> {
+    /// Re-fetch the mirror + index (subject to `policy`'s TTL) and reload the
+    /// session in place, rebuilding the name caches so fresh data backs
+    /// subsequent `search`/`info`/classification + completion. Shared by
+    /// `upgrade` (which then recomputes candidates) and `refresh` (which stops
+    /// here). Invalidates the `show` resolution cache — the mirror/db data it was
+    /// resolved against may have just changed.
+    fn reload(&mut self, policy: upgrade::FetchPolicy) -> Result<()> {
+        let session = upgrade::refresh_and_reload(self.cfg, policy)?;
+        self.caches = build_universe(session.as_ref());
+        self.session = session;
+        self.view = None;
+        Ok(())
+    }
+
+    /// Build the unified change-set table for `show` from the cached resolution,
+    /// re-deriving the approval-bearing root rows from the live cart each call
+    /// (cheap — no I/O). [`ui::transaction_table`] returns an owned [`ui::Table`]
+    /// (it holds no borrow of the cache), so `render_cart` can print it after the
+    /// borrow ends; errors bubble so the caller can fall back to the flat staged
+    /// rows — `show` must never abort.
+    fn transaction_view(&mut self, cart: &Cart) -> Result<ui::Table> {
+        self.ensure_view(cart)?;
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| Error::other("no AUR index loaded"))?;
+        let r = &self
+            .view
+            .as_ref()
+            .expect("ensure_view populated the cache on Ok")
+            .resolved;
+        let roots = txn_roots(cart, session, &r.size_pac);
+        let removals: Vec<PkgName> = cart.removals().to_vec();
+        Ok(ui::transaction_table(
+            &roots,
+            &r.repo_deps,
+            &r.aur_deps,
+            &removals,
+            &r.size_pac,
+            &r.metrics,
+        ))
+    }
+
+    /// Ensure [`Self::view`] holds a resolution valid for `cart`, re-resolving
+    /// only on a package-set change (the [`TxnKey`]) — a reload/apply already
+    /// cleared it. Propagates a resolve error so [`Self::transaction_view`] can
+    /// fall back to flat rows without caching the failure.
+    fn ensure_view(&mut self, cart: &Cart) -> Result<()> {
+        let key = TxnKey::of(cart);
+        if self.view.as_ref().is_some_and(|v| v.key == key) {
+            return Ok(());
+        }
+        let resolved = self.resolve_view(cart)?;
+        self.view = Some(CachedTxn { key, resolved });
+        Ok(())
+    }
+
+    /// Resolve the cart's package set into a [`ResolvedTxn`]: run the dependency
+    /// resolve, then from its plan derive the synced-db size snapshot, the
+    /// pulled-in dep rows, and the build-time overlay (the plan itself isn't
+    /// kept). This is the expensive I/O the cache amortises (`resolve_targets` +
+    /// two alpm opens + the metrics store), recomputed only on a package-set
+    /// change or a reload/apply.
+    fn resolve_view(&self, cart: &Cart) -> Result<ResolvedTxn> {
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| Error::other("no AUR index loaded"))?;
+        let pac = upgrade::system_pac()?;
+        let plan = self.resolve_cart(session, &pac, cart)?;
+        // Sizes from the freshly-synced db (the new versions' real download cost).
+        let size_pac = upgrade::synced_pac()?;
+        let (repo_deps, aur_deps) = upgrade::dep_rows(plan.as_ref());
+        // Roots feed only the (approval-independent) build-time overlay here; the
+        // render re-derives approval-aware roots from the live cart.
+        let roots = txn_roots(cart, session, &size_pac);
+        let metrics = upgrade::preview_metrics(session, &roots, plan.as_ref());
+        Ok(ResolvedTxn {
+            size_pac,
+            repo_deps,
+            aur_deps,
+            metrics,
+        })
+    }
+
+    /// Resolve the cart's install/build half into a [`Plan`] — the AUR rows and
+    /// fresh installs (repo *upgrades* take the `-Syu` lane, so they aren't
+    /// targets here). `None` when nothing needs the build pipeline (a
+    /// repo-upgrade-only or removal-only cart).
+    fn resolve_cart(
+        &self,
+        session: &UpgradeSession,
+        pac: &PacmanIndex,
+        cart: &Cart,
+    ) -> Result<Option<Plan>> {
+        let targets = cart.install_targets();
+        if targets.is_empty() {
+            return Ok(None);
+        }
+        let plan = build::resolve_targets(
+            self.cfg,
+            session.index(),
+            Some(session.secondary()),
+            pac,
+            &targets,
+            false,
+        )?;
+        Ok(Some(plan))
     }
 
     /// Turn the staged repo upgrades into the partial-`-Syu` selection: the
@@ -1029,11 +1329,153 @@ fn outcome_of(report: &build::RunReport) -> ApplyOutcome {
     }
 }
 
+/// Map the cart's [`Approval`] to the renderer's presentation enum — the seam
+/// that keeps `ui::change_set` from depending on `cli::shell`.
+const fn approval_cell(approval: Approval) -> ui::ApprovalCell {
+    match approval {
+        Approval::Approved => ui::ApprovalCell::Approved,
+        Approval::NeedsReview => ui::ApprovalCell::NeedsReview,
+    }
+}
+
+/// Build the numbered root rows for the unified table from the (sorted) cart,
+/// resolving each row's version pair and AUR age. `size_pac` is the synced
+/// snapshot — it carries the new repo versions for fresh repo installs.
+fn txn_roots(cart: &Cart, session: &UpgradeSession, size_pac: &PacmanIndex) -> Vec<ui::TxnRoot> {
+    let now = SystemTime::now();
+    cart.items()
+        .iter()
+        .map(|it| {
+            let (old_ver, new_ver) = row_versions(it, session, size_pac);
+            ui::TxnRoot {
+                repo: it.repo_label(),
+                approval: approval_cell(it.approval),
+                name: PkgName::from(it.spec()),
+                old_ver,
+                new_ver,
+                age: aur_age(it, session, now),
+            }
+        })
+        .collect()
+}
+
+/// The `(old, new)` versions for a row: an upgrade carries both; a fresh install
+/// has no `old` and takes `new` from the AUR index (AUR rows) or the synced
+/// syncdb (repo rows). Either fresh lookup may miss → `None` (the renderer then
+/// leaves the version cell blank but aligned).
+fn row_versions(
+    it: &CartItem,
+    session: &UpgradeSession,
+    size_pac: &PacmanIndex,
+) -> (Option<Version>, Option<Version>) {
+    if let Some(u) = &it.upgrade {
+        return (Some(u.old_ver.clone()), Some(u.new_ver.clone()));
+    }
+    let new = match it.source {
+        Source::Aur => session
+            .secondary()
+            .lookup(session.index(), it.spec())
+            .map(IndexEntry::version),
+        Source::Repo => size_pac.sync_version(it.spec()).map(Version::from),
+    };
+    (None, new)
+}
+
+/// The AUR pkgbase's "last modified" age (its branch-tip commit time vs `now`),
+/// for the table's age column. `None` for repo rows, when there's no matching
+/// index entry, or when the commit time is unrecorded (`0` in
+/// pre-`commit_time_unix` archives).
+fn aur_age(it: &CartItem, session: &UpgradeSession, now: SystemTime) -> Option<Duration> {
+    if it.source != Source::Aur {
+        return None;
+    }
+    let entry = session.secondary().lookup(session.index(), it.spec())?;
+    let secs = u64::try_from(entry.commit_time_unix)
+        .ok()
+        .filter(|&s| s > 0)?;
+    let modified = UNIX_EPOCH + Duration::from_secs(secs);
+    now.duration_since(modified).ok()
+}
+
+/// The graceful-degradation rendering for `show` when the resolve behind the
+/// unified table fails (unknown target, mirror gap): a note plus the flat staged
+/// rows, so `show` still tells the user what's in the cart instead of erroring.
+fn flat_cart_lines(cart: &Cart, err: &Error) -> Vec<String> {
+    let mut out = vec![format!(
+        "  (couldn't resolve the full change set: {err} — showing staged items)"
+    )];
+    for (i, it) in cart.items().iter().enumerate() {
+        let ver = it
+            .version_transition()
+            .map_or_else(String::new, |t| format!("  {t}"));
+        out.push(format!(
+            "{:>3}  {}  {}  {}{ver}",
+            i + 1,
+            it.repo_label(),
+            it.approval.label(),
+            it.spec(),
+        ));
+    }
+    for name in cart.removals() {
+        out.push(format!("     remove  {name}"));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::collections::HashMap;
+
+    /// The fake env's captured output: every `print`ed line, in order.
+    ///
+    /// A named domain type rather than a bare `Vec<String>` — but deliberately
+    /// *not* [`ui::Table`], which is specifically *rendered-table* lines built
+    /// only inside `ui` (and whose own doc warns against conflating it with other
+    /// string lists). This is a transcript of arbitrary shell output, exposing
+    /// the substring assertions the tests actually make rather than a raw `Vec`.
+    #[derive(Default, Debug)]
+    struct Transcript(Vec<String>);
+
+    impl Transcript {
+        fn push(&mut self, line: &str) {
+            self.0.push(line.to_owned());
+        }
+        fn clear(&mut self) {
+            self.0.clear();
+        }
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+        /// Some printed line contains `needle` — the common assertion.
+        fn contains(&self, needle: &str) -> bool {
+            self.0.iter().any(|l| l.contains(needle))
+        }
+        /// Some printed line satisfies `pred`, for compound / exact-match checks.
+        fn any(&self, pred: impl Fn(&str) -> bool) -> bool {
+            self.0.iter().any(|l| pred(l))
+        }
+        /// The whole transcript as one string, for cross-line substring checks.
+        fn joined(&self) -> String {
+            self.0.join("\n")
+        }
+    }
+
+    /// How many times a scripted env effect ran. A typed counter so the fake's
+    /// call bookkeeping reads `env.upgrades.count()` against a named type instead
+    /// of a bare `usize` that could be compared against anything.
+    #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+    struct CallCount(usize);
+
+    impl CallCount {
+        fn bump(&mut self) {
+            self.0 += 1;
+        }
+        fn count(self) -> usize {
+            self.0
+        }
+    }
 
     /// Scripted [`ShellEnv`] capturing output + recording calls, with a
     /// pre-seeded search result, name universe, classification table, and
@@ -1041,8 +1483,9 @@ mod tests {
     /// terminal, index, or alpm.
     #[derive(Default)]
     struct FakeEnv {
-        lines: Vec<String>,
-        upgrades: usize,
+        lines: Transcript,
+        upgrades: CallCount,
+        refreshes: CallCount,
         search_result: Vec<ListItem>,
         info_calls: Vec<Vec<PkgTarget>>,
         names: Vec<PkgTarget>,
@@ -1056,16 +1499,20 @@ mod tests {
         review_calls: Vec<String>,
         /// What `apply` returns; absent ⇒ `Succeeded`.
         apply_outcome: Option<ApplyOutcome>,
-        apply_calls: usize,
+        apply_calls: CallCount,
     }
 
     impl ShellEnv for FakeEnv {
         fn print(&mut self, line: &str) {
-            self.lines.push(line.to_owned());
+            self.lines.push(line);
         }
         fn upgrade(&mut self) -> Result<Vec<PkgUpgrade>> {
-            self.upgrades += 1;
+            self.upgrades.bump();
             Ok(self.upgrade_candidates.clone())
+        }
+        fn refresh(&mut self) -> Result<()> {
+            self.refreshes.bump();
+            Ok(())
         }
         fn search(&mut self, _terms: &[SearchTerm]) -> Result<Vec<ListItem>> {
             Ok(self.search_result.clone())
@@ -1077,8 +1524,13 @@ mod tests {
         fn names(&self) -> &[PkgTarget] {
             &self.names
         }
-        fn classify(&self, target: &PkgTarget) -> Option<Source> {
-            self.classes.get(target.as_str()).copied()
+        fn classify(&self, target: &PkgTarget) -> Option<StageClass> {
+            // The fake tracks only the coarse source; the concrete repo (which
+            // drives the display + `drop core`) is exercised via `upgrade`-seeded
+            // rows, whose `from_upgrade` carries the real repo name.
+            self.classes
+                .get(target.as_str())
+                .map(|&source| StageClass { source, repo: None })
         }
         fn aur_policy(&self) -> AurApproval {
             self.policy
@@ -1093,8 +1545,12 @@ mod tests {
                 .remove(target.as_str())
                 .unwrap_or(ReviewOutcome::Approved))
         }
+        fn render_cart(&mut self, _cart: &Cart) {
+            // The table rendering (color, alignment, age) is RealEnv's job; the
+            // pure dispatch core under test prints the header + summary itself.
+        }
         fn apply(&mut self, _cart: &Cart) -> Result<ApplyOutcome> {
-            self.apply_calls += 1;
+            self.apply_calls.bump();
             Ok(self.apply_outcome.take().unwrap_or(ApplyOutcome::Succeeded))
         }
     }
@@ -1112,6 +1568,16 @@ mod tests {
         ListItem {
             target: PkgTarget::new(name),
             label: label.to_owned(),
+            repo: None,
+        }
+    }
+
+    /// A list row tagged with its repo, for the `add <repo>` filter tests.
+    fn li_repo(repo: &str, name: &str) -> ListItem {
+        ListItem {
+            target: PkgTarget::new(name),
+            label: format!("{repo}/{name} 1-1"),
+            repo: Some(RepoName::from(repo)),
         }
     }
 
@@ -1146,7 +1612,6 @@ mod tests {
         assert_eq!(flow, Flow::Continue);
         assert!(
             env.lines
-                .iter()
                 .any(|l| l.contains("unknown command") && l.contains("frobnicate")),
             "got: {:?}",
             env.lines
@@ -1157,7 +1622,7 @@ mod tests {
     fn help_lists_the_core_verbs() {
         let (flow, env) = dispatch_one("help");
         assert_eq!(flow, Flow::Continue);
-        let joined = env.lines.join("\n");
+        let joined = env.lines.joined();
         for verb in ["search", "info", "add", "upgrade", "apply", "quit"] {
             assert!(joined.contains(verb), "help text missing `{verb}`");
         }
@@ -1166,7 +1631,7 @@ mod tests {
     fn up(repo: &str, name: &str) -> PkgUpgrade {
         use crate::version::Version;
         PkgUpgrade {
-            repo: repo.to_owned(),
+            repo: RepoName::from(repo),
             name: PkgName::from(name),
             old_ver: Version::from("1-1"),
             new_ver: Version::from("2-1"),
@@ -1181,7 +1646,7 @@ mod tests {
         };
         let mut state = State::default();
         state.dispatch(&command::parse("upgrade"), &mut env);
-        assert_eq!(env.upgrades, 1, "upgrade recomputes once");
+        assert_eq!(env.upgrades.count(), 1, "upgrade recomputes once");
         assert_eq!(state.cart.items().len(), 2, "both candidates staged");
         // Repo upgrade auto-approves; AUR upgrade needs review.
         assert_eq!(state.cart.pending_review().len(), 1);
@@ -1204,7 +1669,27 @@ mod tests {
     fn upgrade_with_nothing_to_do_stages_nothing() {
         let (flow, env) = dispatch_one("upgrade");
         assert_eq!(flow, Flow::Continue);
-        assert!(env.lines.iter().any(|l| l.contains("nothing to upgrade")));
+        assert!(env.lines.contains("nothing to upgrade"));
+    }
+
+    #[test]
+    fn refresh_reloads_without_seeding_or_touching_the_cart() {
+        let mut env = env_with(&[("foo", Source::Aur)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add foo"), &mut env);
+        state.dispatch(&command::parse("refresh"), &mut env);
+        assert_eq!(env.refreshes.count(), 1, "refresh re-fetches once");
+        assert_eq!(
+            env.upgrades.count(),
+            0,
+            "refresh is not an upgrade recompute"
+        );
+        assert_eq!(
+            state.cart.items().len(),
+            1,
+            "refresh leaves the cart intact"
+        );
+        assert!(env.lines.contains("refreshed"));
     }
 
     #[test]
@@ -1225,7 +1710,7 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("add nope"), &mut env);
         assert!(state.cart.is_empty());
-        assert!(env.lines.iter().any(|l| l.contains("unknown package")));
+        assert!(env.lines.contains("unknown package"));
     }
 
     #[test]
@@ -1235,7 +1720,7 @@ mod tests {
         state.dispatch(&command::parse("add foo"), &mut env);
         state.dispatch(&command::parse("add foo"), &mut env);
         assert_eq!(state.cart.items().len(), 1);
-        assert!(env.lines.iter().any(|l| l.contains("already staged")));
+        assert!(env.lines.contains("already staged"));
     }
 
     #[test]
@@ -1305,8 +1790,12 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("add yay-bin"), &mut env);
         state.dispatch(&command::parse("apply"), &mut env);
-        assert_eq!(env.apply_calls, 0, "apply must not run while pending");
-        assert!(env.lines.iter().any(|l| l.contains("needs review")));
+        assert_eq!(
+            env.apply_calls.count(),
+            0,
+            "apply must not run while pending"
+        );
+        assert!(env.lines.contains("needs review"));
     }
 
     #[test]
@@ -1315,9 +1804,9 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("add glibc"), &mut env);
         state.dispatch(&command::parse("apply"), &mut env);
-        assert_eq!(env.apply_calls, 1);
+        assert_eq!(env.apply_calls.count(), 1);
         assert!(state.cart.is_empty(), "a clean apply clears the cart");
-        assert!(env.lines.iter().any(|l| l == "done"));
+        assert!(env.lines.any(|l| l == "done"));
     }
 
     #[test]
@@ -1338,7 +1827,7 @@ mod tests {
         state.dispatch(&command::parse("add glibc"), &mut env);
         state.dispatch(&command::parse("apply"), &mut env);
         assert_eq!(state.cart.items().len(), 1, "failed apply keeps the cart");
-        assert!(env.lines.iter().any(|l| l.contains("didn't apply")));
+        assert!(env.lines.contains("didn't apply"));
     }
 
     #[test]
@@ -1355,22 +1844,73 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("add yay-bin"), &mut env);
         state.dispatch(&command::parse("show"), &mut env);
-        assert!(env.lines.iter().any(|l| l.contains("need review")));
+        assert!(env.lines.contains("need review"));
         state.dispatch(&command::parse("approve yay-bin"), &mut env);
         env.lines.clear();
         state.dispatch(&command::parse("show"), &mut env);
-        assert!(env.lines.iter().any(|l| l.contains("all approved")));
+        assert!(env.lines.contains("all approved"));
+    }
+
+    #[test]
+    fn add_reprints_the_whole_cart() {
+        // A successful stage reprints the transaction so the user sees the cart
+        // without typing `show` (post-5c UX). The pure core's `show` header is
+        // the observable proof here (the table body is RealEnv's job).
+        let mut env = env_with(&[("foo", Source::Aur)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add foo"), &mut env);
+        assert!(
+            env.lines.contains("transaction — 1 to install"),
+            "add should reprint the cart: {:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn add_no_op_stays_quiet() {
+        // An add that stages nothing (unknown package) must not reprint the cart.
+        let mut env = FakeEnv::default(); // classifies nothing
+        let mut state = State::default();
+        state.dispatch(&command::parse("add nope"), &mut env);
+        assert!(
+            !env.lines.any(|l| l.contains("transaction —")),
+            "a no-op add should not reprint: {:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn drop_reprints_the_remaining_cart() {
+        let mut env = env_with(&[("foo", Source::Aur), ("bar", Source::Repo)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add foo bar"), &mut env);
+        env.lines.clear();
+        state.dispatch(&command::parse("drop foo"), &mut env);
+        assert!(
+            env.lines.contains("transaction — 1 to install"),
+            "drop should reprint the remaining cart: {:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn remove_reprints_the_cart_with_the_removal_row() {
+        let mut env = FakeEnv::default();
+        let mut state = State::default();
+        state.dispatch(&command::parse("remove oldpkg"), &mut env);
+        assert!(
+            env.lines
+                .contains("transaction — 0 to install, 1 to remove"),
+            "remove should reprint the cart: {:?}",
+            env.lines
+        );
     }
 
     #[test]
     fn syntax_error_is_reported_not_fatal() {
         let (flow, env) = dispatch_one("add \"unterminated");
         assert_eq!(flow, Flow::Continue);
-        assert!(
-            env.lines.iter().any(|l| l.contains("syntax error")),
-            "got: {:?}",
-            env.lines
-        );
+        assert!(env.lines.contains("syntax error"), "got: {:?}", env.lines);
     }
 
     #[test]
@@ -1384,14 +1924,12 @@ mod tests {
         assert_eq!(flow, Flow::Continue);
         assert!(
             env.lines
-                .iter()
                 .any(|l| l.starts_with("  1") && l.contains("aur/foo")),
             "row 1 should be numbered: {:?}",
             env.lines
         );
         assert!(
             env.lines
-                .iter()
                 .any(|l| l.contains("  2") && l.contains("extra/bar"))
         );
         assert_eq!(state.last_list.len(), 2, "the list should be remembered");
@@ -1401,7 +1939,7 @@ mod tests {
     fn search_with_no_terms_prints_usage() {
         let (flow, env) = dispatch_one("search");
         assert_eq!(flow, Flow::Continue);
-        assert!(env.lines.iter().any(|l| l.contains("usage: search")));
+        assert!(env.lines.contains("usage: search"));
     }
 
     #[test]
@@ -1449,17 +1987,117 @@ mod tests {
         };
         state.dispatch(&command::parse("info 9"), &mut env);
         assert!(env.info_calls.is_empty(), "must not show on a bad index");
-        assert!(
-            env.lines.iter().any(|l| l.contains("info:")),
-            "got: {:?}",
-            env.lines
-        );
+        assert!(env.lines.contains("info:"), "got: {:?}", env.lines);
     }
 
     #[test]
     fn info_with_no_args_prints_usage() {
         let (flow, env) = dispatch_one("info");
         assert_eq!(flow, Flow::Continue);
-        assert!(env.lines.iter().any(|l| l.contains("usage: info")));
+        assert!(env.lines.contains("usage: info"));
+    }
+
+    fn cart_specs(state: &State) -> Vec<PkgTarget> {
+        state
+            .cart
+            .items()
+            .iter()
+            .map(|i| PkgTarget::new(i.spec()))
+            .collect()
+    }
+
+    #[test]
+    fn drop_by_repo_filter_unstages_every_aur_row() {
+        let mut env = env_with(&[
+            ("foo", Source::Aur),
+            ("bar", Source::Repo),
+            ("baz", Source::Aur),
+        ]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add foo bar baz"), &mut env);
+        state.dispatch(&command::parse("drop aur"), &mut env);
+        assert_eq!(cart_specs(&state), vec!["bar"], "`drop aur` drops AUR rows");
+    }
+
+    #[test]
+    fn drop_by_concrete_repo_filter_targets_one_sync_db() {
+        // `upgrade`-seeded rows carry their concrete repo, so a repo-name
+        // selector can single out `core` without touching `extra`/`aur`.
+        let mut env = FakeEnv {
+            upgrade_candidates: vec![
+                up("core", "glibc"),
+                up("extra", "firefox"),
+                up("aur", "yay-bin"),
+            ],
+            ..FakeEnv::default()
+        };
+        let mut state = State::default();
+        state.dispatch(&command::parse("upgrade"), &mut env);
+        state.dispatch(&command::parse("drop core"), &mut env);
+        assert_eq!(cart_specs(&state), vec!["firefox", "yay-bin"]);
+    }
+
+    #[test]
+    fn add_by_repo_filter_stages_matching_list_rows() {
+        let mut env = env_with(&[("firefox", Source::Repo), ("vim", Source::Repo)]);
+        env.search_result = vec![
+            li_repo("extra", "firefox"),
+            li_repo("core", "glibc"),
+            li_repo("extra", "vim"),
+        ];
+        let mut state = State::default();
+        // `search` remembers the list `add extra` then filters against.
+        state.dispatch(&command::parse("search x"), &mut env);
+        state.dispatch(&command::parse("add extra"), &mut env);
+        assert_eq!(cart_specs(&state), vec!["firefox", "vim"]);
+    }
+
+    #[test]
+    fn upgrade_by_repo_filter_seeds_only_that_repo() {
+        let mut env = FakeEnv {
+            upgrade_candidates: vec![up("core", "glibc"), up("aur", "yay-bin")],
+            ..FakeEnv::default()
+        };
+        let mut state = State::default();
+        state.dispatch(&command::parse("upgrade aur"), &mut env);
+        assert_eq!(cart_specs(&state), vec!["yay-bin"]);
+    }
+
+    #[test]
+    fn approve_by_repo_filter_clears_every_aur_row() {
+        let mut env = env_with(&[("a", Source::Aur), ("b", Source::Aur), ("c", Source::Repo)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add a b c"), &mut env);
+        state.dispatch(&command::parse("approve aur"), &mut env);
+        assert!(
+            state.cart.all_approved(),
+            "`approve aur` clears the AUR gate"
+        );
+    }
+
+    #[test]
+    fn expand_repo_tokens_expands_known_repos_and_passes_others_through() {
+        let rows = vec![
+            RepoRow {
+                target: PkgTarget::new("glibc"),
+                repo: Some(RepoName::from("core")),
+            },
+            RepoRow {
+                target: PkgTarget::new("yay-bin"),
+                repo: Some(RepoName::from("aur")),
+            },
+        ];
+        // A repo name expands to its rows' targets…
+        assert_eq!(expand_repo_tokens(&[s("aur")], &rows), vec!["yay-bin"]);
+        // …case-insensitively…
+        assert_eq!(expand_repo_tokens(&[s("CORE")], &rows), vec!["glibc"]);
+        // …while numbers, names, and globs pass through untouched.
+        assert_eq!(expand_repo_tokens(&[s("3")], &rows), vec!["3"]);
+        assert_eq!(expand_repo_tokens(&[s("nginx")], &rows), vec!["nginx"]);
+        assert_eq!(expand_repo_tokens(&[s("py-*")], &rows), vec!["py-*"]);
+    }
+
+    fn s(t: &str) -> String {
+        t.to_owned()
     }
 }
