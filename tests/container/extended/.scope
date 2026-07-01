@@ -54,6 +54,9 @@
 #    shell_cart_e2e PTY driver)
 #   (landed: 04_shell_upgrade_repo.sh — upgrade → preview+size-guard → apply, via
 #    the shell_upgrade_e2e PTY driver; folds in the retired 05 size guard)
+#   (landed: 08_shell_search_seed.sh — bare-term launch `gaur <term>` opens the
+#    shell seeded with that search; add-by-number stages it, via the
+#    shell_search_seed_e2e PTY driver)
 #   - shell_upgrade_aur_built_tag.sh     (AUR upgrade with a pre-built artifact →
 #       the apply preview's change-set row carries `built`; ports the retired
 #       06_loop_built_tag now that the picker is gone)

@@ -49,6 +49,19 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::path::Path;
 
+/// Where a search regex matched a package name — at its start or inside it.
+///
+/// The position-aware companion to [`PkgName::matches_regex`]: search ranking
+/// tiers a name-prefix hit above a mere substring one, so it needs the
+/// *position*, not just a yes/no.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameMatch {
+    /// The regex matched starting at the first character.
+    Prefix,
+    /// The regex matched, but not at the start.
+    Inside,
+}
+
 /// One pacman pkgname (the entity `pacman -Q` reports, the unit of a
 /// localdb entry). For split AUR pkgbases there's more than one per
 /// pkgbase; for non-split pkgs `PkgName == PkgBase` lexically.
@@ -202,6 +215,19 @@ macro_rules! impl_name_wrapper {
             /// operation, not a downgrade.
             pub fn matches_regex(&self, r: &Regex) -> bool {
                 r.is_match(&self.0)
+            }
+            /// Where `r` matches this name — anchored at the start, inside, or
+            /// not at all (`None`). The position-aware companion to
+            /// [`Self::matches_regex`]; search ranking uses it to rank a
+            /// name-prefix hit above a substring one.
+            pub fn regex_anchor(&self, r: &Regex) -> Option<NameMatch> {
+                r.find(&self.0).map(|m| {
+                    if m.start() == 0 {
+                        NameMatch::Prefix
+                    } else {
+                        NameMatch::Inside
+                    }
+                })
             }
             /// Prefix test as a domain operation — keeps cluster/family
             /// checks (e.g. `python38-*`) from reaching into the inner

@@ -33,7 +33,7 @@ pub mod print;
 pub mod review;
 pub mod upgrade;
 
-pub use upgrade::{UpgradeSession, cmd_query_upgrades, collect_upgrade_plan};
+pub use upgrade::{DevelPolicy, UpgradeSession, cmd_query_upgrades, collect_upgrade_plan};
 
 /// Read-only mirror of [`prepare_one`]'s idempotency check.
 ///

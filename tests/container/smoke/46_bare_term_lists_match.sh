@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Bare `gaur <term>` is the yay parity shortcut for AUR fuzzy search →
-# interactive multi-select → install. With no TTY (the container runs
-# headless), the picker degrades to "print matches and exit 0" instead of
-# auto-installing every regex hit — an explicit safety call. This test
-# pins that behaviour so a future refactor doesn't silently start
+# Bare `gaur <term>` is the yay parity shortcut for a repo+AUR fuzzy search.
+# Interactively it launches the shell REPL seeded with the search; with no TTY
+# (the container runs headless) it degrades to "print the ranked matches and
+# exit 0" instead of auto-installing every regex hit — an explicit safety call.
+# This test pins that behaviour so a future refactor doesn't silently start
 # installing matched packages in non-interactive contexts.
 source /work/tests/container/lib.sh
 bootstrap; reset_state

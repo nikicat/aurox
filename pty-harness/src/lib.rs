@@ -42,6 +42,13 @@ impl Pty {
     /// with no args — the upgrade loop — inheriting the container env so it
     /// finds its config, the mock mirror, pacman, sudo, and makepkg.
     pub fn spawn_gaur() -> Self {
+        Self::spawn_gaur_args(&[])
+    }
+
+    /// Like [`Self::spawn_gaur`] but passes `args` to `gaur`. Used to drive the
+    /// bare-term launch (`gaur <term>…`), which opens the shell *seeded* with
+    /// that `search` instead of the plain upgrade-loop prompt.
+    pub fn spawn_gaur_args(args: &[&str]) -> Self {
         let gaur = std::env::args()
             .nth(1)
             .or_else(|| std::env::var("GITAUR").ok())
@@ -57,6 +64,9 @@ impl Pty {
             .expect("openpty");
 
         let mut cmd = CommandBuilder::new(&gaur);
+        for a in args {
+            cmd.arg(a);
+        }
         for (k, v) in std::env::vars() {
             cmd.env(k, v);
         }

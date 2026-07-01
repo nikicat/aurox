@@ -23,9 +23,9 @@
 //! so the cart mutations and the approval gate are exercised without a
 //! terminal, index, or `makepkg`.
 
-use crate::build::{self, ConfirmGate, InstallOpts, UpgradeSession, review};
+use crate::build::{self, ConfirmGate, DevelPolicy, InstallOpts, UpgradeSession, review};
 use crate::cli::dispatch;
-use crate::cli::search::Row;
+use crate::cli::search::{Row, rank_rows};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::{self, IndexEntry};
@@ -236,7 +236,13 @@ impl State {
                         .join(" ");
                     env.print(&format!("no packages match `{joined}`"));
                 } else {
-                    for (i, item) in items.iter().enumerate() {
+                    // `items` is best-first (row 1 = best). Print it worst-first
+                    // so the strongest matches land at the bottom, next to the
+                    // prompt the shell scrolls to — and the low, easy-to-type
+                    // numbers are the good ones. The numbers still key the
+                    // best-first `last_list`, so `add 1` is always the top match
+                    // regardless of print direction.
+                    for (i, item) in items.iter().enumerate().rev() {
                         env.print(&format!("{:>3}  {}", i + 1, item.label));
                     }
                 }
@@ -733,9 +739,14 @@ selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
            `aur`/`core`/… (whole repo — e.g. `drop aur`, `add extra`)";
 
 /// Run the interactive shell. Returns the desired process exit code.
+///
+/// `initial_search` seeds the session: when launched via the bare-positional
+/// shortcut (`gaur <term>…`), dispatch passes the typed terms here and the shell
+/// runs one `search` before the prompt loop — identical to starting the shell
+/// and typing `search <term>…`. Empty for the plain no-arg `gaur` launch.
 #[instrument(skip(cfg))]
-pub fn run(cfg: &Config, devel: bool) -> Result<u8> {
-    info!(devel, "shell session start");
+pub fn run(cfg: &Config, devel: DevelPolicy, initial_search: &[SearchTerm]) -> Result<u8> {
+    info!(devel = ?devel, terms = initial_search.len(), "shell session start");
     // Once per session: load the AUR index (+ secondary maps) and the name
     // universe. Not repeated per command; `refresh` (later phase) re-fetches.
     let session = UpgradeSession::load(cfg)?;
@@ -758,6 +769,13 @@ pub fn run(cfg: &Config, devel: bool) -> Result<u8> {
     env.print("gitaur shell — type `help` for commands, `quit` to leave");
     if env.session.is_none() {
         env.print("no AUR index yet — run `gaur -Sy` to enable AUR search/info");
+    }
+
+    // Seed the session with the launch-time search (`gaur <term>…`): run it once
+    // up front so the numbered result list is on screen before the first prompt,
+    // exactly as if the user had typed `search <term>…`.
+    if !initial_search.is_empty() {
+        state.dispatch(&Command::Search(initial_search.to_vec()), &mut env);
     }
 
     let helper = ShellHelper::new(Rc::clone(&env.caches.universe));
@@ -862,7 +880,7 @@ fn cart_targets(state: &State) -> Vec<PkgTarget> {
 /// the existing loop.
 struct RealEnv<'a> {
     cfg: &'a Config,
-    devel: bool,
+    devel: DevelPolicy,
     session: Option<UpgradeSession>,
     caches: NameCaches,
     /// Cached resolution of the cart's package set for `show` — see
@@ -956,21 +974,19 @@ impl ShellEnv for RealEnv<'_> {
             .map(SearchTerm::compile)
             .collect::<std::result::Result<_, _>>()?;
         let color = ui::color_on();
-        // Repo hits first (yay/paru "official repos on top"); they need no index.
         let mut rows: Vec<Row<'_>> = alpm_db::search_sync(terms)?
             .into_iter()
             .map(Row::Repo)
             .collect();
         if let Some(session) = &self.session {
-            let mut aur = session.secondary().search(session.index(), &regexes);
-            // Freshest commit first, pkgbase tie-break — same order as `-Ss`.
-            aur.sort_by(|a, b| {
-                b.commit_time_unix
-                    .cmp(&a.commit_time_unix)
-                    .then_with(|| a.pkgbase.cmp(&b.pkgbase))
-            });
+            let aur = session.secondary().search(session.index(), &regexes);
             rows.extend(aur.into_iter().map(Row::Aur));
         }
+        // Rank the merged repo+AUR list best-first (name-prefix > substring >
+        // description; shorter names win; AUR ties break freshest-first).
+        // `State::search` prints this reversed, so row 1 — the best match — lands
+        // right above the prompt.
+        rank_rows(&mut rows, &regexes);
         Ok(rows
             .iter()
             .map(|r| ListItem {

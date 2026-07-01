@@ -31,7 +31,11 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
     if f.op.is_none() && f.positional.is_empty() {
         let interactive = !cli.noconfirm && std::io::stdin().is_terminal();
         if interactive {
-            return shell::run(cfg, cli.devel || cfg.devel);
+            return shell::run(
+                cfg,
+                build::DevelPolicy::from_enabled(cli.devel || cfg.devel),
+                &[],
+            );
         }
         // Non-interactive bare `gaur` (cron / pipe / `--noconfirm`) is a plain
         // `pacman -Syu --noconfirm` — there's no human to answer pacman's
@@ -44,15 +48,34 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
         Some('S') => handle_s(cfg, cli, &f, argv),
         // Pre-scan in `cli::run` only routes the bare `-Qu` form here; every
         // other Q variant is plain pacman territory and never reaches dispatch.
-        Some('Q') => build::cmd_query_upgrades(cfg, cli.devel || cfg.devel || f.has_long("devel")),
+        Some('Q') => build::cmd_query_upgrades(
+            cfg,
+            build::DevelPolicy::from_enabled(cli.devel || cfg.devel || f.has_long("devel")),
+        ),
         Some(other) => Err(Error::other(format!(
             "unsupported gitaur op `-{other}` (pacman pass-through goes via the pre-scan, this dispatch is `-S` / `-Qu` only)"
         ))),
-        // yay parity: `gaur <term>...` with no operation letter is a
-        // fuzzy search across the AUR index → interactive multi-select →
-        // install. The empty-positional branch above already absorbed the
-        // no-op-and-no-target case, so reaching here means we have terms.
-        None => search::cmd_search_install(cfg, cli, &search_terms(&f.positional)),
+        // yay parity: `gaur <term>...` with no operation letter is a fuzzy
+        // search across the sync repos + AUR index. Interactively this launches
+        // the shell REPL seeded with the search — identical to starting the
+        // shell and typing `search <term>…` (no picker; the REPL is the one
+        // interactive surface). Non-interactively (a pipe / `--noconfirm`) it
+        // just lists the ranked matches, installing nothing. The empty-positional
+        // branch above already absorbed the no-op-and-no-target case, so reaching
+        // here means we have terms.
+        None => {
+            let terms = search_terms(&f.positional);
+            let interactive = !cli.noconfirm && std::io::stdin().is_terminal();
+            if interactive {
+                shell::run(
+                    cfg,
+                    build::DevelPolicy::from_enabled(cli.devel || cfg.devel),
+                    &terms,
+                )
+            } else {
+                search::cmd_search_install(cfg, &terms)
+            }
+        }
     }
 }
 

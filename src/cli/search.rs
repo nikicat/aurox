@@ -1,17 +1,17 @@
-//! `gaur <term>...` — yay-style fuzzy search → multi-select → install.
+//! `gaur <term>...` — yay-style fuzzy search across the sync repos + the AUR.
 //!
 //! Wired up from [`crate::cli::dispatch`] for the no-operation-letter case.
-//! Shows sync-repo packages alongside AUR ones (like yay/paru): repo hits
-//! first in pacman.conf precedence order, then AUR hits sorted freshest-commit
-//! first. Picked rows are routed through [`crate::build::cmd_install`], which
-//! re-classifies each name (pacman wins over AUR) and installs accordingly.
+//! Interactively, dispatch launches the shell REPL seeded with this search
+//! (see [`crate::cli::shell`]) — there is no picker; the REPL is the one
+//! interactive surface. This module owns the *non-interactive* path (a pipe or
+//! `--noconfirm`): it merges sync-repo and AUR matches into one relevance-ranked
+//! list (see [`rank_rows`]) and prints it, installing nothing. The [`Row`] model
+//! and its labels are shared with the shell so both render matches identically.
 
-use crate::build::{self, Target};
-use crate::cli::Cli;
 use crate::config::Config;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::index::{self, IndexEntry, secondary::Secondary};
-use crate::names::{PkgTarget, SearchTerm};
+use crate::names::{NameMatch, PkgTarget, SearchTerm};
 use crate::pacman::alpm_db::{self, RepoHit};
 use crate::pacman::invoke::REPO_AUR;
 use crate::paths;
@@ -19,9 +19,8 @@ use crate::runopts;
 use crate::ui;
 
 use console::style;
-use dialoguer::MultiSelect;
-use std::io::IsTerminal;
-use tracing::{debug, info, instrument};
+use std::cmp::Ordering;
+use tracing::{info, instrument};
 
 /// One search hit — either a sync-repo package or an AUR pkgbase.
 ///
@@ -57,8 +56,9 @@ impl Row<'_> {
         }
     }
 
-    /// The display label for this row (no leading number/checkbox), colored
-    /// per `color`. The plain form is also what dialoguer measures for width.
+    /// The display label for this row (no leading number), colored per `color`.
+    /// The shell prefixes it with the row number; the non-interactive listing
+    /// prints the plain form as-is.
     pub(crate) fn label(&self, color: bool) -> String {
         if color {
             label_colored(self)
@@ -68,31 +68,20 @@ impl Row<'_> {
     }
 }
 
-/// Outcome of the picker step — distinguishes the three terminal states the
-/// caller must dispatch on differently:
-///   * `Listed` — non-interactive (no TTY or `--noconfirm`); the search hits
-///     were printed to stdout, nothing to install. The caller returns `Ok(0)`
-///     so `gaur foo | head` is a legitimate "search" pipeline.
-///   * `Picked` — interactive: the user kept at least one row. Caller routes
-///     into `build::cmd_install`.
-///   * `Aborted` — interactive: the user explicitly cleared every row. Caller
-///     returns `Error::UserAbort` so scripts can detect the abort.
-enum PickOutcome {
-    Listed,
-    Picked(Vec<PkgTarget>),
-    Aborted,
-}
-
-/// Entry point for the bare-positional shortcut.
+/// Entry point for the bare-positional shortcut in a **non-interactive** run
+/// (a pipe, or `--noconfirm`).
 ///
-/// `terms` are the freeform regex fragments the user typed; they're combined
-/// as an AND filter (same semantics as `-Ss`). Sync-repo and AUR matches land
-/// in a single picker so the user can pick across both sources in one pass.
+/// The interactive case never reaches here — [`crate::cli::dispatch`] launches
+/// the shell REPL seeded with the search instead, so there is no picker (the
+/// REPL is the one interactive surface).
+///
+/// `terms` are the freeform regex fragments the user typed, combined as an AND
+/// filter (same semantics as `-Ss`). Sync-repo and AUR matches are merged into
+/// one relevance-ranked list ([`rank_rows`]) and printed best-first — so
+/// `gaur foo | head` surfaces the strongest hits. Nothing is installed:
+/// auto-installing every regex hit is too dangerous without a human in the loop.
 #[instrument(skip(cfg))]
-pub fn cmd_search_install(cfg: &Config, cli: &Cli, terms: &[SearchTerm]) -> Result<u8> {
-    let noconfirm = cli.noconfirm;
-    let asdeps = cli.asdeps;
-
+pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
     let regexes: Vec<regex::Regex> = terms
         .iter()
         .map(SearchTerm::compile)
@@ -122,25 +111,22 @@ pub fn cmd_search_install(cfg: &Config, cli: &Cli, terms: &[SearchTerm]) -> Resu
     let aur_hits: Vec<&IndexEntry> = match idx.as_ref() {
         Some(idx) => {
             let by = Secondary::build(idx);
-            let mut hits = by.search(idx, &regexes);
-            // Freshest commit first; tie-break on pkgbase so equal timestamps
-            // (common in fixtures, possible in the wild) stay deterministic.
-            hits.sort_by(|a, b| {
-                b.commit_time_unix
-                    .cmp(&a.commit_time_unix)
-                    .then_with(|| a.pkgbase.cmp(&b.pkgbase))
-            });
-            hits
+            by.search(idx, &regexes)
         }
         None => Vec::new(),
     };
-    info!(
-        repo = repo_hits.len(),
-        aur = aur_hits.len(),
-        "search results"
-    );
 
-    if repo_hits.is_empty() && aur_hits.is_empty() {
+    // Repo and AUR rows share one relevance-ranked list (unlike yay's fixed
+    // "repos on top", `rank_rows` interleaves both sources by match quality).
+    let mut rows: Vec<Row<'_>> = repo_hits
+        .into_iter()
+        .map(Row::Repo)
+        .chain(aur_hits.into_iter().map(Row::Aur))
+        .collect();
+    rank_rows(&mut rows, &regexes);
+    info!(rows = rows.len(), "search results");
+
+    if rows.is_empty() {
         ui::info(&format!(
             "no packages match `{}`",
             terms
@@ -152,75 +138,159 @@ pub fn cmd_search_install(cfg: &Config, cli: &Cli, terms: &[SearchTerm]) -> Resu
         return Ok(0);
     }
 
-    // Repo rows first (yay/paru "official repos on top"), AUR rows after in
-    // freshest-first order.
-    let rows: Vec<Row<'_>> = repo_hits
-        .into_iter()
-        .map(Row::Repo)
-        .chain(aur_hits.into_iter().map(Row::Aur))
-        .collect();
+    // Plain labels (no ANSI) keep the listing pipe-clean; best-first order means
+    // a `… | head` shows the strongest matches.
+    for row in &rows {
+        println!("{}", label_plain(row));
+    }
+    Ok(0)
+}
 
-    match pick(&rows, noconfirm)? {
-        PickOutcome::Listed => Ok(0),
-        PickOutcome::Aborted => Err(Error::UserAbort),
-        PickOutcome::Picked(selected) => {
-            debug!(picked = selected.len(), "search-install selection");
-            // `Target.spec` is the freeform argv-shaped string, so
-            // `into_inner()` is the sanctioned name→String boundary here.
-            let targets: Vec<Target> = selected
-                .into_iter()
-                .map(|t| Target::bare(t.into_inner()))
-                .collect();
-            build::cmd_install(cfg, &targets, noconfirm, asdeps, false)
-        }
+/// Rank + sort merged repo/AUR search `rows` in place, best match first.
+///
+/// The order the shell list and the non-interactive listing both use:
+///   1. **match tier** — a package-name *prefix* match beats a name *substring*
+///      match beats a *description-only* match. (`regexes` is already applied as
+///      the AND filter that produced `rows`, so every row matches *somewhere*;
+///      the tier records *where*.)
+///   2. **shorter name wins** within a tier — `claude` before `claude-desktop`.
+///   3. repo rows sit ahead of AUR rows of otherwise-equal rank (pacman owns the
+///      name), then AUR ties break **freshest-commit-first**, then name, for a
+///      stable total order.
+///
+/// `pub(crate)` so [`crate::cli::shell`] ranks its combined list identically.
+pub(crate) fn rank_rows(rows: &mut [Row<'_>], regexes: &[regex::Regex]) {
+    rows.sort_by_cached_key(|r| rank_key(r, regexes));
+}
+
+/// The total-order sort key for one row — see [`rank_rows`] for the field
+/// meanings. Field declaration order *is* the comparison order (derived `Ord`).
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct RankKey {
+    tier: MatchTier,
+    name_len: usize,
+    source: SourceRank,
+    /// Breaks AUR ties freshest-commit-first; repo rows all tie here (they've
+    /// already been separated by `source`).
+    freshness: Freshness,
+    /// Final lexical tie-break — the row's install identity (`PkgTarget`).
+    name: PkgTarget,
+}
+
+/// A row's freshness for ranking: its AUR branch-tip commit time, ordered so
+/// **fresher sorts first** — a later commit is the better tie-break. Wrapping
+/// the raw [`IndexEntry::commit_time_unix`] keeps that "fresher wins" polarity
+/// in one place (an `impl Ord`) instead of scattering a bare `Reverse<i64>`
+/// through the sort key.
+#[derive(PartialEq, Eq)]
+struct Freshness(i64);
+
+impl Freshness {
+    /// Rows with no commit of their own (repo packages) — older than any real
+    /// AUR commit, so they never win a freshness tie-break.
+    const STALE: Self = Self(i64::MIN);
+}
+
+impl Ord for Freshness {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Larger commit time = fresher = "less", so it lands first in the
+        // best-first `RankKey` order.
+        other.0.cmp(&self.0)
     }
 }
 
-/// Render the picker (or, when non-interactive, dump labels to stdout and
-/// install nothing — auto-installing every regex hit is too dangerous to do
-/// without a human in the loop; the user can re-run interactively or with
-/// `-S <pkg>` once they know the exact pkgname).
-fn pick(rows: &[Row<'_>], noconfirm: bool) -> Result<PickOutcome> {
-    let labels_plain: Vec<String> = rows.iter().map(label_plain).collect();
-
-    let interactive = !noconfirm && std::io::stdin().is_terminal();
-    if !interactive {
-        // Pipelines (`gaur foo | grep …`) and `--noconfirm` callers both
-        // land here. We print the matches so the search itself is useful and
-        // exit cleanly so the shell doesn't treat the listing as a failure.
-        for l in &labels_plain {
-            println!("{l}");
-        }
-        return Ok(PickOutcome::Listed);
+impl PartialOrd for Freshness {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
+}
 
-    let labels_colored: Vec<String>;
-    let labels_display: &[String] = if ui::color_on() {
-        labels_colored = rows.iter().map(label_colored).collect();
-        &labels_colored
-    } else {
-        &labels_plain
+/// Where the query matched a package's name, best to worst. Only the name
+/// decides the tier; a hit that reached the row purely through its description
+/// (or `provides`) lands in [`MatchTier::Desc`].
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchTier {
+    /// Some name starts with the query.
+    Prefix,
+    /// Some name contains the whole query, but none as a prefix.
+    Substring,
+    /// No single name carries the whole query — it matched the description.
+    Desc,
+}
+
+/// Repo rows sort ahead of AUR rows when everything else ties.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum SourceRank {
+    Repo,
+    Aur,
+}
+
+fn rank_key(row: &Row<'_>, regexes: &[regex::Regex]) -> RankKey {
+    // `picked()` is the row's install identity (repo pkgname / AUR pkgbase) —
+    // the same name the label shows, reused here for the length + lexical keys.
+    let name = row.picked();
+    let (source, freshness) = match row {
+        Row::Repo(_) => (SourceRank::Repo, Freshness::STALE),
+        Row::Aur(e) => (SourceRank::Aur, Freshness(e.commit_time_unix)),
     };
-
-    let chosen = MultiSelect::new()
-        .with_prompt("Select packages to install (space toggles, enter confirms)")
-        .items(labels_display)
-        // Same rationale as the upgrade picker: dialoguer would otherwise
-        // re-list every selected row as a single wrapped line that duplicates
-        // the picker output. We print our own short summary instead.
-        .report(false)
-        .interact()
-        .map_err(|e| Error::other(format!("search picker: {e}")))?;
-
-    if chosen.is_empty() {
-        return Ok(PickOutcome::Aborted);
+    RankKey {
+        tier: match_tier(row, regexes),
+        name_len: name.len(),
+        source,
+        freshness,
+        name,
     }
-    Ok(PickOutcome::Picked(
-        chosen.into_iter().map(|i| rows[i].picked()).collect(),
-    ))
 }
 
-/// One picker row, plain ASCII — fed to dialoguer for width math.
+/// The best (lowest) tier any of a row's names achieves against the whole query.
+///
+/// A row's names are its display name plus — for AUR split packages — each
+/// member pkgname, so a query hitting only a member still counts as a name
+/// match, not a description one. Each name is tiered through its typed
+/// `regex_anchor` (on `PkgName` / `PkgBase`); `name_tier` combines the per-term
+/// anchors into a [`MatchTier`].
+fn match_tier(row: &Row<'_>, regexes: &[regex::Regex]) -> MatchTier {
+    match row {
+        Row::Repo(r) => name_tier(|re| r.name.regex_anchor(re), regexes),
+        Row::Aur(e) => e
+            .pkgnames
+            .iter()
+            .map(|p| name_tier(|re| p.name.regex_anchor(re), regexes))
+            .fold(
+                name_tier(|re| e.pkgbase.regex_anchor(re), regexes),
+                MatchTier::min,
+            ),
+    }
+}
+
+/// Tier one name against the whole query, given `anchor` — where each term
+/// matches that name. The query is an AND, so the name has to satisfy *every*
+/// term (`anchor` returning `Some`) to count as a name match at all: it's
+/// `Prefix` when some term anchors at the name's start, `Substring` when all
+/// terms match but none anchors, else `Desc` (the row was pulled in by its
+/// description). The typed [`NameMatch`] keeps an anchored query like `^foo$`
+/// classified as the exact-name match it is.
+fn name_tier(
+    anchor: impl Fn(&regex::Regex) -> Option<NameMatch>,
+    regexes: &[regex::Regex],
+) -> MatchTier {
+    let mut any_prefix = false;
+    for r in regexes {
+        match anchor(r) {
+            Some(NameMatch::Prefix) => any_prefix = true,
+            Some(NameMatch::Inside) => {}
+            None => return MatchTier::Desc,
+        }
+    }
+    if any_prefix {
+        MatchTier::Prefix
+    } else {
+        MatchTier::Substring
+    }
+}
+
+/// One result row, plain ASCII (no ANSI) — the pipe-clean listing form and the
+/// base the shell prefixes its row number onto.
 fn label_plain(row: &Row<'_>) -> String {
     match row {
         Row::Repo(r) => {
@@ -318,9 +388,9 @@ mod tests {
         }
     }
 
-    /// `label_plain` is the byte-exact string dialoguer measures for wrap
-    /// width — must stay free of ANSI escapes, must surface pkgbase / version
-    /// / description so the user has enough to pick from.
+    /// `label_plain` is the pipe-clean listing form — must stay free of ANSI
+    /// escapes and surface pkgbase / version / description so the user has
+    /// enough to act on.
     #[test]
     fn aur_label_plain_no_ansi_and_has_all_pieces() {
         let l = label_plain(&Row::Aur(&mk("foo", Some("does foo"), None)));
@@ -380,25 +450,122 @@ mod tests {
         assert_eq!(Row::Aur(&e).picked(), PkgTarget::from("bisq"));
     }
 
-    /// Freshest-commit-first ordering with a deterministic pkgbase tie-break.
-    /// Mirrors the sort in `cmd_search_install` so a refactor that drops the
-    /// `commit_time_unix` key (reverting to alphabetical) fails here.
+    /// Compile domain search terms into the regexes ranking consumes.
+    fn compiled(terms: &[SearchTerm]) -> Vec<regex::Regex> {
+        terms.iter().map(|t| t.compile().unwrap()).collect()
+    }
+
+    /// Rank `rows` against `terms` and return the install identities in order.
+    fn ranked(mut rows: Vec<Row<'_>>, terms: &[SearchTerm]) -> Vec<PkgTarget> {
+        rank_rows(&mut rows, &compiled(terms));
+        rows.iter().map(Row::picked).collect()
+    }
+
+    /// The primary key: a name-prefix hit outranks a name-substring hit, which
+    /// outranks a description-only hit.
     #[test]
-    fn aur_hits_sort_by_commit_time_desc_then_pkgbase() {
-        let mut a = mk("alpha", None, None);
-        a.commit_time_unix = 100;
-        let mut b = mk("bravo", None, None);
-        b.commit_time_unix = 300;
-        let mut c = mk("charlie", None, None);
-        c.commit_time_unix = 300; // ties with bravo → pkgbase order
-        let mut hits = [&a, &b, &c];
-        hits.sort_by(|x, y| {
-            y.commit_time_unix
-                .cmp(&x.commit_time_unix)
-                .then_with(|| x.pkgbase.cmp(&y.pkgbase))
+    fn rank_orders_prefix_then_substring_then_desc() {
+        let substr = mk("py-claude", None, None); // "claude" at index 3
+        let prefix = mk("claude", None, None);
+        let desc = mk("toolkit", Some("wraps claude"), None); // name lacks the term
+        let rows = vec![Row::Aur(&substr), Row::Aur(&desc), Row::Aur(&prefix)];
+        assert_eq!(
+            ranked(rows, &[SearchTerm::new("claude")]),
+            [
+                PkgTarget::from("claude"),
+                PkgTarget::from("py-claude"),
+                PkgTarget::from("toolkit"),
+            ]
+        );
+    }
+
+    /// Within a tier, the shorter name wins.
+    #[test]
+    fn rank_prefers_shorter_name_within_tier() {
+        let long = mk("claude-desktop", None, None);
+        let short = mk("claude", None, None);
+        let rows = vec![Row::Aur(&long), Row::Aur(&short)];
+        assert_eq!(
+            ranked(rows, &[SearchTerm::new("claude")]),
+            [PkgTarget::from("claude"), PkgTarget::from("claude-desktop")]
+        );
+    }
+
+    /// Equal tier + equal name length: a repo row sorts ahead of an AUR one.
+    #[test]
+    fn rank_puts_repo_ahead_of_aur_on_equal_match() {
+        let aur = mk("claude", None, None);
+        let mut rows = vec![Row::Aur(&aur), Row::Repo(repo("claude", None, false))];
+        rank_rows(&mut rows, &compiled(&[SearchTerm::new("claude")]));
+        assert!(matches!(rows[0], Row::Repo(_)), "repo should lead the tie");
+        assert!(matches!(rows[1], Row::Aur(_)));
+    }
+
+    /// `Freshness` is the domain key behind the AUR tie-break: a newer commit
+    /// sorts *before* an older one, and repo rows' `STALE` sorts last.
+    #[test]
+    fn freshness_orders_newer_before_older() {
+        assert!(Freshness(900) < Freshness(100));
+        assert!(Freshness(100) < Freshness::STALE);
+    }
+
+    /// End to end, that tie-break beats the lexical fallback (`aaa-` would
+    /// otherwise precede `zzz-`): the fresher pkgbase leads.
+    #[test]
+    fn rank_breaks_aur_ties_by_freshest_commit() {
+        let mut old = mk("aaa-claude", None, None);
+        old.commit_time_unix = 100;
+        let mut fresh = mk("zzz-claude", None, None);
+        fresh.commit_time_unix = 900;
+        let rows = vec![Row::Aur(&old), Row::Aur(&fresh)];
+        assert_eq!(
+            ranked(rows, &[SearchTerm::new("claude")]),
+            [PkgTarget::from("zzz-claude"), PkgTarget::from("aaa-claude")]
+        );
+    }
+
+    /// An anchored regex (`^name$`) still classifies as an exact name-prefix
+    /// match — the tier is computed from the compiled regex, not raw text.
+    #[test]
+    fn rank_treats_anchored_regex_as_name_prefix() {
+        let hit = mk("test-trivial", None, None);
+        let miss = mk("unrelated", None, None);
+        let rx = compiled(&[SearchTerm::new("^test-trivial$")]);
+        assert_eq!(match_tier(&Row::Aur(&hit), &rx), MatchTier::Prefix);
+        assert_eq!(match_tier(&Row::Aur(&miss), &rx), MatchTier::Desc);
+    }
+
+    /// Multi-term AND: a name-tier match needs *every* term in the name. Here
+    /// `python-claude` carries both (→ prefix), while `claude-cli` has "python"
+    /// only in its description (→ desc), so it ranks lower.
+    #[test]
+    fn rank_multi_term_requires_all_terms_in_name() {
+        let both = mk("python-claude", None, None);
+        let one = mk("claude-cli", Some("a python helper"), None);
+        let rows = vec![Row::Aur(&one), Row::Aur(&both)];
+        assert_eq!(
+            ranked(
+                rows,
+                &[SearchTerm::new("python"), SearchTerm::new("claude")]
+            ),
+            [
+                PkgTarget::from("python-claude"),
+                PkgTarget::from("claude-cli")
+            ]
+        );
+    }
+
+    /// A split package's member pkgname counts as a name match, not a
+    /// description one — so a query hitting only a member still ranks by name.
+    #[test]
+    fn rank_member_pkgname_counts_as_name_match() {
+        let mut e = mk("widgets", None, None);
+        e.pkgnames.push(Pkgname {
+            name: PkgName::new("libclaude"),
+            provides: Vec::new(),
+            pkgdesc: None,
         });
-        assert_eq!(hits[0].pkgbase, "bravo");
-        assert_eq!(hits[1].pkgbase, "charlie");
-        assert_eq!(hits[2].pkgbase, "alpha");
+        let rx = compiled(&[SearchTerm::new("claude")]);
+        assert_eq!(match_tier(&Row::Aur(&e), &rx), MatchTier::Substring);
     }
 }

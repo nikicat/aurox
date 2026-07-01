@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # yay parity: bare `gaur <term>` searches the sync repos AND the AUR index,
-# listing both in one picker (older gitaur only searched the AUR). Headless,
-# the picker degrades to "print matches, install nothing" — so this pins that
+# ranking both in one merged list (older gitaur only searched the AUR).
+# Headless, it degrades to "print matches, install nothing" — so this pins that
 # a repo package and an AUR package both appear in that listing for a query
 # that matches each.
 source /work/tests/container/lib.sh
