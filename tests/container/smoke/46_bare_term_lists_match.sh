@@ -13,7 +13,9 @@ assert_exit 0
 
 gaur "^test-trivial$"
 assert_exit 0
-assert_stdout_contains "aur/test-trivial"
+# The aligned table renders repo + name as separate columns (like the upgrade
+# table), so the row reads `aur   test-trivial …` rather than `aur/test-trivial`.
+assert_stdout_contains "test-trivial"
 
 # Nothing should have been built or installed — the non-interactive path
 # only lists matches. Asserts the safety promise above.

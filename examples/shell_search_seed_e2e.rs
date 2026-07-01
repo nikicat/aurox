@@ -25,9 +25,10 @@ fn main() {
     // The shell still prints its banner…
     pty.expect("shell banner", |s| s.contains("gitaur shell"));
     // …and the seeded search ran before the prompt: the numbered row is on
-    // screen without the user typing `search`.
+    // screen without the user typing `search`. The aligned table renders repo +
+    // name as separate columns, so the row reads `1  aur   test-trivial …`.
     pty.expect("seeded result row", |s| {
-        s.contains("aur/test-trivial") && s.contains("  1")
+        s.contains("test-trivial") && s.contains("  1")
     });
 
     // The seeded list is remembered, so the row is addressable by its number —

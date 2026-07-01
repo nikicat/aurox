@@ -5,20 +5,21 @@
 //! (see [`crate::cli::shell`]) — there is no picker; the REPL is the one
 //! interactive surface. This module owns the *non-interactive* path (a pipe or
 //! `--noconfirm`): it merges sync-repo and AUR matches into one relevance-ranked
-//! list (see [`rank_rows`]) and prints it, installing nothing. The [`Row`] model
-//! and its labels are shared with the shell so both render matches identically.
+//! list (see [`rank_rows`]) and prints it, installing nothing. The [`Row`] model,
+//! ranking, and the [`ui::search_table`] renderer are shared with the shell so
+//! both render matches identically.
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::index::{self, IndexEntry, secondary::Secondary};
-use crate::names::{NameMatch, PkgTarget, SearchTerm};
-use crate::pacman::alpm_db::{self, RepoHit};
+use crate::names::{NameMatch, PkgName, PkgTarget, RepoName, SearchTerm};
+use crate::pacman::alpm_db::{self, PacmanIndex, RepoHit};
 use crate::pacman::invoke::REPO_AUR;
 use crate::paths;
 use crate::runopts;
 use crate::ui;
+use crate::version::Version;
 
-use console::style;
 use std::cmp::Ordering;
 use tracing::{info, instrument};
 
@@ -27,7 +28,7 @@ use tracing::{info, instrument};
 /// Borrows the AUR entry from the loaded index; repo hits are owned (their
 /// `Alpm` handle is already dropped by the time we build rows). `pub(crate)` so
 /// the interactive shell ([`crate::cli::shell`]) reuses the same row model +
-/// labels for its numbered result list.
+/// ranking + [`search_row`] conversion for its numbered result table.
 pub(crate) enum Row<'a> {
     Repo(RepoHit),
     Aur(&'a IndexEntry),
@@ -53,17 +54,6 @@ impl Row<'_> {
         match self {
             Row::Repo(r) => r.repo.as_str(),
             Row::Aur(_) => REPO_AUR,
-        }
-    }
-
-    /// The display label for this row (no leading number), colored per `color`.
-    /// The shell prefixes it with the row number; the non-interactive listing
-    /// prints the plain form as-is.
-    pub(crate) fn label(&self, color: bool) -> String {
-        if color {
-            label_colored(self)
-        } else {
-            label_plain(self)
         }
     }
 }
@@ -138,12 +128,51 @@ pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
         return Ok(0);
     }
 
-    // Plain labels (no ANSI) keep the listing pipe-clean; best-first order means
-    // a `… | head` shows the strongest matches.
-    for row in &rows {
-        println!("{}", label_plain(row));
+    // Render the aligned table (installed emphasis + version diff + size), the
+    // same machinery the shell uses. Build-time is left off the pipe listing
+    // (empty metrics — no store lookups), so installed AUR rows show `~?` there.
+    let pac = PacmanIndex::build(&alpm_db::open()?);
+    let search_rows: Vec<ui::SearchRow> = rows.iter().map(|r| search_row(r, &pac)).collect();
+    let table = ui::search_table(&search_rows, &pac, &ui::PreviewMetrics::empty());
+    for line in table.lines() {
+        println!("{line}");
     }
     Ok(0)
+}
+
+/// Resolve one ranked [`Row`] into a [`ui::SearchRow`] for the aligned table:
+/// its display name, available version, description, and — against `pac` — its
+/// installed state and (when an upgrade is available) the installed version for
+/// the `old → new` diff.
+pub(crate) fn search_row(row: &Row<'_>, pac: &PacmanIndex) -> ui::SearchRow {
+    let name = PkgName::new(row.picked().into_inner());
+    let (available, desc) = match row {
+        Row::Repo(r) => (Some(r.version.clone()), r.desc.clone()),
+        Row::Aur(e) => (Some(e.version()), e.display_desc().map(str::to_owned)),
+    };
+    let installed = pac.is_installed(name.as_str());
+    // Surface the installed version (→ an `old → new` diff) only when it's
+    // actually behind the available one; a same-version row just shows the
+    // version.
+    let old_ver = if installed {
+        pac.installed_version(name.as_str())
+            .filter(|iv| {
+                available
+                    .as_ref()
+                    .is_some_and(|av| iv.is_outdated(av.as_ver()))
+            })
+            .map(Version::from)
+    } else {
+        None
+    };
+    ui::SearchRow {
+        repo: RepoName::from(row.repo_name()),
+        name,
+        install: ui::InstallState::from_installed(installed),
+        old_ver,
+        new_ver: available,
+        desc,
+    }
 }
 
 /// Rank + sort merged repo/AUR search `rows` in place, best match first.
@@ -289,71 +318,6 @@ fn name_tier(
     }
 }
 
-/// One result row, plain ASCII (no ANSI) — the pipe-clean listing form and the
-/// base the shell prefixes its row number onto.
-fn label_plain(row: &Row<'_>) -> String {
-    match row {
-        Row::Repo(r) => {
-            let installed = if r.installed { " [installed]" } else { "" };
-            match r.desc.as_deref() {
-                Some(d) if !d.is_empty() => {
-                    format!("{}/{} {}{installed}  {d}", r.repo, r.name, r.version)
-                }
-                _ => format!("{}/{} {}{installed}", r.repo, r.name, r.version),
-            }
-        }
-        Row::Aur(e) => {
-            let ver = aur_version(e);
-            match e.display_desc() {
-                Some(d) => format!("aur/{} {ver}  {d}", e.pkgbase),
-                None => format!("aur/{} {ver}", e.pkgbase),
-            }
-        }
-    }
-}
-
-/// Colored variant of [`label_plain`] — matches `-Ss` / install-table styling
-/// (repo prefix bold, version green, description dimmed, installed marker cyan).
-fn label_colored(row: &Row<'_>) -> String {
-    match row {
-        Row::Repo(r) => {
-            let mut head = format!(
-                "{}/{} {}",
-                ui::repo(r.repo.as_str()),
-                style(&r.name).bold(),
-                style(&r.version).green(),
-            );
-            if r.installed {
-                head = format!("{head} {}", style("[installed]").cyan());
-            }
-            match r.desc.as_deref() {
-                Some(d) if !d.is_empty() => format!("{head}  {}", ui::dim(d)),
-                _ => head,
-            }
-        }
-        Row::Aur(e) => {
-            let ver = aur_version(e);
-            let head = format!(
-                "{}/{} {}",
-                ui::repo("aur"),
-                style(&e.pkgbase).bold(),
-                style(ver).green(),
-            );
-            match e.display_desc() {
-                Some(d) => format!("{head}  {}", ui::dim(d)),
-                None => head,
-            }
-        }
-    }
-}
-
-fn aur_version(e: &IndexEntry) -> String {
-    match e.epoch.as_deref() {
-        Some(ep) if !ep.is_empty() => format!("{ep}:{}-{}", e.pkgver, e.pkgrel),
-        _ => format!("{}-{}", e.pkgver, e.pkgrel),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,54 +350,6 @@ mod tests {
             desc: desc.map(str::to_owned),
             installed,
         }
-    }
-
-    /// `label_plain` is the pipe-clean listing form — must stay free of ANSI
-    /// escapes and surface pkgbase / version / description so the user has
-    /// enough to act on.
-    #[test]
-    fn aur_label_plain_no_ansi_and_has_all_pieces() {
-        let l = label_plain(&Row::Aur(&mk("foo", Some("does foo"), None)));
-        assert!(!l.contains('\u{1b}'), "ANSI leaked into plain label: {l:?}");
-        assert_eq!(l, "aur/foo 1.2.3-4  does foo");
-    }
-
-    #[test]
-    fn aur_label_plain_drops_empty_or_missing_description() {
-        assert_eq!(
-            label_plain(&Row::Aur(&mk("bar", None, None))),
-            "aur/bar 1.2.3-4"
-        );
-        assert_eq!(
-            label_plain(&Row::Aur(&mk("baz", Some(""), None))),
-            "aur/baz 1.2.3-4"
-        );
-    }
-
-    #[test]
-    fn aur_label_plain_includes_epoch_when_set() {
-        let l = label_plain(&Row::Aur(&mk("qux", None, Some("2"))));
-        assert_eq!(l, "aur/qux 2:1.2.3-4");
-    }
-
-    #[test]
-    fn aur_label_plain_skips_empty_epoch_string() {
-        let l = label_plain(&Row::Aur(&mk("qux", None, Some(""))));
-        assert!(l.starts_with("aur/qux 1.2.3-4"), "got: {l:?}");
-    }
-
-    /// Repo rows render in pacman `repo/name version` shape, with the
-    /// `[installed]` marker only when the user already has the package.
-    #[test]
-    fn repo_label_plain_shape_and_installed_marker() {
-        assert_eq!(
-            label_plain(&Row::Repo(repo("firefox", Some("a browser"), false))),
-            "extra/firefox 2.0-1  a browser"
-        );
-        assert_eq!(
-            label_plain(&Row::Repo(repo("vim", None, true))),
-            "extra/vim 2.0-1 [installed]"
-        );
     }
 
     /// Both row kinds widen to the unclassified `PkgTarget` the install path

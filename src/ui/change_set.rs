@@ -18,10 +18,13 @@
 //!   store can't predict; dimmed when the recorded duration is old enough that
 //!   it's a shaky predictor.
 
-use super::cost::{PreviewMetrics, RowCost, TimeEst, built_suffix, cost_of, time_col};
+use super::cost::{
+    PreviewMetrics, RowCost, SizeEst, TimeEst, built_suffix, cost_of, size_of, size_of_repo_dep,
+    time_col,
+};
 use super::tables::{Cell, Paint, Table, Width, version_block};
 use super::{color_on, dim, human_age, human_bytes, human_duration, repo as repo_style};
-use crate::names::{PkgBase, PkgName, RepoName, RepoRank};
+use crate::names::{PkgBase, PkgName, RepoName};
 use crate::pacman::alpm_db::PacmanIndex;
 use crate::version::Version;
 use console::style;
@@ -382,63 +385,6 @@ fn age_cell(age: Option<Duration>, paint: Paint) -> String {
     } else {
         format!("  {label}")
     }
-}
-
-/// A change-set row's size figure.
-///
-/// Repo rows are [`Self::Exact`] (the bytes pacman will download); AUR rows are
-/// an [`Self::Estimate`] from the installed version's on-disk size, rendered
-/// with a leading `~`; a pulled-in dep that was never installed is
-/// [`Self::Unknown`] (`~?`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SizeEst {
-    Exact(u64),
-    Estimate(u64),
-    Unknown,
-}
-
-impl SizeEst {
-    /// Bytes this row contributes to the batch total (0 when unknown).
-    const fn bytes(self) -> u64 {
-        match self {
-            Self::Exact(n) | Self::Estimate(n) => n,
-            Self::Unknown => 0,
-        }
-    }
-
-    /// Whether the figure is approximate — any non-exact row makes the batch
-    /// total a `~` lower bound.
-    const fn approximate(self) -> bool {
-        !matches!(self, Self::Exact(_))
-    }
-
-    /// The cell text: bare for exact, `~`-prefixed for an estimate, `~?` when
-    /// unknown.
-    fn render(self) -> String {
-        match self {
-            Self::Exact(n) => human_bytes(n),
-            Self::Estimate(n) => format!("~{}", human_bytes(n)),
-            Self::Unknown => "~?".to_owned(),
-        }
-    }
-}
-
-/// Size of a transaction root: AUR rows estimate from the installed footprint,
-/// repo rows take the exact download size. Either lookup can miss → [`SizeEst::Unknown`].
-fn size_of(repo: &RepoName, name: &PkgName, pac: &PacmanIndex) -> SizeEst {
-    if repo.rank() == RepoRank::Aur {
-        pac.installed_size(name)
-            .map_or(SizeEst::Unknown, SizeEst::Estimate)
-    } else {
-        pac.sync_download_size(name)
-            .map_or(SizeEst::Unknown, SizeEst::Exact)
-    }
-}
-
-/// Size of a pulled-in repo dependency: the exact bytes `pacman -S` will fetch.
-fn size_of_repo_dep(name: &PkgName, pac: &PacmanIndex) -> SizeEst {
-    pac.sync_download_size(name)
-        .map_or(SizeEst::Unknown, SizeEst::Exact)
 }
 
 /// A byte count. A newtype (not a bare `u64`) so a size can't be mixed up with a

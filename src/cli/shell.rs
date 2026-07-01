@@ -25,12 +25,12 @@
 
 use crate::build::{self, ConfirmGate, DevelPolicy, InstallOpts, UpgradeSession, review};
 use crate::cli::dispatch;
-use crate::cli::search::{Row, rank_rows};
+use crate::cli::search::{Row, rank_rows, search_row};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::{self, IndexEntry};
 use crate::mirror::{self, MirrorRepo};
-use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, SearchTerm};
+use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, RepoRank, SearchTerm};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke::{self, PkgUpgrade, REPO_AUR};
 use crate::paths;
@@ -973,7 +973,6 @@ impl ShellEnv for RealEnv<'_> {
             .iter()
             .map(SearchTerm::compile)
             .collect::<std::result::Result<_, _>>()?;
-        let color = ui::color_on();
         let mut rows: Vec<Row<'_>> = alpm_db::search_sync(terms)?
             .into_iter()
             .map(Row::Repo)
@@ -987,11 +986,22 @@ impl ShellEnv for RealEnv<'_> {
         // `State::search` prints this reversed, so row 1 — the best match — lands
         // right above the prompt.
         rank_rows(&mut rows, &regexes);
-        Ok(rows
+
+        // Resolve installed state + versions against the live pacman DBs and
+        // render the aligned table (installed rows emphasized, with an `old → new`
+        // diff + build-time estimate). The build-time overlay is filled only for
+        // the installed AUR rows.
+        let pac = upgrade::system_pac()?;
+        let search_rows: Vec<ui::SearchRow> = rows.iter().map(|r| search_row(r, &pac)).collect();
+        let metrics = self.search_metrics(&search_rows);
+        let table = ui::search_table(&search_rows, &pac, &metrics);
+        Ok(table
+            .lines()
             .iter()
-            .map(|r| ListItem {
+            .zip(&rows)
+            .map(|(line, r)| ListItem {
                 target: r.picked(),
-                label: r.label(color),
+                label: line.clone(),
                 repo: Some(RepoName::from(r.repo_name())),
             })
             .collect())
@@ -1190,6 +1200,32 @@ impl ShellEnv for RealEnv<'_> {
 }
 
 impl RealEnv<'_> {
+    /// Build the build-time overlay for the search table from the metrics store —
+    /// only the **installed AUR** rows (build time is a property we show for
+    /// installed packages, keyed by pkgname). Empty when there's no session or no
+    /// such rows, in which case the table's build column stays blank.
+    fn search_metrics(&self, rows: &[ui::SearchRow]) -> ui::PreviewMetrics {
+        let Some(session) = &self.session else {
+            return ui::PreviewMetrics::empty();
+        };
+        let roots: Vec<ui::TxnRoot> = rows
+            .iter()
+            .filter(|r| r.install.installed() && r.repo.rank() == RepoRank::Aur)
+            .map(|r| ui::TxnRoot {
+                repo: r.repo.clone(),
+                approval: ui::ApprovalCell::Approved,
+                name: r.name.clone(),
+                old_ver: r.old_ver.clone(),
+                new_ver: r.new_ver.clone(),
+                age: None,
+            })
+            .collect();
+        if roots.is_empty() {
+            return ui::PreviewMetrics::empty();
+        }
+        upgrade::preview_metrics(session, &roots, None)
+    }
+
     /// Re-fetch the mirror + index (subject to `policy`'s TTL) and reload the
     /// session in place, rebuilding the name caches so fresh data backs
     /// subsequent `search`/`info`/classification + completion. Shared by

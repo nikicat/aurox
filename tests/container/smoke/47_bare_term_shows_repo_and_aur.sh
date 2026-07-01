@@ -15,8 +15,12 @@ assert_exit 0
 # alpm searches name+desc; gitaur searches AUR name+desc+provides.
 gaur fixture
 assert_exit 0
-assert_stdout_contains "local-repo/repo-base"
-assert_stdout_contains "aur/test-trivial"
+# The aligned table renders repo + name as separate columns, so assert on the
+# names (repo-sourced `repo-base` and AUR-sourced `test-trivial`) plus the
+# `local-repo` repo column, rather than the old `repo/name` form.
+assert_stdout_contains "local-repo"
+assert_stdout_contains "repo-base"
+assert_stdout_contains "test-trivial"
 
 # Listing only — nothing built or installed in the non-interactive path.
 assert_pkg_not_installed test-trivial

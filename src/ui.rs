@@ -16,6 +16,7 @@ mod cost;
 mod gix_progress;
 mod progress;
 mod prompts;
+mod search_table;
 mod tables;
 
 pub use change_set::{ApprovalCell, TxnRoot, cost_summary, transaction_table};
@@ -26,6 +27,7 @@ pub use progress::{
     promote_count_bar, spinner, tick,
 };
 pub use prompts::{confirm, select_pkgnames};
+pub use search_table::{InstallState, SearchRow, search_table};
 pub use tables::{Table, UpgradeSelection, install_table, pkg_list, upgrade_table};
 
 use console::{Term, style};
