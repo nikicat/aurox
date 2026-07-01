@@ -14,13 +14,41 @@ use crate::paths;
 use crate::ui;
 use tracing::{instrument, warn};
 
+/// Whether `--devel` is in effect for an upgrade scan.
+///
+/// VCS pkgbases (`-git`/`-svn`/`-hg`/`-bzr`) carry no upstream-comparable
+/// version until `makepkg` rebuilds them, so plain vercmp never sees a new
+/// upstream commit. `--devel` (yay/paru parity) opts into rebuilding them
+/// anyway; the default leaves them alone. A named pair instead of a bare `bool`
+/// so call sites read `DevelPolicy::Rebuild`, not a nameless `true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DevelPolicy {
+    /// Default: a VCS pkgbase upgrades only when vercmp says it's outdated.
+    Skip,
+    /// `--devel`: force every VCS pkgbase into the upgrade set for a rebuild.
+    Rebuild,
+}
+
+impl DevelPolicy {
+    /// Collapse the CLI/config `--devel` toggle (the flag ∪ config value, plus
+    /// `-Qu`'s trailing `--devel`) into the policy.
+    pub const fn from_enabled(enabled: bool) -> Self {
+        if enabled { Self::Rebuild } else { Self::Skip }
+    }
+
+    /// Whether a VCS pkgbase is forced into the upgrade set regardless of vercmp.
+    const fn rebuilds_vcs(self) -> bool {
+        matches!(self, Self::Rebuild)
+    }
+}
+
 /// `gaur -Qu` — show the union of pacman-repo and AUR upgrade candidates.
 ///
 /// One flat, severity-sorted table grouped by `repo` column. Read-only and
 /// unprivileged (no sudo), so safe to call both as the bare `-Qu` and as a
 /// preview before `-Syu` runs.
 #[instrument]
-pub fn cmd_query_upgrades(cfg: &Config, devel: bool) -> Result<u8> {
+pub fn cmd_query_upgrades(cfg: &Config, devel: DevelPolicy) -> Result<u8> {
     ui::upgrade_table(&collect_upgrade_plan(cfg, devel)?);
     Ok(0)
 }
@@ -28,7 +56,7 @@ pub fn cmd_query_upgrades(cfg: &Config, devel: bool) -> Result<u8> {
 /// Gather the merged repo + AUR upgrade list. Shared by `-Qu` (read-only
 /// rendering) and `-Syu` (feeds the interactive picker). Unprivileged —
 /// reads alpm and the AUR index file only.
-pub fn collect_upgrade_plan(cfg: &Config, devel: bool) -> Result<Vec<PkgUpgrade>> {
+pub fn collect_upgrade_plan(cfg: &Config, devel: DevelPolicy) -> Result<Vec<PkgUpgrade>> {
     match UpgradeSession::load(cfg)? {
         Some(session) => session.recompute_remaining(devel),
         // No AUR index yet (user hasn't run `-Sy`) — repo upgrades only.
@@ -95,7 +123,7 @@ impl UpgradeSession {
     /// the per-iteration cost the loop pays (≈10ms), as opposed to the
     /// once-only index load above.
     #[instrument(skip(self))]
-    pub fn recompute_remaining(&self, devel: bool) -> Result<Vec<PkgUpgrade>> {
+    pub fn recompute_remaining(&self, devel: DevelPolicy) -> Result<Vec<PkgUpgrade>> {
         // Same rootless-sync db `query_repo_upgrades` uses, so the AUR-vs-repo
         // "foreign" split is computed against one consistent view.
         let alpm = alpm_db::open_synced()?;
@@ -108,15 +136,15 @@ impl UpgradeSession {
 
 /// Scan the localdb for foreign pkgs with a newer version in the AUR index.
 ///
-/// `devel=true` forces every VCS pkgbase (`-git`/`-svn`/`-hg`/`-bzr`) into
-/// the list regardless of vercmp, since their `pkgver` is only refreshed by
-/// `makepkg`. Otherwise VCS pkgs are skipped (their on-disk version always
-/// looks stale).
+/// [`DevelPolicy::Rebuild`] forces every VCS pkgbase (`-git`/`-svn`/`-hg`/
+/// `-bzr`) into the list regardless of vercmp, since their `pkgver` is only
+/// refreshed by `makepkg`. Under [`DevelPolicy::Skip`] VCS pkgs are skipped
+/// (their on-disk version always looks stale).
 fn aur_upgrades(
     idx: &IndexFile,
     by: &Secondary,
     pac: &PacmanIndex,
-    devel: bool,
+    devel: DevelPolicy,
 ) -> Vec<PkgUpgrade> {
     let mut out = Vec::new();
     for (name, installed_ver) in pac.foreign() {
@@ -156,13 +184,13 @@ fn aur_upgrades(
             }
         };
         let is_vcs = entry.pkgbase.is_vcs();
-        if !devel && is_vcs {
+        if is_vcs && !devel.rebuilds_vcs() {
             continue;
         }
         let aur_ver = entry.version();
         // Typed vercmp via `Ver::is_outdated` — `<` and `==` on `Ver` invoke
         // libalpm's vercmp under the hood.
-        let need = (devel && is_vcs) || installed_ver.is_outdated(&aur_ver);
+        let need = (is_vcs && devel.rebuilds_vcs()) || installed_ver.is_outdated(&aur_ver);
         if need {
             out.push(PkgUpgrade {
                 repo: invoke::REPO_AUR.into(),
@@ -260,7 +288,7 @@ mod tests {
         let i = idx(vec![entry("foo-git", "foo-git", "r1.deadbeef", "1")]);
         let s = Secondary::build(&i);
         let pac = pac_with_foreign(&[("foo-git", "r1.deadbeef-1")]);
-        assert!(aur_upgrades(&i, &s, &pac, false).is_empty());
+        assert!(aur_upgrades(&i, &s, &pac, DevelPolicy::Skip).is_empty());
     }
 
     /// Same setup but with `--devel`: the row must appear even though
@@ -270,7 +298,7 @@ mod tests {
         let i = idx(vec![entry("foo-git", "foo-git", "r1.deadbeef", "1")]);
         let s = Secondary::build(&i);
         let pac = pac_with_foreign(&[("foo-git", "r1.deadbeef-1")]);
-        let out = aur_upgrades(&i, &s, &pac, true);
+        let out = aur_upgrades(&i, &s, &pac, DevelPolicy::Rebuild);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, PkgName::from("foo-git"));
         assert_eq!(out[0].repo, invoke::REPO_AUR);
@@ -284,9 +312,9 @@ mod tests {
         let i = idx(vec![entry("foo", "foo", "2.0", "1")]);
         let s = Secondary::build(&i);
         let pac = pac_with_foreign(&[("foo", "1.0-1")]);
-        for devel in [false, true] {
+        for devel in [DevelPolicy::Skip, DevelPolicy::Rebuild] {
             let out = aur_upgrades(&i, &s, &pac, devel);
-            assert_eq!(out.len(), 1, "devel={devel}: expected one upgrade row");
+            assert_eq!(out.len(), 1, "devel={devel:?}: expected one upgrade row");
             assert_eq!(out[0].name, PkgName::from("foo"));
             assert_eq!(out[0].old_ver, Version::from("1.0-1"));
             assert_eq!(out[0].new_ver, Version::from("2.0-1"));
@@ -301,8 +329,8 @@ mod tests {
         let i = idx(vec![]);
         let s = Secondary::build(&i);
         let pac = pac_with_foreign(&[("foo-debug", "1.0-1"), ("orphan-pkg", "1.0-1")]);
-        assert!(aur_upgrades(&i, &s, &pac, false).is_empty());
-        assert!(aur_upgrades(&i, &s, &pac, true).is_empty());
+        assert!(aur_upgrades(&i, &s, &pac, DevelPolicy::Skip).is_empty());
+        assert!(aur_upgrades(&i, &s, &pac, DevelPolicy::Rebuild).is_empty());
     }
 
     /// `is_transparent_upgrade_for` coverage. The principle: a pkgbase is
@@ -387,7 +415,7 @@ mod tests {
         }]);
         let s = Secondary::build(&i);
         let pac = pac_with_foreign(&[("foo", "1-1")]);
-        let out = aur_upgrades(&i, &s, &pac, false);
+        let out = aur_upgrades(&i, &s, &pac, DevelPolicy::Skip);
         assert!(
             out.is_empty(),
             "conflicting pkgbase should not auto-upgrade `foo`; got: {out:?}",
@@ -406,7 +434,7 @@ mod tests {
         }]);
         let s = Secondary::build(&i);
         let pac = pac_with_foreign(&[("foo", "1-1")]);
-        let out = aur_upgrades(&i, &s, &pac, false);
+        let out = aur_upgrades(&i, &s, &pac, DevelPolicy::Skip);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].name, PkgName::from("foo"));
     }

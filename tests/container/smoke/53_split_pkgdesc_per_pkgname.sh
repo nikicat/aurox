@@ -3,7 +3,7 @@
 # systemd-selinux shape — see fixtures/test-splitdesc). Older gitaur read
 # only pkgbase-level pkgdesc, so these showed a blank description everywhere.
 # This pins that the per-pkgname description now surfaces in -Ss, -Si, and the
-# bare-term picker, and that it's reachable by a regex search over the desc.
+# bare-term listing, and that it's reachable by a regex search over the desc.
 source /work/tests/container/lib.sh
 bootstrap; reset_state
 gaur -Sy
@@ -27,10 +27,11 @@ gaur -Ss "splitdesc client libraries"
 assert_exit 0
 assert_stdout_contains "aur/test-splitdesc"
 
-# Bare-term picker (headless = print matches): the AUR row carries its
-# canonical description rather than rendering name + version only.
+# Bare-term listing (headless = print matches): the aligned table renders repo +
+# name as separate columns, and the AUR row carries its canonical description
+# rather than rendering name + version only.
 gaur test-splitdesc
 assert_exit 0
-assert_stdout_contains "aur/test-splitdesc"
+assert_stdout_contains "test-splitdesc"
 assert_stdout_contains "the main splitdesc package"
 assert_pkg_not_installed test-splitdesc

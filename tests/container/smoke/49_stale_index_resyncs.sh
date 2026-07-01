@@ -18,7 +18,7 @@ echo "this is not a valid rkyv archive" > "$STATE_DIR/index.bin"
 # and still surface the AUR hit, with a one-line resync notice on stderr.
 gaur test-trivial
 assert_exit 0
-assert_stdout_contains "aur/test-trivial"
+assert_stdout_contains "test-trivial"
 assert_stderr_contains "resyncing"
 # The resync notice must read cleanly — no leaked rancor detail (the release
 # build's "failed without error information; enable debug assertions and the
@@ -31,7 +31,7 @@ assert_stderr_not_contains "rebuilding from scratch"
 # further resync notice.
 gaur test-trivial
 assert_exit 0
-assert_stdout_contains "aur/test-trivial"
+assert_stdout_contains "test-trivial"
 if grep -qF "resyncing" "$LAST_STDERR"; then
     echo "second run resynced again — the rebuilt index should load cleanly" >&2
     _dump >&2

@@ -54,10 +54,14 @@ gaur> quit
 ## Locked decisions (from review)
 
 1. **Augment, don't replace, the flag CLI.** Bare interactive `gaur` opens the
-   shell. Explicit `gaur -S…/-Ss…/-Si…/-Syu`, bare-term search, and all pacman
-   pass-through keep their **current one-shot, scriptable** behavior unchanged.
-   Non-interactive bare `gaur` (pipe / cron / `--noconfirm`) still does a single
-   `-Syu` pass. The shell is *strictly* the interactive no-arg path.
+   shell. Explicit `gaur -S…/-Ss…/-Si…/-Syu` and all pacman pass-through keep
+   their **current one-shot, scriptable** behavior unchanged.
+   *Revised:* interactive **bare-term search** (`gaur <term>…`) now opens the
+   shell too, seeded with that `search` (identical to typing `search <term>…` at
+   the prompt) — the old `MultiSelect` picker is gone, so the REPL is the one
+   interactive surface. Non-interactively (pipe / `--noconfirm`) `gaur <term>…`
+   stays a one-shot **ranked listing** that installs nothing. Non-interactive
+   bare `gaur` (pipe / cron / `--noconfirm`) still does a single `-Syu` pass.
 2. **Words-only command vocabulary.** `search` `info` `add` `discard` `remove`
    `upgrade` `review` `approve` `show` `apply` `clear` `refresh` `help` `quit`.
    No pacman-letter clusters, no clap. Note the three distinct removal-ish verbs:

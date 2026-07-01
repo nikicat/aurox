@@ -1,19 +1,22 @@
-//! Per-row build-time cost cells for the change-set table ([`super::change_set`]).
+//! Per-row cost cells — size + build-time — shared by the change-set table
+//! ([`super::change_set`]) and the search list ([`super::search_table`]).
 //!
 //! Borrows the [`Paint`]/[`Width`] rendering primitives from [`super::tables`]
 //! but nothing flows back the other way — `tables` never imports `cost`, so
-//! there's no cycle. Two things live here:
+//! there's no cycle. What lives here:
 //!
 //! - [`PreviewMetrics`] — the per-AUR-row overlay the shell fills in: last
 //!   build duration (the only persisted cost — sizes come straight from the
 //!   pacman DBs) and which rows already have artifacts on disk.
+//! - [`SizeEst`]/[`size_of`] — the download/footprint size cell (exact for repo
+//!   rows, `~`-estimated for AUR).
 //! - [`TimeEst`] — the build-time cell, plus [`built_tag`], the trailing
-//!   `built` marker. The size cell ([`super::change_set`]'s `SizeEst`) stays
-//!   with the table since it's the only place sizes show.
+//!   `built` marker.
 
-use super::human_duration;
 use super::tables::{Paint, Width};
+use super::{human_bytes, human_duration};
 use crate::names::{PkgBase, PkgName, RepoName, RepoRank};
+use crate::pacman::alpm_db::PacmanIndex;
 use console::style;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -108,6 +111,65 @@ impl TimeEst {
     pub(super) const fn should_dim(self, paint: Paint, fade: Fade) -> bool {
         paint.colored() && matches!(fade, Fade::Faded) && matches!(self, Self::Estimate(_))
     }
+}
+
+/// A package row's size figure — the size half of a cost cell.
+///
+/// Repo rows are [`Self::Exact`] (the bytes pacman will download); AUR rows are
+/// an [`Self::Estimate`] from the installed version's on-disk size, rendered
+/// with a leading `~`; a row that was never installed is [`Self::Unknown`]
+/// (`~?`). Shared by the change-set preview and the search list so the size cell
+/// (and the stale-db / zero-size bugs it's had) is fixed in one place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SizeEst {
+    Exact(u64),
+    Estimate(u64),
+    Unknown,
+}
+
+impl SizeEst {
+    /// Bytes this row contributes to a batch total (0 when unknown).
+    pub(super) const fn bytes(self) -> u64 {
+        match self {
+            Self::Exact(n) | Self::Estimate(n) => n,
+            Self::Unknown => 0,
+        }
+    }
+
+    /// Whether the figure is approximate — any non-exact row makes a batch
+    /// total a `~` lower bound.
+    pub(super) const fn approximate(self) -> bool {
+        !matches!(self, Self::Exact(_))
+    }
+
+    /// The cell text: bare for exact, `~`-prefixed for an estimate, `~?` when
+    /// unknown.
+    pub(super) fn render(self) -> String {
+        match self {
+            Self::Exact(n) => human_bytes(n),
+            Self::Estimate(n) => format!("~{}", human_bytes(n)),
+            Self::Unknown => "~?".to_owned(),
+        }
+    }
+}
+
+/// Size of a package row: AUR rows estimate from the installed footprint, repo
+/// rows take the exact download size. Either lookup can miss → [`SizeEst::Unknown`].
+/// Shared by the change-set roots and the search list.
+pub(super) fn size_of(repo: &RepoName, name: &PkgName, pac: &PacmanIndex) -> SizeEst {
+    if repo.rank() == RepoRank::Aur {
+        pac.installed_size(name)
+            .map_or(SizeEst::Unknown, SizeEst::Estimate)
+    } else {
+        pac.sync_download_size(name)
+            .map_or(SizeEst::Unknown, SizeEst::Exact)
+    }
+}
+
+/// Size of a pulled-in repo dependency: the exact bytes `pacman -S` will fetch.
+pub(super) fn size_of_repo_dep(name: &PkgName, pac: &PacmanIndex) -> SizeEst {
+    pac.sync_download_size(name)
+        .map_or(SizeEst::Unknown, SizeEst::Exact)
 }
 
 /// Whether a build-time cell is visually de-emphasized — its recorded duration
@@ -307,5 +369,55 @@ mod tests {
             ""
         );
         assert_eq!(built_suffix(RowCost::none(), Paint::Plain), "");
+    }
+
+    /// Each `SizeEst` variant renders its expected cell.
+    #[test]
+    fn size_est_renders_each_variant() {
+        assert_eq!(SizeEst::Exact(1024).render(), "1.00 KiB");
+        assert_eq!(SizeEst::Estimate(1024).render(), "~1.00 KiB");
+        assert_eq!(SizeEst::Unknown.render(), "~?");
+    }
+
+    /// A root's size source is chosen by repo: AUR rows estimate from localdb
+    /// `isize`, repo rows take the exact syncdb download size, and a miss in
+    /// either map falls back to unknown.
+    #[test]
+    fn size_of_picks_source_by_repo() {
+        let mut pac = PacmanIndex::default();
+        pac.installed_size
+            .insert("paru-bin".into(), 9 * 1024 * 1024);
+        pac.sync_download_size
+            .insert("glibc".into(), 12 * 1024 * 1024);
+
+        assert_eq!(
+            size_of(&"aur".into(), &"paru-bin".into(), &pac),
+            SizeEst::Estimate(9 * 1024 * 1024)
+        );
+        assert_eq!(
+            size_of(&"core".into(), &"glibc".into(), &pac),
+            SizeEst::Exact(12 * 1024 * 1024)
+        );
+        // AUR row with no localdb size (manually built / never installed).
+        assert_eq!(
+            size_of(&"aur".into(), &"ghost".into(), &pac),
+            SizeEst::Unknown
+        );
+    }
+
+    /// Regression guard for the stale-db size bug: a repo row whose pkgname is
+    /// present with a `download_size` of 0 (libalpm's answer for an already-cached
+    /// archive) is `Exact(0)` → renders `0 B`, distinct from a *missing* pkgname,
+    /// which is `Unknown` → `~?`.
+    #[test]
+    fn repo_zero_size_is_exact_not_missing() {
+        let mut pac = PacmanIndex::default();
+        pac.sync_download_size.insert("cached".into(), 0);
+        let cached = size_of(&"core".into(), &"cached".into(), &pac);
+        assert_eq!(cached, SizeEst::Exact(0));
+        assert_eq!(cached.render(), "0 B");
+        let missing = size_of(&"core".into(), &"absent".into(), &pac);
+        assert_eq!(missing, SizeEst::Unknown);
+        assert_eq!(missing.render(), "~?");
     }
 }

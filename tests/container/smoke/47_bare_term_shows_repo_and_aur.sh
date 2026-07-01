@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # yay parity: bare `gaur <term>` searches the sync repos AND the AUR index,
-# listing both in one picker (older gitaur only searched the AUR). Headless,
-# the picker degrades to "print matches, install nothing" — so this pins that
+# ranking both in one merged list (older gitaur only searched the AUR).
+# Headless, it degrades to "print matches, install nothing" — so this pins that
 # a repo package and an AUR package both appear in that listing for a query
 # that matches each.
 source /work/tests/container/lib.sh
@@ -15,8 +15,12 @@ assert_exit 0
 # alpm searches name+desc; gitaur searches AUR name+desc+provides.
 gaur fixture
 assert_exit 0
-assert_stdout_contains "local-repo/repo-base"
-assert_stdout_contains "aur/test-trivial"
+# The aligned table renders repo + name as separate columns, so assert on the
+# names (repo-sourced `repo-base` and AUR-sourced `test-trivial`) plus the
+# `local-repo` repo column, rather than the old `repo/name` form.
+assert_stdout_contains "local-repo"
+assert_stdout_contains "repo-base"
+assert_stdout_contains "test-trivial"
 
 # Listing only — nothing built or installed in the non-interactive path.
 assert_pkg_not_installed test-trivial
