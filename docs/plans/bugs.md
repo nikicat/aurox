@@ -1,25 +1,24 @@
 # Bugs
 
-## systemd-selinux fails with self-cycle in dependency resolution
+_No open bugs._
 
-`systemd-selinux` can't be installed:
-
-```
-error: resolve: cycle: systemd-selinux → systemd-selinux
-```
-
-The resolver reports a self-referential cycle (`systemd-selinux → systemd-selinux`).
-A package depending on / providing itself (or otherwise resolving to itself) must
-not be treated as a dependency cycle — self-edges should be dropped before cycle
-detection.
+<!-- Resolved: systemd-selinux self-cycle in dependency resolution.
+`error: resolve: cycle: systemd-selinux → systemd-selinux` — a pkgbase that
+named itself in `depends` (a package providing/depending on its own name) built
+a self-edge in the full-graph cycle check (`topo::sort` over `all_edges`). Fixed
+in `src/resolver.rs::resolve` by dropping deps that `refers_to` the owning
+pkgbase before the cycle check (mirroring the self-edge filter
+`resolve_make_edges` already applied for the strata pass). `topo.rs` keeps its
+invariant — a genuine self-loop in raw input is still a cycle; the resolver just
+never constructs one. Regression tests: `resolver::tests::aur_self_dependency_is_not_a_cycle`
++ `aur_self_makedepend_is_not_a_cycle`. -->
 
 <!-- Resolved/obsolete: "Package size not shown for pacman packages in the
 update table." That table was the interactive `-Syu` picker, now removed; the
 shell's change-set preview already shows repo `download_size` from the syncdb
 (see `src/ui/change_set.rs`, UPDATE_LOOP phase 2). -->
 
-_(One open bug remains above. Feature roadmaps live in the per-feature plan
-docs: shell phases 5–6 in `shell-ui.md`, GPG key import in
-`gpg-key-auto-import.md`, the `-Syu` discoverability + `-Qf`/`-G` ideas in
-`../COMPARISON.md`'s "Open design questions", and the test backlog in
-`../../tests/container/extended/.scope`.)_
+_Feature roadmaps live in the per-feature plan docs: shell phases 5–6 in
+`shell-ui.md`, GPG key import in `gpg-key-auto-import.md`, the `-Syu`
+discoverability + `-Qf`/`-G` ideas in `../COMPARISON.md`'s "Open design
+questions", and the test backlog in `../../tests/container/extended/.scope`._

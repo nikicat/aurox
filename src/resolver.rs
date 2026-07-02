@@ -238,7 +238,19 @@ pub fn resolve(
                 // BFS; `build_time` alone is staged for strata and rewritten
                 // pkgname → pkgbase after the BFS (needs the full name map).
                 let (all, build_time) = entry_dep_exprs(entry);
-                all_edges.insert(pkgbase.clone(), all.clone());
+                // A dep that names this pkgbase itself (a package that lists
+                // itself in `depends`, or a split sibling whose pkgname equals
+                // the pkgbase) is a self-edge, not a dependency cycle — drop it
+                // before the `topo::sort` check, mirroring the self-edge filter
+                // `resolve_make_edges` already applies to the strata graph. The
+                // BFS still sees the self-dep, but it dedups against
+                // `visited_aur` on the next pop, so nothing is lost.
+                let cycle_edges: Vec<PkgTarget> = all
+                    .iter()
+                    .filter(|d| !d.refers_to(&pkgbase))
+                    .cloned()
+                    .collect();
+                all_edges.insert(pkgbase.clone(), cycle_edges);
                 make_edges.insert(pkgbase.clone(), build_time);
                 queue.extend(all.into_iter().map(|d| (d, Origin::Dep)));
             }
@@ -698,6 +710,35 @@ mod tests {
         mid.sort();
         assert_eq!(mid, vec!["b".to_owned(), "c".to_owned()]);
         assert_eq!(plan.aur_strata[2], vec!["d".to_owned()]);
+    }
+
+    // ---- self-edges are dropped, not reported as cycles -----------------
+
+    #[test]
+    fn aur_self_dependency_is_not_a_cycle() {
+        // Regression (docs/plans/bugs.md): a pkgbase that lists its own name
+        // in `depends` (a package providing/depending on itself) produced a
+        // spurious `cycle: systemd-selinux → systemd-selinux` from the
+        // full-graph `topo::sort`. The self-edge must be dropped before the
+        // cycle check, so the package resolves normally.
+        let plan = run(
+            &["systemd-selinux"],
+            vec![entry("systemd-selinux", &["systemd-selinux"], &[])],
+            &[],
+        )
+        .expect("a package depending on itself must resolve, not cycle");
+        assert!(plan.direct_aur.contains("systemd-selinux"));
+        assert_eq!(plan.aur_strata, vec![vec!["systemd-selinux".to_owned()]]);
+    }
+
+    #[test]
+    fn aur_self_makedepend_is_not_a_cycle() {
+        // Same self-edge via `makedepends` (a split pkgbase whose build dep
+        // names its own pkgbase). It must clear both the `topo::sort` cycle
+        // check and strata — a single unblocked stratum.
+        let plan = run(&["foo"], vec![entry("foo", &[], &["foo"])], &[])
+            .expect("a pkgbase makedepending on itself must resolve, not cycle");
+        assert_eq!(plan.aur_strata, vec![vec!["foo".to_owned()]]);
     }
 
     #[test]
