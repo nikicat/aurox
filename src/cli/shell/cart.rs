@@ -261,6 +261,9 @@ pub enum ApproveResult {
 pub enum ReviewOutcome {
     /// User approved the PKGBUILD — clear the item for `apply`.
     Approved,
+    /// User chose "approve all" — clear this item *and* every remaining one in
+    /// the pass without opening another diff.
+    ApprovedAll,
     /// User looked but deferred — the item stays `NeedsReview`.
     Skipped,
     /// User aborted the whole review pass — stop, leave the rest as they are.

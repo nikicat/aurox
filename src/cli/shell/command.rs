@@ -110,8 +110,8 @@ pub fn parse(line: &str) -> Command {
         "upgrade" | "up" => Command::Upgrade(args),
         "review" => Command::Review(args),
         "approve" => Command::Approve(args),
-        "show" | "status" => Command::Show,
-        "apply" | "commit" => Command::Apply,
+        "show" | "status" | "ls" => Command::Show,
+        "apply" | "commit" | "do" => Command::Apply,
         "clear" => Command::Clear,
         "refresh" => Command::Refresh,
         "help" | "?" => Command::Help(args.into_iter().next()),
@@ -159,7 +159,9 @@ mod tests {
         assert_eq!(parse("only x"), Command::Keep(v(&["x"])));
         assert_eq!(parse("up"), Command::Upgrade(v(&[])));
         assert_eq!(parse("commit"), Command::Apply);
+        assert_eq!(parse("do"), Command::Apply);
         assert_eq!(parse("status"), Command::Show);
+        assert_eq!(parse("ls"), Command::Show);
         assert_eq!(parse("exit"), Command::Quit);
         assert_eq!(parse("q"), Command::Quit);
     }

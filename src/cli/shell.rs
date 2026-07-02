@@ -549,6 +549,9 @@ impl State {
             env.print("review: nothing in the cart matched");
             return;
         }
+        // Flips to `Auto` once the user picks "approve all": the remaining AUR
+        // items clear without opening another diff.
+        let mut prompting = review::Prompting::default();
         for t in targets {
             // Copy out (source, approval) so the cart isn't borrowed across the
             // `env.review` call (which then mutates the cart on approval).
@@ -563,28 +566,45 @@ impl State {
                 Some((_, Approval::Approved)) => {
                     env.print(&format!("{} is already approved", t.as_str()));
                 }
-                Some((Source::Aur, Approval::NeedsReview)) => match env.review(&t) {
-                    Ok(ReviewOutcome::Approved) => {
-                        self.cart.approve(&t);
-                        if let Some(pb) = env.pkgbase_of(&t) {
-                            self.cart.mark_reviewed(pb);
+                Some((Source::Aur, Approval::NeedsReview)) => {
+                    if prompting == review::Prompting::Auto {
+                        // "approve all" was chosen earlier — no more diffs.
+                        self.approve_reviewed(&t, env);
+                        continue;
+                    }
+                    match env.review(&t) {
+                        Ok(ReviewOutcome::Approved) => self.approve_reviewed(&t, env),
+                        Ok(ReviewOutcome::ApprovedAll) => {
+                            self.approve_reviewed(&t, env);
+                            prompting = review::Prompting::Auto;
                         }
-                        env.print(&format!("approved {}", t.as_str()));
+                        Ok(ReviewOutcome::Skipped) => {
+                            env.print(&format!("{} left for review", t.as_str()));
+                        }
+                        Ok(ReviewOutcome::Aborted) => {
+                            env.print("review aborted");
+                            break;
+                        }
+                        Err(e) => {
+                            env.print(&format!("review {}: {e}", t.as_str()));
+                            break;
+                        }
                     }
-                    Ok(ReviewOutcome::Skipped) => {
-                        env.print(&format!("{} left for review", t.as_str()));
-                    }
-                    Ok(ReviewOutcome::Aborted) => {
-                        env.print("review aborted");
-                        break;
-                    }
-                    Err(e) => {
-                        env.print(&format!("review {}: {e}", t.as_str()));
-                        break;
-                    }
-                },
+                }
             }
         }
+    }
+
+    /// Clear a just-reviewed AUR target's approval gate: approve it, record its
+    /// pkgbase in the reviewed set (so the build pipeline won't re-prompt), and
+    /// acknowledge it. Shared by the per-item `review` approval and the
+    /// "approve all" fast path.
+    fn approve_reviewed<E: ShellEnv>(&mut self, t: &PkgTarget, env: &mut E) {
+        self.cart.approve(t);
+        if let Some(pb) = env.pkgbase_of(t) {
+            self.cart.mark_reviewed(pb);
+        }
+        env.print(&format!("approved {}", t.as_str()));
     }
 
     /// `show`: render the staged transaction — a header, the install/removal
@@ -1157,9 +1177,13 @@ impl ShellEnv for RealEnv<'_> {
             counterpart.as_ref(),
             &wt,
             self.cfg.review_history_scan_max,
-            false,
+            // The shell drives one interactive review per call; the
+            // "approve all" fast path is the dispatch loop's job (it decides
+            // whether to call this at all), so a single review always prompts.
+            review::Prompting::Prompt,
         ) {
             Ok(review::Outcome::Approved) => Ok(ReviewOutcome::Approved),
+            Ok(review::Outcome::ApprovedAll) => Ok(ReviewOutcome::ApprovedAll),
             Ok(review::Outcome::Skipped) => Ok(ReviewOutcome::Skipped),
             // An abort at the review prompt ends the pass but not the shell.
             Err(Error::UserAbort) => Ok(ReviewOutcome::Aborted),
@@ -2012,6 +2036,24 @@ mod tests {
         state.dispatch(&command::parse("add yay-bin"), &mut env);
         state.dispatch(&command::parse("review yay-bin"), &mut env);
         assert!(!state.cart.all_approved(), "skip leaves it needing review");
+    }
+
+    #[test]
+    fn review_approve_all_clears_the_rest_without_more_diffs() {
+        // The `(a)pprove all` outcome on the first item auto-approves the rest
+        // without opening their diffs.
+        let mut env = env_with(&[("a", Source::Aur), ("b", Source::Aur), ("c", Source::Aur)]);
+        env.review_outcomes
+            .insert("a".into(), ReviewOutcome::ApprovedAll);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add a b c"), &mut env);
+        state.dispatch(&command::parse("review"), &mut env);
+        assert_eq!(
+            env.review_calls,
+            vec!["a"],
+            "approve-all opens only the first diff, then auto-approves the rest"
+        );
+        assert!(state.cart.all_approved(), "every staged item is cleared");
     }
 
     #[test]
