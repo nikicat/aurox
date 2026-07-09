@@ -8,7 +8,7 @@
 use super::sync;
 use crate::error::{Error, Result};
 use crate::index::schema::IndexEntry;
-use crate::names::{PkgName, PkgTarget, RepoName, SearchTerm};
+use crate::names::{PkgDesc, PkgName, PkgTarget, RepoName, SearchTerm};
 use crate::version::{Ver, Version};
 use alpm::Alpm;
 use std::collections::{HashMap, HashSet};
@@ -116,6 +116,92 @@ pub fn search_sync(terms: &[SearchTerm]) -> Result<Vec<RepoHit>> {
     }
     debug!(count = hits.len(), "repo search hits");
     Ok(hits)
+}
+
+/// The `-Si`-style summary fields of one sync-repo package.
+///
+/// Extracted from the borrowed alpm `Package` into owned, typed data so the
+/// block can be rendered — and its byte layout unit-tested — without an open
+/// handle. Mirrors the field set of the AUR block ([`crate::index`]'s
+/// `print_info`), so the shell's `info` reads the same for repo and AUR
+/// packages.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SyncInfo {
+    pub repo: RepoName,
+    pub name: PkgName,
+    pub version: Version,
+    pub desc: Option<PkgDesc>,
+    /// Dep specs as alpm renders them (`name>=ver`), same shape as the
+    /// schema's `provides` — the constraint stays part of the spec.
+    pub depends: Vec<PkgTarget>,
+    pub provides: Vec<PkgTarget>,
+}
+
+impl SyncInfo {
+    /// Look up `name` across the sync DBs and extract its summary fields.
+    ///
+    /// The first DB pacman.conf lists that carries the name wins — the same
+    /// repo precedence as [`search_sync`] and pacman itself. `None` when no
+    /// sync repo knows the name.
+    pub fn lookup(alpm: &Alpm, name: &str) -> Option<Self> {
+        for db in alpm.syncdbs() {
+            let Ok(p) = db.pkg(name) else { continue };
+            return Some(Self {
+                repo: RepoName::from(db.name()),
+                name: PkgName::new(p.name()),
+                version: Version::from(p.version()),
+                desc: p.desc().map(PkgDesc::new),
+                depends: p.depends().iter().map(dep_spec).collect(),
+                provides: p.provides().iter().map(dep_spec).collect(),
+            });
+        }
+        None
+    }
+
+    /// Render the info block to `out` in the AUR block's field layout.
+    ///
+    /// A writer (not `println!`) for the same reason as [`crate::index`]'s
+    /// `write_search_result`: the exact byte layout is testable without
+    /// capturing a process's stdout.
+    pub fn write_to<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
+        writeln!(out, "Repository      : {}", self.repo)?;
+        writeln!(out, "Name            : {}", self.name)?;
+        writeln!(out, "Version         : {}", self.version)?;
+        if let Some(d) = &self.desc {
+            writeln!(out, "Description     : {d}")?;
+        }
+        if !self.depends.is_empty() {
+            writeln!(out, "Depends On      : {}", join_specs(&self.depends))?;
+        }
+        if !self.provides.is_empty() {
+            writeln!(out, "Provides        : {}", join_specs(&self.provides))?;
+        }
+        writeln!(out)
+    }
+
+    /// Print the info block to stdout (the interactive `info` path). Same
+    /// best-effort stance as the `println!`-based printers elsewhere: a closed
+    /// stdout mid-block isn't worth failing the command over.
+    pub fn print(&self) {
+        let stdout = std::io::stdout();
+        self.write_to(&mut stdout.lock()).ok();
+    }
+}
+
+/// Widen one alpm dep into the typed dep-spec, keeping the version constraint
+/// (`Dep`'s `Display` renders `name>=ver`) — unlike the resolver paths, which
+/// classify on the bare [`Dep::name`], an info block shows the full spec.
+fn dep_spec(d: &alpm::Dep) -> PkgTarget {
+    PkgTarget::new(d.to_string())
+}
+
+/// Space-join dep specs for a one-line info field.
+fn join_specs(specs: &[PkgTarget]) -> String {
+    specs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Open the system alpm DB with sync repos registered from `pacman.conf`.
@@ -596,6 +682,58 @@ impl PacmanIndex {
 mod tests {
     use super::*;
     use crate::index::schema::Pkgname;
+
+    fn render(info: &SyncInfo) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        info.write_to(&mut buf).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn sync_info_block_matches_aur_field_layout() {
+        // The column layout must match `index`'s AUR block byte-for-byte
+        // (16-char field name, then `: `), so a shell session mixing repo and
+        // AUR `info` output reads as one aligned format.
+        let info = SyncInfo {
+            repo: RepoName::from("extra"),
+            name: PkgName::new("cef"),
+            version: Version::from("138.0.1-1"),
+            desc: Some(PkgDesc::new("Chromium Embedded Framework")),
+            depends: vec![PkgTarget::from("nss"), PkgTarget::from("libxcb>=1.17")],
+            provides: vec![PkgTarget::from("cef-minimal")],
+        };
+        assert_eq!(
+            render(&info),
+            "Repository      : extra\n\
+             Name            : cef\n\
+             Version         : 138.0.1-1\n\
+             Description     : Chromium Embedded Framework\n\
+             Depends On      : nss libxcb>=1.17\n\
+             Provides        : cef-minimal\n\
+             \n"
+        );
+    }
+
+    #[test]
+    fn sync_info_block_omits_absent_fields() {
+        // No desc / deps / provides ⇒ no empty lines for them, same as the
+        // AUR block — only the always-present header fields remain.
+        let info = SyncInfo {
+            repo: RepoName::from("core"),
+            name: PkgName::new("filesystem"),
+            version: Version::from("2025.05.01-1"),
+            desc: None,
+            depends: Vec::new(),
+            provides: Vec::new(),
+        };
+        assert_eq!(
+            render(&info),
+            "Repository      : core\n\
+             Name            : filesystem\n\
+             Version         : 2025.05.01-1\n\
+             \n"
+        );
+    }
 
     /// Build an `IndexEntry` with the fields `counterpart` actually reads
     /// (pkgnames, replaces, provides). Everything else stays at default —

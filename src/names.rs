@@ -309,6 +309,35 @@ impl_name_wrapper!(PkgTarget);
 impl_name_wrapper!(VirtualName);
 impl_name_wrapper!(RepoName);
 
+/// A package's one-line human description (`pkgdesc`).
+///
+/// Not a name, so it deliberately skips [`impl_name_wrapper`]: a description
+/// never keys a map (`Borrow<str>`), never lands in a path (`AsRef<Path>`),
+/// and never equals a CLI token (`PartialEq<str>`). It exists so info/search
+/// structs carry a typed field instead of a bare `String` that could be
+/// cross-passed with a name. `Display` is its one rendering surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PkgDesc(String);
+
+impl PkgDesc {
+    pub fn new(s: impl Into<String>) -> Self {
+        Self(s.into())
+    }
+
+    /// Borrow the wrapped text as a string slice — the sanctioned escape
+    /// hatch for `&str`-typed APIs, kept explicit for the same reason as the
+    /// name wrappers' `as_str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PkgDesc {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(&self.0)
+    }
+}
+
 /// Sort/display rank of a [`RepoName`]'s column position.
 ///
 /// Variant declaration order *is* the sort order (derived `Ord` compares by
