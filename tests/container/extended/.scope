@@ -57,6 +57,9 @@
 #   (landed: 08_shell_search_seed.sh — bare-term launch `gaur <term>` opens the
 #    shell seeded with that search; add-by-number stages it, via the
 #    shell_search_seed_e2e PTY driver)
+#   (landed: 10_shell_info_repo.sh — `info` describes a sync-repo name from the
+#    sync DBs (repo wins over a same-named AUR entry) and an AUR-only name from
+#    the index, via the shell_info_e2e PTY driver)
 #   - shell_upgrade_aur_built_tag.sh     (AUR upgrade with a pre-built artifact →
 #       the apply preview's change-set row carries `built`; ports the retired
 #       06_loop_built_tag now that the picker is gone)

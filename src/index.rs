@@ -141,35 +141,15 @@ fn write_search_result<W: std::io::Write>(out: &mut W, entry: &IndexEntry) -> st
     Ok(())
 }
 
-/// `-Si` info for one or more targets.
+/// `-Si` info for one or more targets (AUR-only by design — repo packages are
+/// `pacman -Si`'s job on this path; the interactive shell merges the two).
 pub fn cmd_info(cfg: &Config, targets: &[PkgTarget]) -> Result<u8> {
     let idx = load_or_resync(cfg, &paths::index_path())?;
     let by = secondary::Secondary::build(&idx);
-    // Pacman-style exit code: non-zero when a requested target wasn't in the AUR.
-    let missing = info_targets(&idx, &by, targets);
-    Ok(u8::from(!missing.is_empty()))
-}
-
-/// Print `-Si`-style info for each target found against an already-loaded index,
-/// warning about any that aren't in the AUR.
-///
-/// Returns the unmatched targets (empty ⇒ all found), so [`cmd_info`] can derive
-/// an exit code while the interactive shell ignores it. Shared so both resolve a
-/// name (pkgname / provides / pkgbase) through [`secondary`] identically; the
-/// shell already holds the index, so it calls this directly instead of
-/// reloading.
-pub(crate) fn info_targets(
-    idx: &IndexFile,
-    by: &secondary::Secondary,
-    targets: &[PkgTarget],
-) -> Vec<PkgTarget> {
-    let mut missing = Vec::new();
-    for t in targets {
-        match by.lookup(idx, t.as_str()) {
-            Some(entry) => print_info(entry),
-            None => missing.push(t.clone()),
-        }
-    }
+    let missing: Vec<&PkgTarget> = targets
+        .iter()
+        .filter(|t| !print_aur_info(&idx, &by, t))
+        .collect();
     if !missing.is_empty() {
         ui::warn(&format!(
             "not in AUR: {}",
@@ -180,7 +160,27 @@ pub(crate) fn info_targets(
                 .join(", ")
         ));
     }
-    missing
+    // Pacman-style exit code: non-zero when a requested target wasn't in the AUR.
+    Ok(u8::from(!missing.is_empty()))
+}
+
+/// Look up one target (pkgname / provides / pkgbase, via [`secondary`]) against
+/// an already-loaded index and print its `-Si`-style block. `false` ⇒ not in
+/// the AUR — the caller decides how to report the miss ([`cmd_info`] warns
+/// "not in AUR"; the shell first tries the sync repos and words it
+/// accordingly). Shared so both surfaces resolve a name identically.
+pub(crate) fn print_aur_info(
+    idx: &IndexFile,
+    by: &secondary::Secondary,
+    target: &PkgTarget,
+) -> bool {
+    match by.lookup(idx, target.as_str()) {
+        Some(entry) => {
+            print_info(entry);
+            true
+        }
+        None => false,
+    }
 }
 
 fn print_info(e: &IndexEntry) {

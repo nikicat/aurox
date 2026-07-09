@@ -31,7 +31,7 @@ use crate::error::{Error, Result};
 use crate::index::{self, IndexEntry};
 use crate::mirror::{self, MirrorRepo};
 use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, RepoRank, SearchTerm};
-use crate::pacman::alpm_db::{self, PacmanIndex};
+use crate::pacman::alpm_db::{self, PacmanIndex, SyncInfo};
 use crate::pacman::invoke::{self, PkgUpgrade, REPO_AUR};
 use crate::paths;
 use crate::resolver::Plan;
@@ -1407,13 +1407,46 @@ impl ShellEnv for RealEnv<'_> {
     }
 
     fn show_info(&mut self, targets: &[PkgTarget]) -> Result<()> {
-        let Some(session) = &self.session else {
-            ui::warn("no AUR index; run `gaur -Sy` first");
-            return Ok(());
-        };
-        // `info_targets` already warns about misses; the shell doesn't propagate
-        // per-command exit codes, so the returned missing-list is discarded.
-        index::info_targets(session.index(), session.secondary(), targets);
+        // Repo wins ties — the same rule as `classify`: pacman owns a name
+        // that lives in both a sync repo and the AUR (`info cef` must describe
+        // extra/cef, not the same-named AUR pkgbase). Targets are handled in
+        // the order given so multi-target output matches pacman's.
+        let mut alpm = None;
+        let mut missing: Vec<&PkgTarget> = Vec::new();
+        for t in targets {
+            if self.caches.sync.contains_key(t.bare()) {
+                // One handle for the whole command, opened at the first repo
+                // target — repo info works even without an AUR index.
+                if alpm.is_none() {
+                    alpm = Some(alpm_db::open()?);
+                }
+                if let Some(info) = alpm.as_ref().and_then(|a| SyncInfo::lookup(a, t.bare())) {
+                    info.print();
+                    continue;
+                }
+                // The startup cache said repo but the live DBs disagree (a
+                // `pacman -Sy` ran since) — fall through to the AUR lookup.
+            }
+            if let Some(session) = &self.session
+                && index::print_aur_info(session.index(), session.secondary(), t)
+            {
+                continue;
+            }
+            missing.push(t);
+        }
+        if !missing.is_empty() {
+            if self.session.is_none() {
+                ui::warn("no AUR index; run `gaur -Sy` first");
+            }
+            ui::warn(&format!(
+                "not in repos or AUR: {}",
+                missing
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         Ok(())
     }
 
