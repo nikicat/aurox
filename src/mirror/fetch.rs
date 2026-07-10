@@ -62,9 +62,18 @@ pub fn incremental_fetch(
             let _span = info_span!("prepare_fetch").entered();
             debug!("preparing fetch: handshake + list refs against remote");
             let t_prepare = Instant::now();
+            // Write ref updates straight into packed-refs instead of one loose
+            // file per changed branch. On a ~155k-ref mirror a fetch after hours
+            // of AUR churn updates thousands of branches; a single packed-refs
+            // rewrite (tens of ms) beats thousands of loose creates+renames, and
+            // the store stays permanently all-packed so every packed-only fast
+            // path in the pinned gix stays hot — no repack maintenance needed.
+            // Symbolic targets would still go loose per gix semantics, but AUR
+            // branches are all object refs.
             let prepared = connection
                 .prepare_fetch(&mut progress, RefMapOptions::default())
-                .map_err(|e| Error::gix("prepare_fetch", e))?;
+                .map_err(|e| Error::gix("prepare_fetch", e))?
+                .with_write_packed_refs_only(true);
             debug!(
                 elapsed_ms = u64::try_from(t_prepare.elapsed().as_millis()).unwrap_or(u64::MAX),
                 "prepare_fetch returned (ref advertisement complete)"

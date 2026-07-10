@@ -149,25 +149,6 @@ pub fn write_commit_graph(repo: &Path, new_commits: Option<&[ObjectId]>) {
     }
 }
 
-/// Fold all loose refs into `packed-refs` for the bare repository at `repo`.
-///
-/// Each fetch writes its changed refs as loose files, which accumulate forever
-/// on a mirror aurox only ever fetches. Loose refs miss gix's borrowed
-/// packed-refs fast path (#4/#7/#9): each one costs an `open()` syscall in the
-/// negotiate/update find loops and inflates the `loose_names` set every ref is
-/// hashed against. Packing returns the whole store to the all-packed state
-/// those fast paths assume.
-///
-/// Rewrites the entire `packed-refs` file (~1 s on the ~155k-ref AUR mirror),
-/// so callers should gate this on a loose-ref threshold rather than running it
-/// every fetch. Best-effort, same rationale as [`write_commit_graph`].
-pub fn pack_refs(repo: &Path) {
-    let _span = info_span!("pack_refs").entered();
-    if let Err(e) = run(["pack-refs", "--all"], Some(repo)) {
-        debug!(error = %e, "pack-refs failed; continuing unpacked");
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
