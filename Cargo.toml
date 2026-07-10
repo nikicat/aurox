@@ -77,7 +77,7 @@ path = "src/bin/trace.rs"
 #    (the `apply` span). Cuts that resolution on the AUR mirror from ~640ms to
 #    ~240ms (`apply` ~770ms to ~400ms); adds a `ref tx resolve` detail span
 #    (PR #2705).
-gix = { git = "https://github.com/nikicat/gitoxide", rev = "39ee770b4", features = [
+gix = { git = "https://github.com/nikicat/gitoxide", rev = "7ce41a485", features = [
   # curl-rustls (over reqwest-rust-tls) so gix's low_speed_* / lowSpeedLimit
   # config actually fires — only the curl transport implements it, the
   # reqwest blocking transport silently ignores those fields. Adds libcurl
