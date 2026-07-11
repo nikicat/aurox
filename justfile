@@ -18,6 +18,64 @@ default:
 test:
     cargo test --all-features --locked
 
+# Cut a release: bump the version on a branch, open a PR, wait for its CI,
+# and merge — the merge to master IS the release (release.yml tags the merge
+# commit, creates the GitHub release, test-builds the PKGBUILD, and publishes
+# to the AUR). Nothing is pushed to master directly, so this works with a
+# protected master; the PR's CI run gates the merge, and a failed run leaves
+# the branch + PR in place to inspect. `bump` is patch|minor|major or an
+# explicit version like 0.2.0. Cargo.lock must carry the new version too:
+# the PKGBUILD builds with --frozen, so a stale lock fails the release build.
+release bump='patch':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ "$(git symbolic-ref --short HEAD)" = master ] || { echo 'not on master' >&2; exit 1; }
+    [ -z "$(git status --porcelain)" ] || { echo 'working tree not clean' >&2; exit 1; }
+    git fetch origin master
+    [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/master)" ] \
+        || { echo 'master is not in sync with origin/master' >&2; exit 1; }
+    cur=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+    IFS=. read -r maj min pat <<<"$cur"
+    case '{{bump}}' in
+        major) new="$((maj + 1)).0.0" ;;
+        minor) new="$maj.$((min + 1)).0" ;;
+        patch) new="$maj.$min.$((pat + 1))" ;;
+        *) new='{{bump}}'
+           [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+               || { echo 'bump must be patch|minor|major or X.Y.Z' >&2; exit 1; } ;;
+    esac
+    ! git ls-remote --exit-code --tags origin "refs/tags/v$new" >/dev/null 2>&1 \
+        || { echo "v$new is already released" >&2; exit 1; }
+    read -rp "release v$new (current: v$cur)? [y/N] " answer
+    [[ "$answer" == [yY]* ]] || { echo 'aborted'; exit 1; }
+    git switch -c "release-v$new"
+    sed -i "0,/^version = \".*\"/s//version = \"$new\"/" Cargo.toml
+    cargo update --workspace
+    git add Cargo.toml Cargo.lock
+    git commit -m "Bump version to $new"
+    git push -u origin "release-v$new"
+    gh pr create --base master --title "Bump version to $new" \
+        --body "Merging this PR releases v$new: release.yml tags the merge commit, creates the GitHub release, and publishes to the AUR."
+    # Right after the push, CI may not have reported its check yet, and
+    # `gh pr checks` treats "no checks" as an error (exit 1) rather than
+    # something to wait for — poll until a check exists (0 passed/8 pending),
+    # then let --watch do the real blocking.
+    for _ in $(seq 20); do
+        rc=0; gh pr checks >/dev/null 2>&1 || rc=$?
+        [ "$rc" = 1 ] || break
+        sleep 3
+    done
+    gh pr checks --watch --fail-fast
+    gh pr merge --merge --delete-branch
+    git pull --ff-only origin master
+    echo "merged — release.yml takes it from here:"
+    echo "https://github.com/nikicat/aurox/actions/workflows/release.yml"
+
+# Republish an existing release tag to the AUR with the current PKGBUILD.in
+# (e.g. after a template fix) — creates no new tag or GitHub release.
+republish tag:
+    gh workflow run release.yml --field tag={{tag}}
+
 # Coverage summary in the terminal.
 coverage:
     cargo llvm-cov --all-features --ignore-filename-regex '{{ignore_regex}}'
