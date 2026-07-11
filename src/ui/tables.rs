@@ -142,9 +142,10 @@ impl Table {
 ///
 /// An explicit per-render argument rather than a re-read of [`color_on`], so
 /// the change-set preview can render a plain form (for width measurement) and a
-/// colored form from the same code path.
+/// colored form from the same code path — and so tests can pin [`Paint::Plain`]
+/// instead of inheriting whatever the ambient terminal supports.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Paint {
+pub enum Paint {
     Plain,
     Colored,
 }
@@ -152,6 +153,11 @@ pub(super) enum Paint {
 impl Paint {
     pub(super) const fn colored(self) -> bool {
         matches!(self, Self::Colored)
+    }
+
+    /// The ambient paint for the process's terminal ([`color_on`]).
+    pub fn detect() -> Self {
+        Self::from(color_on())
     }
 }
 

@@ -28,7 +28,7 @@ pub use progress::{
 };
 pub use prompts::{confirm, select_pkgnames};
 pub use search_table::{InstallState, SearchRow, search_table};
-pub use tables::{Table, UpgradeSelection, install_table, pkg_list, upgrade_table};
+pub use tables::{Paint, Table, UpgradeSelection, install_table, pkg_list, upgrade_table};
 
 use console::{Term, style};
 use std::sync::OnceLock;

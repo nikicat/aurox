@@ -24,7 +24,7 @@ use super::cost::{
     time_col,
 };
 use super::tables::{Cell, Paint, Table, Width, version_block};
-use super::{color_on, dim, human_age, human_bytes, human_duration, repo as repo_style};
+use super::{dim, human_age, human_bytes, human_duration, repo as repo_style};
 use crate::names::{PkgBase, PkgName, RepoName};
 use crate::pacman::alpm_db::PacmanIndex;
 use crate::version::Version;
@@ -89,7 +89,9 @@ pub struct TxnRoot {
 /// given (the cart holds them sorted, so the row number *is* the cart index);
 /// `repo_deps` / `aur_deps` are the pulled-in dependencies the resolver added;
 /// `removals` are the staged uninstalls; `pac` backs the size figures and
-/// `metrics` the build-time ones.
+/// `metrics` the build-time ones. `paint` is passed in (callers use
+/// [`Paint::detect`]) rather than re-read from the environment, so tests can
+/// pin the plain rendering.
 pub fn transaction_table(
     roots: &[TxnRoot],
     repo_deps: &[PkgName],
@@ -97,8 +99,8 @@ pub fn transaction_table(
     removals: &[PkgName],
     pac: &PacmanIndex,
     metrics: &PreviewMetrics,
+    paint: Paint,
 ) -> Table {
-    let paint = Paint::from(color_on());
     let fig = figures(roots, repo_deps, aur_deps, pac, metrics);
 
     // Column widths over the plain cell text — padding is applied on that visible
@@ -196,7 +198,7 @@ fn dep_lines(
     let tag_w = Width::of("(install)");
     let (dw, tw, sw, tmw) = (dep_w.cells(), tag_w.cells(), size_w.cells(), time_w.cells());
     let mut out = Table::new();
-    out.push(marker("pulls in:"));
+    out.push(marker("pulls in:", paint));
     for (name, size) in repo_deps.iter().zip(&fig.repo_dep_sizes) {
         out.push(format!(
             "        {name:<dw$}  {tag:<tw$}  {size:>sw$}  {empty:>tmw$}",
@@ -228,7 +230,7 @@ fn removal_lines(removals: &[PkgName], paint: Paint) -> Table {
         return Table::new();
     }
     let mut out = Table::new();
-    out.push(marker("will remove:"));
+    out.push(marker("will remove:", paint));
     for name in removals {
         let shown = if paint.colored() {
             style(name.as_str()).red().to_string()
@@ -388,11 +390,11 @@ fn total_line(fig: &Figures) -> String {
     line
 }
 
-/// A section marker line (`-> pulls in:` / `-> will remove:`), dimmed when color
-/// is on.
-fn marker(text: &str) -> String {
+/// A section marker line (`-> pulls in:` / `-> will remove:`), dimmed when
+/// colored.
+fn marker(text: &str, paint: Paint) -> String {
     let body = format!("-> {text}");
-    if color_on() {
+    if paint.colored() {
         dim(&body).to_string()
     } else {
         body
@@ -527,6 +529,7 @@ fn batch_time_total(times: impl IntoIterator<Item = TimeEst>) -> TimeTotal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{assert_contains, assert_not_contains, assert_regex};
 
     fn root(repo: &str, name: &str, old: Option<&str>, new: Option<&str>) -> TxnRoot {
         TxnRoot {
@@ -723,16 +726,16 @@ mod tests {
             .insert("newthing".into(), 85 * 1024 * 1024);
         let roots = vec![root("aur", "newthing", None, Some("1.0-1"))];
         let s = cost_summary(&roots, &[], &[], &[], &pac, &PreviewMetrics::empty());
-        assert!(s.contains("? build"), "never-built shows `? build`: {s}");
-        assert!(
-            !s.contains("0s build"),
-            "must not fake a `0s build` figure: {s}"
-        );
+        assert_contains!(s, "? build", "never-built build time is unknown");
+        assert_not_contains!(s, "0s build", "must not fake a summed figure");
     }
 
     /// One numbered row per root, in the given order; a fresh install (no `old`)
-    /// drops the arrow while an upgrade keeps `old → new`; the deps + removals +
-    /// total lines all appear. Plain (un-colored) so the assertions are stable.
+    /// drops the arrow while an upgrade keeps `old -> new`; the deps, removals,
+    /// and total lines all appear. [`Paint::Plain`] is pinned — the colored form
+    /// uses a Unicode arrow and ANSI verdiff splits, so inheriting the ambient
+    /// terminal's paint made this fail under an interactive `makepkg check()`
+    /// while passing on tty-less CI.
     #[test]
     fn transaction_table_renders_rows_deps_and_total() {
         let mut pac = PacmanIndex::default();
@@ -753,27 +756,32 @@ mod tests {
         let removals = vec![PkgName::from("old-cuda")];
         let metrics = PreviewMetrics::empty();
 
-        let table = transaction_table(&roots, &repo_deps, &aur_deps, &removals, &pac, &metrics);
-        let lines = table.lines();
-        // Three numbered roots; the number column is as wide as the row count's
-        // digit count (1 here), so rows read `1  …`, `2  …`, `3  …`.
-        assert!(lines[0].starts_with("1  "), "row 1: {:?}", lines[0]);
-        assert!(lines[0].contains("glibc") && lines[0].contains("2.40-1 -> 2.41-1"));
-        assert!(lines[1].starts_with("2  ") && lines[1].contains("cuda"));
-        // Fresh install: no arrow, just the new version.
-        assert!(lines[2].starts_with("3  ") && lines[2].contains("newpkg"));
-        assert!(
-            !lines[2].contains("->"),
-            "fresh install has no arrow: {:?}",
-            lines[2]
+        let table = transaction_table(
+            &roots,
+            &repo_deps,
+            &aur_deps,
+            &removals,
+            &pac,
+            &metrics,
+            Paint::Plain,
         );
+        let lines = table.lines();
+        // One pattern per row pins the column order: number (as wide as the
+        // row count's digit count — 1 here), repo, then name and versions.
+        assert_regex!(lines[0], r"^1  core\s+.*glibc\s+2\.40-1 -> 2\.41-1");
+        assert_regex!(lines[1], r"^2  aur\s+.*cuda\s+12\.6-1 -> 12\.8-1");
+        // Fresh install: no arrow, just the new version after a blank gap.
+        assert_regex!(lines[2], r"^3  extra\s+.*newpkg\s+1\.0-1");
+        assert_not_contains!(lines[2], "->", "fresh install has no arrow");
 
         let joined = lines.join("\n");
-        assert!(joined.contains("pulls in:"));
-        assert!(joined.contains("gcc13") && joined.contains("(install)"));
-        assert!(joined.contains("nvidia-utils") && joined.contains("(build)"));
-        assert!(joined.contains("will remove:") && joined.contains("old-cuda"));
-        assert!(joined.contains("-> total"));
+        // Dep rows pair each name with its tag on the same line; removals sit
+        // directly under their marker.
+        assert_regex!(joined, "(?m)^-> pulls in:");
+        assert_regex!(joined, r"(?m)^\s+gcc13\s+\(install\)");
+        assert_regex!(joined, r"(?m)^\s+nvidia-utils\s+\(build\)");
+        assert_regex!(joined, r"-> will remove:\n\s+old-cuda");
+        assert_regex!(joined, r"(?m)^-> total  \S");
     }
 
     /// A pure-repo cart with no deps/removals: just numbered rows + a total with
@@ -783,13 +791,18 @@ mod tests {
         let mut pac = PacmanIndex::default();
         pac.sync_download_size.insert("glibc".into(), 1024);
         let roots = vec![root("core", "glibc", Some("1-1"), Some("1-2"))];
-        let table = transaction_table(&roots, &[], &[], &[], &pac, &PreviewMetrics::empty());
-        let total = table.lines().last().unwrap();
-        assert!(total.contains("-> total"));
-        assert!(
-            !total.contains("build"),
-            "pure-repo total has no build term: {total:?}"
+        let table = transaction_table(
+            &roots,
+            &[],
+            &[],
+            &[],
+            &pac,
+            &PreviewMetrics::empty(),
+            Paint::Plain,
         );
+        let total = table.lines().last().unwrap();
+        assert_regex!(total, r"^-> total  \S");
+        assert_not_contains!(total, "build", "pure-repo total has no build term");
     }
 
     /// The one-line summary lists counts + size, omits the deps/remove/build
