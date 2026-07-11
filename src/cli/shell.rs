@@ -1709,6 +1709,7 @@ impl RealEnv<'_> {
             &removals,
             &r.size_pac,
             &r.metrics,
+            ui::Paint::detect(),
         ))
     }
 

@@ -9,6 +9,52 @@ use crate::paths::state_root;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Assert a string contains a substring, printing needle and haystack on failure.
+///
+/// A bare `assert!(h.contains(n))` reports neither side, which makes a failure
+/// on another machine undiagnosable. Optional trailing format args prefix the
+/// message with context.
+#[macro_export]
+macro_rules! assert_contains {
+    ($haystack:expr, $needle:expr $(,)?) => {{
+        let (h, n) = (&$haystack, $needle);
+        assert!(h.contains(n), "expected {n:?} in {h:?}");
+    }};
+    ($haystack:expr, $needle:expr, $($ctx:tt)+) => {{
+        let (h, n) = (&$haystack, $needle);
+        assert!(h.contains(n), "{}: expected {n:?} in {h:?}", format_args!($($ctx)+));
+    }};
+}
+
+/// Negated [`assert_contains!`]: the substring must be absent.
+#[macro_export]
+macro_rules! assert_not_contains {
+    ($haystack:expr, $needle:expr $(,)?) => {{
+        let (h, n) = (&$haystack, $needle);
+        assert!(!h.contains(n), "expected no {n:?} in {h:?}");
+    }};
+    ($haystack:expr, $needle:expr, $($ctx:tt)+) => {{
+        let (h, n) = (&$haystack, $needle);
+        assert!(!h.contains(n), "{}: expected no {n:?} in {h:?}", format_args!($($ctx)+));
+    }};
+}
+
+/// Assert a string matches a regex (`regex`-crate syntax), printing pattern
+/// and haystack on failure.
+///
+/// One anchored pattern can pin a whole rendered row's structure — order,
+/// adjacency, same-line pairing — where a pile of `contains` checks can't.
+/// No lookaround exists, so express absence with [`assert_not_contains!`]
+/// instead.
+#[macro_export]
+macro_rules! assert_regex {
+    ($haystack:expr, $pattern:expr $(,)?) => {{
+        let (h, p) = (&$haystack, $pattern);
+        let re = ::regex::Regex::new(p).expect("test regex must compile");
+        assert!(re.is_match(h), "expected {h:?} to match /{p}/");
+    }};
+}
+
 /// RAII guard that reroutes [`crate::paths::state_dir`] to a custom root.
 ///
 /// Affects everything that derives from it — `aur_repo_path`, `index_path`,
