@@ -83,8 +83,13 @@ in_image '
     rm -rf "$DIR/profraw"
     find "$DIR" -maxdepth 1 \( -name "*.profraw" -o -name "*.profdata" \) -delete 2>/dev/null || true
     mkdir -p "$DIR/profraw/rust" "$DIR/profraw/podman"
+    # Under script(1) so the suite runs with a tty on stdio — the condition an
+    # interactive `makepkg check()` creates. v0.1.2 shipped a test that passed
+    # on tty-less CI but failed on every interactive host: color autodetection
+    # (`color_on()` asks "is stderr a tty") flipped the rendering under test.
+    # The Tier-1 job keeps the piped, plain-rendering condition covered.
     LLVM_PROFILE_FILE="$DIR/profraw/rust/%p-%m.profraw" \
-        cargo test --all-features --locked --no-fail-fast
+        script -qec "cargo test --all-features --locked --no-fail-fast" /dev/null
     # Build aurox plus the PTY/HTTP driver examples the extended tier shells out
     # to (shell_cart_e2e, shell_upgrade_e2e, tarpit, …). They land in the same
     # coverage-build dir, so tests/container/lib.sh finds them next to $AUROX;
