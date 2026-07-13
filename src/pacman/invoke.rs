@@ -5,13 +5,15 @@ use crate::context;
 use crate::error::{Error, Result};
 use crate::names::{PkgName, RepoName};
 use crate::pacman::alpm_db;
+use crate::pacman::preflight;
 use crate::runopts;
 use crate::ui;
 use crate::version::Version;
-use alpm::{Alpm, PrepareData, PrepareError, SigLevel, TransFlag};
+use alpm::Alpm;
 use console::strip_ansi_codes;
 use std::io::{IsTerminal, Read, Write};
 use std::os::unix::process::ExitStatusExt;
+use std::path::Path;
 use std::process::{Command, Stdio};
 use tracing::{debug, error, info, instrument, warn};
 
@@ -105,13 +107,13 @@ pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
         confirm_escalation(program, &spawn_args)?;
     }
     debug!(program, args = ?spawn_args, "spawning pacman");
-    // For `-U <files>`, ask libalpm what would happen before pacman runs.
-    // Pacman under `--noconfirm` suppresses the conflict-pair detail (it
-    // would normally be the body of an interactive prompt), so the only
-    // way to get structured diagnostics into the execution log is to do
-    // the prepare ourselves. Best-effort: any failure is logged at debug
-    // and we still hand off to the real pacman.
-    preflight_dash_u(argv);
+    // For `-U <files>` and `-S…u` sysupgrades, ask libalpm what would happen
+    // before pacman runs. Pacman under `--noconfirm` suppresses the
+    // conflict-pair / broken-dep detail (it would normally be the body of an
+    // interactive prompt), so the only way to get structured diagnostics into
+    // the execution log is to do the prepare ourselves. Best-effort: any
+    // failure is logged at debug and we still hand off to the real pacman.
+    preflight_pacman(argv);
 
     // On a real terminal, hand pacman the inherited TTY: it draws its own
     // download + transaction progress bars and reads prompts (and the sudo
@@ -267,14 +269,16 @@ fn confirm_escalation(program: &str, spawn_args: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Run a read-only libalpm `trans_prepare` against `-U` artifact paths to
-/// surface the conflict / unsatisfied-dep set BEFORE spawning pacman.
+/// Run the read-only [`preflight`] matching the imminent pacman invocation —
+/// [`preflight::files`] for `-U <files>`, [`preflight::sysupgrade`] for the
+/// `-S…u` family — and land whatever it flags in the execution log as
+/// structured warn events.
 ///
 /// Pacman with `--noconfirm` swallows the offending pair from its terminal
 /// output (it would have been the body of the interactive "Replace X with
 /// Y?" prompt). The execution log then only sees the generic
 /// `unresolvable package conflicts detected` line. Computing the prepare
-/// ourselves writes the structured pair (`pkg1`, `pkg2`, `reason`) into
+/// ourselves writes the structured detail (`pkg1`, `pkg2`, `reason`, …) into
 /// the log as tracing fields, so the next failure is diagnosable from the
 /// log alone.
 ///
@@ -282,39 +286,29 @@ fn confirm_escalation(program: &str, spawn_args: &[String]) -> Result<()> {
 /// with the real pacman invocation. We never block an install on the
 /// pre-flight succeeding (alpm might refuse for sig/db/lock reasons that
 /// don't reflect the real install path).
-fn preflight_dash_u(argv: &[String]) {
-    let Some(paths) = dash_u_paths(argv) else {
+fn preflight_pacman(argv: &[String]) {
+    let issues = if let Some(paths) = dash_u_paths(argv) {
+        if paths.is_empty() {
+            return;
+        }
+        preflight::files(&paths)
+    } else if let Some(ignores) = sysupgrade_ignores(argv) {
+        preflight::sysupgrade(&ignores)
+    } else {
         return;
     };
-    if paths.is_empty() {
-        return;
-    }
-    match preflight_dash_u_inner(&paths) {
-        Ok(PreflightOutcome::Flagged) => debug!(
-            count = paths.len(),
-            "pacman preflight: prepare flagged issues (see warnings above)",
-        ),
-        Ok(PreflightOutcome::Clean) => {
-            debug!(count = paths.len(), "pacman preflight: prepare clean");
+    match issues {
+        Ok(issues) => {
+            preflight::log_issues(&issues);
+            debug!(flagged = issues.len(), "pacman preflight: prepare ran");
         }
         Err(e) => debug!(error = %e, "pacman preflight skipped (could not run prepare)"),
     }
 }
 
-/// What `trans_prepare` told us about the artifact set.
-///
-/// `Flagged` means alpm returned a `PrepareError` whose detail (conflict
-/// pair / unsatisfied dep / invalid arch) we've already emitted as structured
-/// `warn!` events — the variant just records that the diagnostic fired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PreflightOutcome {
-    Clean,
-    Flagged,
-}
-
 /// Extract the file arguments to a `-U` invocation, ignoring flags. Returns
 /// `None` when `argv` isn't a `-U` at all (so callers skip the pre-flight).
-fn dash_u_paths(argv: &[String]) -> Option<Vec<&str>> {
+fn dash_u_paths(argv: &[String]) -> Option<Vec<&Path>> {
     let mut found_u = false;
     let mut paths = Vec::new();
     for a in argv {
@@ -328,79 +322,38 @@ fn dash_u_paths(argv: &[String]) -> Option<Vec<&str>> {
         if a.starts_with('-') {
             continue;
         }
-        paths.push(a.as_str());
+        paths.push(Path::new(a.as_str()));
     }
     found_u.then_some(paths)
 }
 
-/// Run the read-only prepare against `paths` and return a [`PreflightOutcome`]
-/// describing whether issues were reported (and already logged). `Err` means
-/// we couldn't even run the prepare — caller treats that as best-effort skip.
-fn preflight_dash_u_inner(paths: &[&str]) -> Result<PreflightOutcome> {
-    let mut alpm = alpm_db::open()?;
-    // NO_LOCK: skip taking /var/lib/pacman/db.lck — we're a non-root reader,
-    // and the real pacman invocation will take the lock for the actual write.
-    // NEEDED: mirror the real `--needed` flag so we don't flag a conflict for
-    // a same-version reinstall that pacman would silently skip.
-    alpm.trans_init(TransFlag::NO_LOCK | TransFlag::NEEDED)
-        .map_err(|e| Error::other(format!("alpm trans_init: {e}")))?;
-    for path in paths {
-        let loaded = alpm
-            .pkg_load(*path, true, SigLevel::NONE)
-            .map_err(|e| Error::other(format!("alpm pkg_load {path}: {e}")))?;
-        alpm.trans_add_pkg(loaded)
-            .map_err(|e| Error::other(format!("alpm trans_add_pkg {path}: {}", e.error)))?;
+/// The `--ignore` pin set of a sysupgrade invocation (`-Su`, `-Syu`, `-Syyu`,
+/// …, with or without pins). `None` when `argv` isn't a sysupgrade at all (so
+/// callers skip the pre-flight).
+fn sysupgrade_ignores(argv: &[String]) -> Option<Vec<PkgName>> {
+    // A `-S` cluster whose modifiers include `u` — matches how `cli::flags`
+    // reads pacman-style clustered ops, without dragging that parser in here.
+    let is_sysupgrade = argv.iter().any(|a| {
+        a.strip_prefix("-S")
+            .is_some_and(|mods| !mods.is_empty() && mods.contains('u'))
+    });
+    if !is_sysupgrade {
+        return None;
     }
-    // PrepareError borrows `alpm`, so it must be dropped before
-    // trans_release (which needs `&mut alpm`). Report in-arm, then drop.
-    let outcome = if let Err(prep_err) = alpm.trans_prepare() {
-        report_preflight_failure(&prep_err);
-        PreflightOutcome::Flagged
-    } else {
-        PreflightOutcome::Clean
-    };
-    alpm.trans_release().ok();
-    Ok(outcome)
-}
-
-/// Log each prepare-time complaint as its own structured warn event so the
-/// fields (`pkg1`, `pkg2`, `reason`, …) are queryable in the log.
-fn report_preflight_failure(err: &PrepareError<'_>) {
-    let Some(data) = err.data() else {
-        warn!(error = %err, "pacman preflight: prepare failed without detail");
-        return;
-    };
-    match data {
-        PrepareData::ConflictingDeps(list) => {
-            for c in list {
-                warn!(
-                    pkg1 = c.package1().name(),
-                    pkg2 = c.package2().name(),
-                    reason = %c.reason(),
-                    "pacman preflight: conflict detected",
-                );
-            }
-        }
-        PrepareData::UnsatisfiedDeps(list) => {
-            for m in list {
-                warn!(
-                    target = m.target(),
-                    depend = %m.depend(),
-                    causing_pkg = m.causing_pkg().unwrap_or("(none)"),
-                    "pacman preflight: unsatisfied dep",
-                );
-            }
-        }
-        PrepareData::PkgInvalidArch(list) => {
-            for p in list {
-                warn!(
-                    pkg = p.name(),
-                    arch = p.arch().unwrap_or("(unknown)"),
-                    "pacman preflight: invalid architecture",
-                );
-            }
-        }
+    let mut ignores = Vec::new();
+    let mut rest = argv.iter();
+    while let Some(a) = rest.next() {
+        let csv = match a.strip_prefix("--ignore=") {
+            Some(csv) => csv,
+            None if a == "--ignore" => match rest.next() {
+                Some(next) => next.as_str(),
+                None => break,
+            },
+            None => continue,
+        };
+        ignores.extend(csv.split(',').filter(|s| !s.is_empty()).map(PkgName::new));
     }
+    Some(ignores)
 }
 
 fn with_pacman(argv: &[String]) -> Vec<String> {
@@ -494,36 +447,74 @@ mod tests {
         assert!(captured.is_empty());
     }
 
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_owned()).collect()
+    }
+
     #[test]
     fn dash_u_paths_extracts_files_only() {
-        let argv: Vec<String> = [
+        let argv = argv(&[
             "-U",
             "--needed",
             "--noconfirm",
             "/p/a.pkg.tar.zst",
             "/p/b.pkg.tar.zst",
-        ]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
+        ]);
         let paths = dash_u_paths(&argv).expect("argv has -U");
-        assert_eq!(paths, vec!["/p/a.pkg.tar.zst", "/p/b.pkg.tar.zst"]);
+        assert_eq!(
+            paths,
+            vec![Path::new("/p/a.pkg.tar.zst"), Path::new("/p/b.pkg.tar.zst")]
+        );
     }
 
     #[test]
     fn dash_u_paths_returns_none_without_dash_u() {
-        let argv: Vec<String> = ["-Syu", "--noconfirm"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        assert!(dash_u_paths(&argv).is_none());
+        assert!(dash_u_paths(&argv(&["-Syu", "--noconfirm"])).is_none());
     }
 
     #[test]
     fn dash_u_paths_empty_when_no_files() {
-        let argv: Vec<String> = ["-U", "--needed"].iter().map(|s| (*s).to_owned()).collect();
-        let paths = dash_u_paths(&argv).expect("argv has -U");
+        let args = argv(&["-U", "--needed"]);
+        let paths = dash_u_paths(&args).expect("argv has -U");
         assert!(paths.is_empty());
+    }
+
+    #[test]
+    fn sysupgrade_ignores_detects_the_dash_s_u_family() {
+        // The two argv shapes aurox emits itself…
+        assert_eq!(
+            sysupgrade_ignores(&argv(&["-Syu", "--noconfirm"])),
+            Some(vec![])
+        );
+        assert_eq!(
+            sysupgrade_ignores(&argv(&["-Syu", "--noconfirm", "--ignore", "foo,bar"])),
+            Some(vec![PkgName::new("foo"), PkgName::new("bar")])
+        );
+        // …plus the passthrough shapes a user may type.
+        assert_eq!(
+            sysupgrade_ignores(&argv(&["-Su", "--ignore=baz"])),
+            Some(vec![PkgName::new("baz")])
+        );
+        assert_eq!(sysupgrade_ignores(&argv(&["-Syyu"])), Some(vec![]));
+        // A trailing value-less `--ignore` pins nothing rather than erroring —
+        // pacman itself rejects the argv later.
+        assert_eq!(
+            sysupgrade_ignores(&argv(&["-Syu", "--ignore"])),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn sysupgrade_ignores_none_for_non_sysupgrade_ops() {
+        for args in [
+            &["-S", "foo"][..],
+            &["-Sy"],
+            &["-Sc"],
+            &["-U", "x.pkg.tar.zst"],
+            &["-R", "foo"],
+        ] {
+            assert_eq!(sysupgrade_ignores(&argv(args)), None, "argv {args:?}");
+        }
     }
 
     #[test]

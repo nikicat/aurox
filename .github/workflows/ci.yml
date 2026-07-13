@@ -2,8 +2,22 @@ name: CI
 
 on:
   push:
-    branches: ['**']
+    # main only: PR branches are covered by the pull_request event, and a
+    # both-events trigger runs everything twice per push — worse, the
+    # concurrency group's cancelled twin leaves CANCELLED check runs with
+    # the required-check names on the sha, which blocks the merge under
+    # the branch protection policy.
+    branches: [main]
   pull_request:
+
+concurrency:
+  # Rapid successive pushes to a PR branch cancel the outdated in-progress
+  # run (head_ref is set on pull_request events; ref_name covers main
+  # pushes). main is exempt from cancellation: every merge commit's run
+  # must finish to upload the codecov baseline the next PR compares
+  # against.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -116,6 +130,10 @@ jobs:
           # project-local CARGO_HOME (target/coverage-cargo) used by the
           # in-image cargo invocations. Caching it makes incremental coverage
           # runs cheap; cold runs still take a full cargo build + test.
+          # Safe to restore across commits only because scripts/coverage.sh
+          # purges ghost workspace binaries before building — a restored cache
+          # can carry stale-generation executables whose embedded coverage
+          # maps would otherwise pollute every report (see step 1 there).
           path: |
             target
           key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock', 'tests/container/Dockerfile') }}

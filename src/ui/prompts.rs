@@ -14,23 +14,50 @@ pub fn confirm(prompt: &str, noconfirm: bool) -> std::io::Result<bool> {
     if noconfirm {
         return Ok(true);
     }
+    interact(prompt, true)
+}
+
+/// y/N confirmation prompt with `N` default — for "are you sure you want to
+/// override the safety check?" gates, where walking away must mean *no*.
+///
+/// Deliberately no `noconfirm` parameter: an auto-answer would either bypass
+/// the safety (`true`) or dead-end a scripted run (`false`), so the caller
+/// decides what a non-interactive run does *before* prompting.
+pub fn confirm_default_no(prompt: &str) -> std::io::Result<bool> {
+    interact(prompt, false)
+}
+
+/// Shared prompt body: dialoguer on a TTY, a plain `read_line` fallback
+/// otherwise (so tests and pipes can feed an answer). An empty line or EOF
+/// takes `default`; only an explicit y/n overrides it.
+fn interact(prompt: &str, default: bool) -> std::io::Result<bool> {
     let stdin = std::io::stdin();
     if !stdin.is_terminal() {
+        let hint = if default { "[Y/n]" } else { "[y/N]" };
         let mut out = std::io::stdout().lock();
-        write!(out, "{prompt} [Y/n] ")?;
+        write!(out, "{prompt} {hint} ")?;
         out.flush()?;
         let mut line = String::new();
         if stdin.lock().read_line(&mut line)? == 0 {
-            return Ok(true);
+            return Ok(default);
         }
-        let answer = line.trim();
-        return Ok(!matches!(answer, "n" | "N" | "no" | "No" | "NO"));
+        return Ok(parse_answer(&line, default));
     }
     Confirm::new()
         .with_prompt(prompt)
-        .default(true)
+        .default(default)
         .interact()
         .map_err(std::io::Error::other)
+}
+
+/// Map one piped answer line to a decision: an explicit y/n wins; an empty
+/// line or anything unrecognized takes `default`.
+fn parse_answer(line: &str, default: bool) -> bool {
+    match line.trim() {
+        "y" | "Y" | "yes" | "Yes" | "YES" => true,
+        "n" | "N" | "no" | "No" | "NO" => false,
+        _ => default,
+    }
 }
 
 /// Ask the user which pkgnames of a split pkgbase to install.
@@ -72,4 +99,27 @@ pub fn select_pkgnames(
         .interact()
         .map_err(std::io::Error::other)?;
     Ok(chosen.into_iter().map(|i| pkgnames[i].clone()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_answer;
+
+    #[test]
+    fn explicit_answers_override_either_default() {
+        for yes in ["y", "Y", "yes", "Yes", "YES", " yes\n"] {
+            assert!(parse_answer(yes, false), "{yes:?} must read as yes");
+        }
+        for no in ["n", "N", "no", "No", "NO", " no\n"] {
+            assert!(!parse_answer(no, true), "{no:?} must read as no");
+        }
+    }
+
+    #[test]
+    fn empty_or_noise_takes_the_default() {
+        for line in ["", "\n", "maybe", "j", "yep"] {
+            assert!(parse_answer(line, true), "{line:?} with default=yes");
+            assert!(!parse_answer(line, false), "{line:?} with default=no");
+        }
+    }
 }
