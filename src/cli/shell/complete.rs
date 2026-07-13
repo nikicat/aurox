@@ -19,7 +19,7 @@
 //! sources the [`selector`](super::selector) resolver uses, so "what Tab offers"
 //! and "what the verb accepts" can't drift.
 
-use super::command;
+use super::command::{self, SystemAction, Verb};
 use crate::names::PkgTarget;
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
@@ -42,6 +42,8 @@ const MAX_CANDIDATES: usize = 200;
 enum ArgKind {
     /// `help <topic>` — completes verbs, like the first word.
     Verbs,
+    /// `system <action>` — the maintenance sub-verbs.
+    SystemActions,
     /// `search`/`add`/`info`/`remove` — the full name universe.
     Universe,
     /// `drop`/`keep`/`review`/`approve`/`upgrade` — names currently in the cart.
@@ -50,14 +52,38 @@ enum ArgKind {
     None,
 }
 
-/// What a canonical verb's arguments complete against.
-const fn arg_kind(verb: &str) -> ArgKind {
-    match verb.as_bytes() {
-        b"help" => ArgKind::Verbs,
-        b"search" | b"add" | b"info" | b"remove" => ArgKind::Universe,
-        b"drop" | b"keep" | b"review" | b"approve" | b"upgrade" => ArgKind::Cart,
-        _ => ArgKind::None,
+/// What a canonical verb's arguments complete against. Exhaustive over
+/// [`Verb`] so a new verb can't reach the completer undecided; `None` (a
+/// non-verb line) completes nothing.
+const fn arg_kind(verb: Option<Verb>) -> ArgKind {
+    match verb {
+        Some(Verb::Help) => ArgKind::Verbs,
+        Some(Verb::System) => ArgKind::SystemActions,
+        Some(Verb::Search | Verb::Add | Verb::Info | Verb::Remove) => ArgKind::Universe,
+        Some(Verb::Drop | Verb::Keep | Verb::Review | Verb::Approve | Verb::Upgrade) => {
+            ArgKind::Cart
+        }
+        Some(
+            Verb::Show
+            | Verb::Apply
+            | Verb::Undo
+            | Verb::Redo
+            | Verb::Clear
+            | Verb::Refresh
+            | Verb::Quit,
+        )
+        | None => ArgKind::None,
     }
+}
+
+/// The canonical verb names, in help order — the command-position word list.
+fn verb_names() -> impl Iterator<Item = &'static str> {
+    Verb::ALL.iter().map(|v| v.name())
+}
+
+/// The `system` action names, in help order.
+fn action_names() -> impl Iterator<Item = &'static str> {
+    SystemAction::ALL.iter().map(|a| a.name())
 }
 
 /// The shell's rustyline helper.
@@ -108,10 +134,11 @@ impl ShellHelper {
         let before = &line[..start];
         // First word (nothing but whitespace before the cursor word) → verbs.
         let cands = if before.trim().is_empty() {
-            verb_candidates(word)
+            word_candidates(verb_names(), word)
         } else {
             match arg_kind(command::parse(before).verb()) {
-                ArgKind::Verbs => verb_candidates(word),
+                ArgKind::Verbs => word_candidates(verb_names(), word),
+                ArgKind::SystemActions => word_candidates(action_names(), word),
                 ArgKind::Universe => self.name_candidates(word),
                 ArgKind::Cart => prefix_pairs(self.cart.iter().map(PkgTarget::as_str), word),
                 ArgKind::None => Vec::new(),
@@ -169,10 +196,11 @@ impl ShellHelper {
         }
         let before = &line[..start];
         if before.trim().is_empty() {
-            return verb_hint(word);
+            return word_hint(verb_names(), word);
         }
         match arg_kind(command::parse(before).verb()) {
-            ArgKind::Verbs => verb_hint(word),
+            ArgKind::Verbs => word_hint(verb_names(), word),
+            ArgKind::SystemActions => word_hint(action_names(), word),
             ArgKind::Universe => self.universe_hint(word),
             ArgKind::Cart => cart_hint(&self.cart, word),
             ArgKind::None => None,
@@ -197,13 +225,13 @@ impl ShellHelper {
     }
 }
 
-/// Command-position hint: the tail of the *first* verb starting with `word`,
-/// plus a trailing space (readying the cursor for an argument, like Tab). `None`
-/// when nothing matches or `word` is already a whole verb (only the space would
-/// be left — not worth a hint).
-fn verb_hint(word: &str) -> Option<String> {
-    let verb = command::VERBS.iter().find(|v| v.starts_with(word))?;
-    let suffix = &verb[word.len()..];
+/// Command-position hint: the tail of the *first* word (verb or `system`
+/// action) starting with `word`, plus a trailing space (readying the cursor
+/// for an argument, like Tab). `None` when nothing matches or `word` is
+/// already whole (only the space would be left — not worth a hint).
+fn word_hint(mut words: impl Iterator<Item = &'static str>, word: &str) -> Option<String> {
+    let hit = words.find(|w| w.starts_with(word))?;
+    let suffix = &hit[word.len()..];
     (!suffix.is_empty()).then(|| format!("{suffix} "))
 }
 
@@ -248,16 +276,15 @@ fn common_prefix_len(a: &str, b: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Canonical verbs with the given prefix. The replacement carries a trailing
-/// space so a completed verb (`app` → `apply `) leaves the cursor ready for an
-/// argument.
-fn verb_candidates(prefix: &str) -> Vec<Pair> {
-    command::VERBS
-        .iter()
-        .filter(|v| v.starts_with(prefix))
-        .map(|v| Pair {
-            display: (*v).to_owned(),
-            replacement: format!("{v} "),
+/// Command-position words (verbs or `system` actions) with the given prefix.
+/// The replacement carries a trailing space so a completed word (`app` →
+/// `apply `) leaves the cursor ready for an argument.
+fn word_candidates(words: impl Iterator<Item = &'static str>, prefix: &str) -> Vec<Pair> {
+    words
+        .filter(|w| w.starts_with(prefix))
+        .map(|w| Pair {
+            display: w.to_owned(),
+            replacement: format!("{w} "),
         })
         .collect()
 }
@@ -379,7 +406,24 @@ mod tests {
     #[test]
     fn empty_first_word_offers_every_verb() {
         let h = helper(&[], &[]);
-        assert_eq!(complete(&h, "").len(), command::VERBS.len());
+        assert_eq!(complete(&h, "").len(), Verb::ALL.len());
+    }
+
+    #[test]
+    fn system_arg_completes_the_actions() {
+        let h = helper(&["showcase", "pruneyard"], &[]);
+        // The `system` argument position offers the sub-verbs — never the
+        // universe names that share the prefix.
+        assert_eq!(complete(&h, "system "), vec!["show ", "prune "]);
+        assert_eq!(complete(&h, "system pr"), vec!["prune "]);
+        assert_eq!(complete(&h, "system sh"), vec!["show "]);
+    }
+
+    #[test]
+    fn system_arg_hints_the_first_matching_action() {
+        let h = helper(&[], &[]);
+        assert_eq!(hint(&h, "system pr").as_deref(), Some("une "));
+        assert_eq!(hint(&h, "system s").as_deref(), Some("how "));
     }
 
     #[test]

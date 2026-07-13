@@ -36,13 +36,15 @@ use crate::pacman::invoke::{self, PkgUpgrade, REPO_AUR};
 use crate::pacman::preflight;
 use crate::paths;
 use crate::resolver::Plan;
+use crate::system;
 use crate::ui::{self, UpgradeSelection};
+use crate::units::ByteSize;
 use crate::version::Version;
 use cart::{
     ApplyOutcome, Approval, ApproveResult, AurApproval, Cart, CartItem, KeepResult, ReviewOutcome,
     Source, StageClass, StageResult, UnstageResult,
 };
-use command::Command;
+use command::{Command, SystemAction, Verb};
 use complete::ShellHelper;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -168,6 +170,61 @@ pub trait ShellEnv {
     /// Run the staged transaction: resolve + preview + confirm + build/install +
     /// removals. Reads the cart; the dispatch core updates it from the outcome.
     fn apply(&mut self, cart: &Cart) -> Result<ApplyOutcome>;
+    /// Measure aurox's on-disk state per category, for `system show`.
+    /// Infallible: missing/unreadable paths report as zero.
+    fn system_usage(&mut self) -> system::Report;
+    /// `system prune`: delete the re-derivable caches (mirror, index, sync
+    /// dbs, build trees) behind a y/N confirm. `Ok(None)` = user declined.
+    /// Returns the bytes freed. The in-memory session stays loaded — search
+    /// and info keep working from it until a `refresh` re-fetches everything.
+    fn system_prune(&mut self) -> Result<Option<ByteSize>>;
+}
+
+/// `system <show|prune>` — the maintenance group. A free function rather than
+/// a [`State`] method: it reads no session state (no cart, no lists), only the
+/// env seam.
+fn system_dispatch<E: ShellEnv>(action: Option<SystemAction>, env: &mut E) {
+    match action {
+        None => env.print("usage: system <show|prune> — see `help system`"),
+        Some(SystemAction::Show) => {
+            let report = env.system_usage();
+            print_system_report(&report, env);
+        }
+        Some(SystemAction::Prune) => match env.system_prune() {
+            Ok(Some(freed)) => env.print(&format!(
+                "caches pruned — {freed} freed; `refresh` re-fetches the mirror + index"
+            )),
+            Ok(None) => env.print("prune cancelled — nothing removed"),
+            Err(e) => env.print(&format!("prune: {e}")),
+        },
+    }
+}
+
+/// Render the `system show` table through `env`: one aligned row per state
+/// category (size + what it holds, cache rows tagged) and a total line saying
+/// what `system prune` would free.
+// TODO: consolidate the table-formatting code — this hand-rolled column
+// layout, the width math inside `ui::search_table` / `ui::transaction_table`,
+// and the HELP_TEXT column convention each re-implement aligned columns;
+// `ui::Table` only collects rendered lines. One shared column-layout helper
+// should own padding/alignment so the conventions can't drift per call site.
+fn print_system_report<E: ShellEnv>(report: &system::Report, env: &mut E) {
+    env.print(&format!("state under {}:", report.root.display()));
+    for row in &report.rows {
+        let tag = if row.kind.prunable() { "  [cache]" } else { "" };
+        env.print(&format!(
+            "  {:<8} {:>10}  {}{tag}",
+            row.kind.label(),
+            row.size,
+            row.kind.description(),
+        ));
+    }
+    env.print(&format!(
+        "  {:<8} {:>10}  `system prune` frees the [cache] rows ({})",
+        "total",
+        report.total(),
+        report.prunable_total(),
+    ));
 }
 
 /// Pure command dispatch: map a parsed [`Command`] to side effects + control
@@ -270,6 +327,10 @@ impl State {
                     Ok(()) => env.print("mirror + index refreshed"),
                     Err(e) => env.print(&format!("refresh: {e}")),
                 }
+                Flow::Continue
+            }
+            Command::System(action) => {
+                system_dispatch(*action, env);
                 Flow::Continue
             }
         }
@@ -1028,6 +1089,7 @@ commands:
   redo                reapply the last undone change
   clear               empty the cart
   refresh             re-fetch the AUR mirror + index
+  system show|prune   disk usage of aurox's state / delete the caches
   help [topic]        this list, or `help <command>` for detail on one
   quit                leave the shell (also: Ctrl-D)
 selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
@@ -1035,81 +1097,81 @@ selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
 numbers index the list you last brought up — search results (`search`) or the
 transaction (`show`/`upgrade`/`drop`/`keep`)";
 
-/// Per-command help shown by `help <topic>`, keyed by canonical verb (the same
-/// order as [`command::VERBS`]). Each body opens with a usage line (and any
+/// Per-command help shown by `help <topic>`, keyed by canonical [`Verb`] (the
+/// same order as [`Verb::ALL`]). Each body opens with a usage line (and any
 /// aliases) then a short paragraph — enough to answer "what does this verb do
 /// and what does it act on" without leaving the shell.
-const TOPICS: &[(&str, &str)] = &[
+const TOPICS: &[(Verb, &str)] = &[
     (
-        "search",
+        Verb::Search,
         "search <terms…>\n  \
          Query repos + AUR by name, description, and provides. Prints a numbered,\n  \
          ranked list (best matches nearest the prompt) and remembers it, so a later\n  \
          `add 3` / `info 1-4` can index it by number.",
     ),
     (
-        "info",
+        Verb::Info,
         "info <sel…>\n  \
          Show package details. sel = name, number (a row in the shown list), range\n  \
          (`5-8`), or glob (`python-*`).",
     ),
     (
-        "add",
+        Verb::Add,
         "add <sel…>   (alias: install)\n  \
          Stage packages to install in the pending transaction. Resolves against the\n  \
          last list, the AUR index, and the sync DBs — you can add anything.",
     ),
     (
-        "drop",
+        Verb::Drop,
         "drop <sel…>   (aliases: discard, unstage)\n  \
          Un-stage packages from the cart — resolves against what's staged. `drop aur`\n  \
          un-stages every AUR row. Distinct from `remove`, which stages an uninstall.",
     ),
     (
-        "keep",
+        Verb::Keep,
         "keep <sel…>   (alias: only)\n  \
          Keep only the selected staged packages and drop the rest — the inverse of\n  \
          `drop`.",
     ),
     (
-        "remove",
+        Verb::Remove,
         "remove <sel…>   (aliases: uninstall, rm)\n  \
          Stage an uninstall (`pacman -R`) in the transaction. Note the difference from\n  \
          `drop`: `drop` un-stages a pending install, `remove` stages a removal.",
     ),
     (
-        "upgrade",
+        Verb::Upgrade,
         "upgrade [sel…]   (alias: up)\n  \
          Refresh, recompute the available upgrades, and stage them (repo → approved,\n  \
          AUR → needs review). With sel…, stage only the matching subset.",
     ),
     (
-        "review",
+        Verb::Review,
         "review [sel…]\n  \
          Open a PKGBUILD/diff for staged AUR packages and approve / skip / discard\n  \
          each. No sel reviews every AUR item still awaiting review.",
     ),
     (
-        "approve",
+        Verb::Approve,
         "approve <sel…>\n  \
          Approve staged AUR packages without opening a diff. `approve *` approves\n  \
          every staged AUR package at once.",
     ),
     (
-        "show",
+        Verb::Show,
         "show   (aliases: status, ls)\n  \
          Preview the staged transaction: the change-set table with download sizes,\n  \
          build time, and totals.",
     ),
     (
-        "apply",
+        Verb::Apply,
         "apply   (aliases: commit, do)\n  \
          Build + install the staged transaction in one sudo batch. Runs only when\n  \
          every staged package is approved; an interrupted or failed apply drops back\n  \
          to the shell with the cart intact so you can `drop` the offender and retry.",
     ),
     (
-        "undo",
+        Verb::Undo,
         "undo\n  \
          Revert the last cart-changing command (add / drop / keep / remove /\n  \
          upgrade / approve / clear) — e.g. undo a `keep` that dropped too much.\n  \
@@ -1117,25 +1179,34 @@ const TOPICS: &[(&str, &str)] = &[
          (`apply`) forgets the history.",
     ),
     (
-        "redo",
+        Verb::Redo,
         "redo\n  \
          Reapply the change `undo` just reverted. Available until the next\n  \
          cart-changing command, which forks a new edit branch.",
     ),
-    ("clear", "clear\n  Empty the cart."),
+    (Verb::Clear, "clear\n  Empty the cart."),
     (
-        "refresh",
+        Verb::Refresh,
         "refresh\n  \
          Re-fetch the AUR mirror and reload the index — fresh data for\n  \
          search / info / upgrade / completion. Leaves the cart untouched.",
     ),
     (
-        "help",
+        Verb::System,
+        "system <show|prune>\n  \
+         Maintenance for aurox's on-disk state. `system show` prints each\n  \
+         category's disk usage (AUR mirror, package index, repo db snapshot,\n  \
+         build worktrees, logs, …). `system prune` deletes the re-derivable\n  \
+         caches after a y/N confirm — the next `refresh` / build recreates\n  \
+         them; build metrics and shell history are never touched.",
+    ),
+    (
+        Verb::Help,
         "help [topic]\n  \
          List the commands, or `help <command>` for detail on one.",
     ),
     (
-        "quit",
+        Verb::Quit,
         "quit   (aliases: exit, q; also Ctrl-D)\n  Leave the shell.",
     ),
 ];
@@ -1145,11 +1216,13 @@ const TOPICS: &[(&str, &str)] = &[
 /// for free, then looks it up in [`TOPICS`]. An unrecognized topic points back at
 /// the bare `help` list rather than erroring.
 fn help_topic(topic: &str) -> String {
-    let verb = command::parse(topic).verb();
-    TOPICS.iter().find(|(v, _)| *v == verb).map_or_else(
-        || format!("no help for `{topic}` — type `help` for the command list"),
-        |(_, body)| (*body).to_owned(),
-    )
+    command::parse(topic)
+        .verb()
+        .and_then(|verb| TOPICS.iter().find(|(v, _)| *v == verb))
+        .map_or_else(
+            || format!("no help for `{topic}` — type `help` for the command list"),
+            |(_, body)| (*body).to_owned(),
+        )
 }
 
 /// Run the interactive shell. Returns the desired process exit code.
@@ -1724,6 +1797,25 @@ impl ShellEnv for RealEnv<'_> {
         }
         Ok(ApplyOutcome::Succeeded)
     }
+
+    fn system_usage(&mut self) -> system::Report {
+        system::usage()
+    }
+
+    fn system_prune(&mut self) -> Result<Option<ByteSize>> {
+        // Quote what the deletion is worth before asking — the mirror alone is
+        // multi-GiB and minutes of re-fetch, so the user should decline cheap.
+        let would_free = system::usage().prunable_total();
+        let prompt =
+            format!("Delete all caches — AUR mirror, index, sync dbs, build trees ({would_free})?");
+        if !ui::confirm_default_no(&prompt)? {
+            return Ok(None);
+        }
+        // The in-memory session (mmap of the now-deleted index) stays valid and
+        // loaded on purpose: search/info keep answering from it, and the next
+        // `refresh`/`upgrade` re-bootstraps the mirror + index from scratch.
+        system::prune().map(Some)
+    }
 }
 
 impl RealEnv<'_> {
@@ -2148,6 +2240,7 @@ fn flat_cart_lines(cart: &Cart, err: &Error) -> Vec<String> {
 mod tests {
     use super::*;
 
+    use crate::assert_regex;
     use std::collections::HashMap;
 
     /// The fake env's captured output: every `print`ed line, in order.
@@ -2222,6 +2315,12 @@ mod tests {
         /// What `apply` returns; absent ⇒ `Succeeded`.
         apply_outcome: Option<ApplyOutcome>,
         apply_calls: CallCount,
+        /// Rows `system_usage` reports (under a fixed `/state` root).
+        usage_rows: Vec<system::Usage>,
+        /// Scripted `system_prune` outcome: `Some(freed)` = confirmed,
+        /// `None` = the user declined the prompt.
+        prune_outcome: Option<ByteSize>,
+        prune_calls: CallCount,
     }
 
     impl ShellEnv for FakeEnv {
@@ -2274,6 +2373,16 @@ mod tests {
         fn apply(&mut self, _cart: &Cart) -> Result<ApplyOutcome> {
             self.apply_calls.bump();
             Ok(self.apply_outcome.take().unwrap_or(ApplyOutcome::Succeeded))
+        }
+        fn system_usage(&mut self) -> system::Report {
+            system::Report {
+                root: std::path::PathBuf::from("/state"),
+                rows: self.usage_rows.clone(),
+            }
+        }
+        fn system_prune(&mut self) -> Result<Option<ByteSize>> {
+            self.prune_calls.bump();
+            Ok(self.prune_outcome)
         }
     }
 
@@ -2385,10 +2494,11 @@ mod tests {
     fn every_verb_has_a_help_topic() {
         // Guards TOPICS against drifting from the verb set: a new verb without a
         // topic (or a renamed one) fails here rather than printing "no help".
-        for verb in command::VERBS {
+        for verb in Verb::ALL {
             assert!(
                 TOPICS.iter().any(|(v, _)| v == verb),
-                "no `help {verb}` topic",
+                "no `help {}` topic",
+                verb.name(),
             );
         }
     }
@@ -2455,6 +2565,82 @@ mod tests {
             "refresh leaves the cart intact"
         );
         assert!(env.lines.contains("refreshed"));
+    }
+
+    #[test]
+    fn system_without_action_prints_usage_and_never_prunes() {
+        // The safety the two-word group exists for: neither a bare `system`
+        // nor a typo'd action may fall through to the prune.
+        for line in ["system", "system wat"] {
+            let mut env = FakeEnv::default();
+            State::default().dispatch(&command::parse(line), &mut env);
+            assert!(
+                env.lines.contains("usage: system"),
+                "`{line}`: {:?}",
+                env.lines
+            );
+            assert_eq!(env.prune_calls.count(), 0, "`{line}` must not prune");
+        }
+    }
+
+    #[test]
+    fn system_show_renders_rows_with_cache_tags_and_the_totals() {
+        let mut env = FakeEnv {
+            usage_rows: vec![
+                system::Usage {
+                    kind: system::StateKind::Mirror,
+                    size: ByteSize::new(2 * 1024 * 1024 * 1024),
+                },
+                system::Usage {
+                    kind: system::StateKind::Metrics,
+                    size: ByteSize::new(1024),
+                },
+            ],
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("system show"), &mut env);
+        assert!(env.lines.contains("state under /state"), "{:?}", env.lines);
+        // One anchored regex per rendered row: label, aligned size, description,
+        // and the [cache] tag only on the prunable row.
+        assert_regex!(
+            env.lines.joined(),
+            r"(?m)^  mirror\s+2\.00 GiB\s+AUR git mirror\s+\[cache\]$"
+        );
+        assert_regex!(
+            env.lines.joined(),
+            r"(?m)^  metrics\s+1\.00 KiB\s+build-time history$"
+        );
+        // The total sums both rows; the prunable half quotes only the mirror.
+        assert_regex!(
+            env.lines.joined(),
+            r"(?m)^  total\s+2\.00 GiB\s+`system prune` frees the \[cache\] rows \(2\.00 GiB\)$"
+        );
+        assert_eq!(env.prune_calls.count(), 0, "show must not prune");
+    }
+
+    #[test]
+    fn system_prune_reports_the_freed_bytes() {
+        let mut env = FakeEnv {
+            prune_outcome: Some(ByteSize::new(3 * 1024 * 1024)),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("system prune"), &mut env);
+        assert_eq!(env.prune_calls.count(), 1);
+        assert!(
+            env.lines
+                .any(|l| l.contains("3.00 MiB freed") && l.contains("`refresh`")),
+            "{:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn system_prune_declined_reports_cancellation() {
+        // `prune_outcome: None` scripts the user answering N at the confirm.
+        let mut env = FakeEnv::default();
+        State::default().dispatch(&command::parse("system prune"), &mut env);
+        assert_eq!(env.prune_calls.count(), 1, "the env owns the prompt");
+        assert!(env.lines.contains("cancelled"), "{:?}", env.lines);
     }
 
     #[test]
