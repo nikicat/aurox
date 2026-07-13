@@ -41,17 +41,23 @@ fn interact(prompt: &str, default: bool) -> std::io::Result<bool> {
         if stdin.lock().read_line(&mut line)? == 0 {
             return Ok(default);
         }
-        return Ok(match line.trim() {
-            "y" | "Y" | "yes" | "Yes" | "YES" => true,
-            "n" | "N" | "no" | "No" | "NO" => false,
-            _ => default,
-        });
+        return Ok(parse_answer(&line, default));
     }
     Confirm::new()
         .with_prompt(prompt)
         .default(default)
         .interact()
         .map_err(std::io::Error::other)
+}
+
+/// Map one piped answer line to a decision: an explicit y/n wins; an empty
+/// line or anything unrecognized takes `default`.
+fn parse_answer(line: &str, default: bool) -> bool {
+    match line.trim() {
+        "y" | "Y" | "yes" | "Yes" | "YES" => true,
+        "n" | "N" | "no" | "No" | "NO" => false,
+        _ => default,
+    }
 }
 
 /// Ask the user which pkgnames of a split pkgbase to install.
@@ -93,4 +99,27 @@ pub fn select_pkgnames(
         .interact()
         .map_err(std::io::Error::other)?;
     Ok(chosen.into_iter().map(|i| pkgnames[i].clone()).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_answer;
+
+    #[test]
+    fn explicit_answers_override_either_default() {
+        for yes in ["y", "Y", "yes", "Yes", "YES", " yes\n"] {
+            assert!(parse_answer(yes, false), "{yes:?} must read as yes");
+        }
+        for no in ["n", "N", "no", "No", "NO", " no\n"] {
+            assert!(!parse_answer(no, true), "{no:?} must read as no");
+        }
+    }
+
+    #[test]
+    fn empty_or_noise_takes_the_default() {
+        for line in ["", "\n", "maybe", "j", "yep"] {
+            assert!(parse_answer(line, true), "{line:?} with default=yes");
+            assert!(!parse_answer(line, false), "{line:?} with default=no");
+        }
+    }
 }
