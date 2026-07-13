@@ -6,5 +6,6 @@
 
 pub mod alpm_db;
 pub mod invoke;
+pub mod preflight;
 pub mod sync;
 pub mod verdiff;
