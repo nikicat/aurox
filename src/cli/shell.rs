@@ -42,7 +42,7 @@ use cart::{
     ApplyOutcome, Approval, ApproveResult, AurApproval, Cart, CartItem, KeepResult, ReviewOutcome,
     Source, StageClass, StageResult, UnstageResult,
 };
-use command::Command;
+use command::{Command, Verb};
 use complete::ShellHelper;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
@@ -1035,81 +1035,81 @@ selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
 numbers index the list you last brought up — search results (`search`) or the
 transaction (`show`/`upgrade`/`drop`/`keep`)";
 
-/// Per-command help shown by `help <topic>`, keyed by canonical verb (the same
-/// order as [`command::VERBS`]). Each body opens with a usage line (and any
+/// Per-command help shown by `help <topic>`, keyed by canonical [`Verb`] (the
+/// same order as [`Verb::ALL`]). Each body opens with a usage line (and any
 /// aliases) then a short paragraph — enough to answer "what does this verb do
 /// and what does it act on" without leaving the shell.
-const TOPICS: &[(&str, &str)] = &[
+const TOPICS: &[(Verb, &str)] = &[
     (
-        "search",
+        Verb::Search,
         "search <terms…>\n  \
          Query repos + AUR by name, description, and provides. Prints a numbered,\n  \
          ranked list (best matches nearest the prompt) and remembers it, so a later\n  \
          `add 3` / `info 1-4` can index it by number.",
     ),
     (
-        "info",
+        Verb::Info,
         "info <sel…>\n  \
          Show package details. sel = name, number (a row in the shown list), range\n  \
          (`5-8`), or glob (`python-*`).",
     ),
     (
-        "add",
+        Verb::Add,
         "add <sel…>   (alias: install)\n  \
          Stage packages to install in the pending transaction. Resolves against the\n  \
          last list, the AUR index, and the sync DBs — you can add anything.",
     ),
     (
-        "drop",
+        Verb::Drop,
         "drop <sel…>   (aliases: discard, unstage)\n  \
          Un-stage packages from the cart — resolves against what's staged. `drop aur`\n  \
          un-stages every AUR row. Distinct from `remove`, which stages an uninstall.",
     ),
     (
-        "keep",
+        Verb::Keep,
         "keep <sel…>   (alias: only)\n  \
          Keep only the selected staged packages and drop the rest — the inverse of\n  \
          `drop`.",
     ),
     (
-        "remove",
+        Verb::Remove,
         "remove <sel…>   (aliases: uninstall, rm)\n  \
          Stage an uninstall (`pacman -R`) in the transaction. Note the difference from\n  \
          `drop`: `drop` un-stages a pending install, `remove` stages a removal.",
     ),
     (
-        "upgrade",
+        Verb::Upgrade,
         "upgrade [sel…]   (alias: up)\n  \
          Refresh, recompute the available upgrades, and stage them (repo → approved,\n  \
          AUR → needs review). With sel…, stage only the matching subset.",
     ),
     (
-        "review",
+        Verb::Review,
         "review [sel…]\n  \
          Open a PKGBUILD/diff for staged AUR packages and approve / skip / discard\n  \
          each. No sel reviews every AUR item still awaiting review.",
     ),
     (
-        "approve",
+        Verb::Approve,
         "approve <sel…>\n  \
          Approve staged AUR packages without opening a diff. `approve *` approves\n  \
          every staged AUR package at once.",
     ),
     (
-        "show",
+        Verb::Show,
         "show   (aliases: status, ls)\n  \
          Preview the staged transaction: the change-set table with download sizes,\n  \
          build time, and totals.",
     ),
     (
-        "apply",
+        Verb::Apply,
         "apply   (aliases: commit, do)\n  \
          Build + install the staged transaction in one sudo batch. Runs only when\n  \
          every staged package is approved; an interrupted or failed apply drops back\n  \
          to the shell with the cart intact so you can `drop` the offender and retry.",
     ),
     (
-        "undo",
+        Verb::Undo,
         "undo\n  \
          Revert the last cart-changing command (add / drop / keep / remove /\n  \
          upgrade / approve / clear) — e.g. undo a `keep` that dropped too much.\n  \
@@ -1117,25 +1117,25 @@ const TOPICS: &[(&str, &str)] = &[
          (`apply`) forgets the history.",
     ),
     (
-        "redo",
+        Verb::Redo,
         "redo\n  \
          Reapply the change `undo` just reverted. Available until the next\n  \
          cart-changing command, which forks a new edit branch.",
     ),
-    ("clear", "clear\n  Empty the cart."),
+    (Verb::Clear, "clear\n  Empty the cart."),
     (
-        "refresh",
+        Verb::Refresh,
         "refresh\n  \
          Re-fetch the AUR mirror and reload the index — fresh data for\n  \
          search / info / upgrade / completion. Leaves the cart untouched.",
     ),
     (
-        "help",
+        Verb::Help,
         "help [topic]\n  \
          List the commands, or `help <command>` for detail on one.",
     ),
     (
-        "quit",
+        Verb::Quit,
         "quit   (aliases: exit, q; also Ctrl-D)\n  Leave the shell.",
     ),
 ];
@@ -1145,11 +1145,13 @@ const TOPICS: &[(&str, &str)] = &[
 /// for free, then looks it up in [`TOPICS`]. An unrecognized topic points back at
 /// the bare `help` list rather than erroring.
 fn help_topic(topic: &str) -> String {
-    let verb = command::parse(topic).verb();
-    TOPICS.iter().find(|(v, _)| *v == verb).map_or_else(
-        || format!("no help for `{topic}` — type `help` for the command list"),
-        |(_, body)| (*body).to_owned(),
-    )
+    command::parse(topic)
+        .verb()
+        .and_then(|verb| TOPICS.iter().find(|(v, _)| *v == verb))
+        .map_or_else(
+            || format!("no help for `{topic}` — type `help` for the command list"),
+            |(_, body)| (*body).to_owned(),
+        )
 }
 
 /// Run the interactive shell. Returns the desired process exit code.
@@ -2385,10 +2387,11 @@ mod tests {
     fn every_verb_has_a_help_topic() {
         // Guards TOPICS against drifting from the verb set: a new verb without a
         // topic (or a renamed one) fails here rather than printing "no help".
-        for verb in command::VERBS {
+        for verb in Verb::ALL {
             assert!(
                 TOPICS.iter().any(|(v, _)| v == verb),
-                "no `help {verb}` topic",
+                "no `help {}` topic",
+                verb.name(),
             );
         }
     }
