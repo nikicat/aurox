@@ -5,6 +5,17 @@ on:
     branches: ['**']
   pull_request:
 
+concurrency:
+  # A push to a PR'd branch fires both `push` and `pull_request` for the
+  # same commit — two full workflows and a doubled set of codecov uploads.
+  # head_ref (set only on pull_request events) and ref_name (plain pushes)
+  # both resolve to the branch name, so the two runs share a group and the
+  # earlier one is cancelled. main is exempt from cancellation: every merge
+  # commit's run must finish to upload the codecov baseline the next PR
+  # compares against.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
