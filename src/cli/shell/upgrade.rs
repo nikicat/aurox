@@ -187,42 +187,61 @@ fn rebuild_remedy(
     }
 }
 
+/// One rendered line of a preflight note, tagged with the ui channel it goes
+/// through — pure data, so the user-facing wording is unit-testable.
+#[derive(Debug, PartialEq, Eq)]
+enum NoteLine {
+    Warn(String),
+    Note(String),
+}
+
+impl PreflightNote {
+    /// The lines this note renders as: the pacman-parity issue line (a
+    /// warning — or an informational note when the staged cart already
+    /// resolves it) followed by the remediation hints.
+    fn lines(&self) -> Vec<NoteLine> {
+        match &self.remedy {
+            Remedy::StagedRebuild { target } => vec![NoteLine::Note(format!(
+                "{} — resolved by the staged rebuild of {target} (built and installed before the repo upgrade)",
+                self.issue
+            ))],
+            Remedy::AddRebuild { target } => {
+                let mut lines = vec![
+                    NoteLine::Warn(self.issue.to_string()),
+                    NoteLine::Note(format!(
+                        "`add {target}` stages a rebuild — its AUR package no longer needs the broken dependency"
+                    )),
+                ];
+                lines.extend(pin_hint(&self.issue).map(NoteLine::Note));
+                lines
+            }
+            Remedy::RebuildWontHelp => {
+                let mut lines = vec![NoteLine::Warn(self.issue.to_string())];
+                if let preflight::Issue::UnsatisfiedDep { target, depend, .. } = &self.issue {
+                    lines.push(NoteLine::Note(format!(
+                        "the AUR {target} still depends on '{depend}', so a rebuild won't help"
+                    )));
+                }
+                lines.extend(pin_hint(&self.issue).map(NoteLine::Note));
+                lines
+            }
+            Remedy::Unknown => {
+                let mut lines = vec![NoteLine::Warn(self.issue.to_string())];
+                lines.extend(pin_hint(&self.issue).map(NoteLine::Note));
+                lines
+            }
+        }
+    }
+}
+
 /// Print one preflight note: the pacman-parity issue line plus the remediation
 /// hint. Resolved-by-staged-rebuild renders as an informational note, not a
 /// warning — the transaction as staged already handles it.
 pub(crate) fn print_preflight_note(note: &PreflightNote) {
-    match &note.remedy {
-        Remedy::StagedRebuild { target } => {
-            ui::note(&format!(
-                "{} — resolved by the staged rebuild of {target} (built and installed before the repo upgrade)",
-                note.issue
-            ));
-        }
-        Remedy::AddRebuild { target } => {
-            ui::warn(&note.issue.to_string());
-            ui::note(&format!(
-                "`add {target}` stages a rebuild — its AUR package no longer needs the broken dependency"
-            ));
-            if let Some(alt) = pin_hint(&note.issue) {
-                ui::note(&alt);
-            }
-        }
-        Remedy::RebuildWontHelp => {
-            ui::warn(&note.issue.to_string());
-            if let preflight::Issue::UnsatisfiedDep { target, depend, .. } = &note.issue {
-                ui::note(&format!(
-                    "the AUR {target} still depends on '{depend}', so a rebuild won't help"
-                ));
-            }
-            if let Some(alt) = pin_hint(&note.issue) {
-                ui::note(&alt);
-            }
-        }
-        Remedy::Unknown => {
-            ui::warn(&note.issue.to_string());
-            if let Some(alt) = pin_hint(&note.issue) {
-                ui::note(&alt);
-            }
+    for line in note.lines() {
+        match line {
+            NoteLine::Warn(msg) => ui::warn(&msg),
+            NoteLine::Note(msg) => ui::note(&msg),
         }
     }
 }
@@ -393,12 +412,17 @@ fn pkgbase_built(session: &UpgradeSession, pb: &PkgBase) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{FetchPolicy, Remedy, rebuild_remedy, should_fetch};
+    use super::{
+        FetchPolicy, NoteLine, PreflightNote, Remedy, pin_hint, rebuild_remedy, resync_repo_dbs,
+        should_fetch,
+    };
     use crate::config::Config;
     use crate::index::IndexEntry;
     use crate::names::{PkgName, PkgTarget};
+    use crate::pacman::preflight;
     use crate::paths;
     use crate::testing::ScopedStateRoot;
+    use crate::{assert_contains, assert_not_contains, assert_regex};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
 
@@ -516,5 +540,147 @@ mod tests {
         let cfg = Config::default();
         std::fs::write(paths::fetch_stamp_path(), "not-a-number").unwrap();
         assert!(should_fetch(&cfg, FetchPolicy::WhenStale));
+    }
+
+    #[test]
+    fn apply_resync_skips_without_touching_the_sync_db() {
+        let dir = TempDir::new().unwrap();
+        let _root = ScopedStateRoot::new(dir.path().to_path_buf());
+
+        // Repo-update checking off: there is no rootless store to sync.
+        let cfg = Config {
+            check_repo_updates: false,
+            ..Config::default()
+        };
+        resync_repo_dbs(&cfg);
+        assert!(
+            !paths::sync_db_path().exists(),
+            "no sync db may be created when check_repo_updates is off"
+        );
+
+        // Checking on, but synced seconds ago: the drift guard dedupes the
+        // common `upgrade` → immediate `apply` flow.
+        let cfg = Config {
+            check_repo_updates: true,
+            ..Config::default()
+        };
+        stamp_secs_ago(0);
+        resync_repo_dbs(&cfg);
+        assert!(
+            !paths::sync_db_path().exists(),
+            "a fresh stamp must skip the re-sync entirely"
+        );
+    }
+
+    /// A broken-dep preflight issue, with or without the `causing` package
+    /// (pacman's "installing X breaks…" vs plain "can't satisfy…" shapes).
+    fn broken_dep(causing: Option<&str>) -> preflight::Issue {
+        preflight::Issue::UnsatisfiedDep {
+            target: PkgName::new("ioquake3-git"),
+            depend: PkgTarget::new("libjpeg"),
+            causing: causing.map(PkgName::new),
+            causing_ver: None,
+        }
+    }
+
+    fn conflict() -> preflight::Issue {
+        preflight::Issue::Conflict {
+            pkg1: PkgName::new("foo"),
+            pkg2: PkgName::new("bar"),
+            reason: PkgTarget::new("foo"),
+        }
+    }
+
+    #[test]
+    fn pin_hint_offers_drop_only_when_a_causing_package_exists() {
+        let hint = pin_hint(&broken_dep(Some("libjpeg-turbo"))).expect("broken dep hints");
+        assert_regex!(
+            hint,
+            "^`drop libjpeg-turbo` pins .* `remove ioquake3-git` uninstalls"
+        );
+        let hint = pin_hint(&broken_dep(None)).expect("broken dep hints");
+        assert_regex!(hint, "^`remove ioquake3-git` uninstalls");
+        assert_not_contains!(hint, "`drop");
+        // Only broken deps have a pin escape hatch; a conflict offers none.
+        assert_eq!(pin_hint(&conflict()), None);
+    }
+
+    #[test]
+    fn staged_rebuild_renders_as_a_single_resolved_note() {
+        let note = PreflightNote {
+            issue: broken_dep(Some("libjpeg-turbo")),
+            remedy: Remedy::StagedRebuild {
+                target: PkgName::new("ioquake3-git"),
+            },
+        };
+        let lines = note.lines();
+        let [NoteLine::Note(line)] = lines.as_slice() else {
+            panic!("staged-rebuild must render as exactly one note: {lines:?}");
+        };
+        assert_regex!(
+            line,
+            "breaks dependency 'libjpeg' required by ioquake3-git — resolved by \
+             the staged rebuild of ioquake3-git"
+        );
+    }
+
+    #[test]
+    fn add_rebuild_warns_then_hints_add_and_pin() {
+        let note = PreflightNote {
+            issue: broken_dep(Some("libjpeg-turbo")),
+            remedy: Remedy::AddRebuild {
+                target: PkgName::new("ioquake3-git"),
+            },
+        };
+        let lines = note.lines();
+        assert_eq!(lines.len(), 3, "warn + add hint + pin hint: {lines:?}");
+        let NoteLine::Warn(issue) = &lines[0] else {
+            panic!("the issue line must be a warning: {lines:?}");
+        };
+        assert_contains!(issue, "breaks dependency 'libjpeg'");
+        let NoteLine::Note(add) = &lines[1] else {
+            panic!("the add hint must be a note: {lines:?}");
+        };
+        assert_regex!(add, "^`add ioquake3-git` stages a rebuild");
+        let NoteLine::Note(pin) = &lines[2] else {
+            panic!("the pin hint must be a note: {lines:?}");
+        };
+        assert_contains!(pin, "`drop libjpeg-turbo`");
+    }
+
+    #[test]
+    fn rebuild_wont_help_explains_the_still_declared_dep() {
+        let note = PreflightNote {
+            issue: broken_dep(None),
+            remedy: Remedy::RebuildWontHelp,
+        };
+        let lines = note.lines();
+        assert_eq!(
+            lines.len(),
+            3,
+            "warn + won't-help note + pin hint: {lines:?}"
+        );
+        assert!(matches!(&lines[0], NoteLine::Warn(_)), "{lines:?}");
+        let NoteLine::Note(wont_help) = &lines[1] else {
+            panic!("the won't-help line must be a note: {lines:?}");
+        };
+        assert_regex!(
+            wont_help,
+            "^the AUR ioquake3-git still depends on 'libjpeg', so a rebuild won't help"
+        );
+    }
+
+    #[test]
+    fn unknown_remedy_warns_without_hints_for_a_conflict() {
+        let note = PreflightNote {
+            issue: conflict(),
+            remedy: Remedy::Unknown,
+        };
+        // A conflict has no pin/uninstall escape hatch, so the pacman-parity
+        // warning stands alone.
+        assert_eq!(
+            note.lines(),
+            vec![NoteLine::Warn("foo and bar are in conflict".to_owned())]
+        );
     }
 }

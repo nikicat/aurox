@@ -2749,6 +2749,39 @@ mod tests {
     }
 
     #[test]
+    fn merged_dep_rows_unions_and_dedupes_the_two_plans() {
+        // Main plan: pulls openssl+zlib from the repos, and AUR pkgbase
+        // `libfoo-git` as a dep (`yay-bin` is a named root, so not a dep row).
+        let main = Plan {
+            transitive_repo: vec!["openssl".to_owned(), "zlib".to_owned()],
+            aur_strata: vec![vec![PkgBase::from("yay-bin"), PkgBase::from("libfoo-git")]],
+            direct_aur: std::iter::once(PkgBase::from("yay-bin")).collect(),
+            ..Plan::default()
+        };
+        // Blocker plan: shares zlib with the main plan and adds its own rows.
+        let blocker = Plan {
+            transitive_repo: vec!["zlib".to_owned(), "libjpeg-turbo".to_owned()],
+            aur_strata: vec![vec![PkgBase::from("libbar-git")]],
+            ..Plan::default()
+        };
+        let (repo, aur) = merged_dep_rows(Some(&main), Some(&blocker));
+        let repo: Vec<&str> = repo.iter().map(PkgName::as_str).collect();
+        assert_eq!(
+            repo,
+            vec!["openssl", "zlib", "libjpeg-turbo"],
+            "shared zlib appears once, main-plan order first"
+        );
+        let aur: Vec<&str> = aur.iter().map(PkgBase::as_str).collect();
+        assert_eq!(aur, vec!["libfoo-git", "libbar-git"]);
+
+        // A blocker-only apply (repo-upgrade cart with no main AUR half).
+        let (repo, aur) = merged_dep_rows(None, Some(&blocker));
+        let repo: Vec<&str> = repo.iter().map(PkgName::as_str).collect();
+        assert_eq!(repo, vec!["zlib", "libjpeg-turbo"]);
+        assert_eq!(aur.len(), 1);
+    }
+
+    #[test]
     fn show_reports_pending_then_ready() {
         let mut env = env_with(&[("yay-bin", Source::Aur)]);
         let mut state = State::default();
