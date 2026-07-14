@@ -19,7 +19,7 @@ mod prompts;
 mod search_table;
 mod tables;
 
-pub use change_set::{ApprovalCell, TxnRoot, cost_summary, transaction_table};
+pub use change_set::{ApprovalCell, ChangeSet, TxnRoot};
 pub use cost::PreviewMetrics;
 pub use gix_progress::{GixProgress, Operation};
 pub use progress::{

@@ -1669,18 +1669,18 @@ impl ShellEnv for RealEnv<'_> {
         let pac = PacmanIndex::build(&alpm);
         let counterpart = pac.counterpart_with_hint(entry, None);
 
-        match review::review(
-            &mirror,
-            &pkgbase,
-            &new_ver,
-            counterpart.as_ref(),
-            &wt,
-            self.cfg.review_history_scan_max,
-            // The shell drives one interactive review per call; the
-            // "approve all" fast path is the dispatch loop's job (it decides
-            // whether to call this at all), so a single review always prompts.
-            review::Prompting::Prompt,
-        ) {
+        let request = review::ReviewRequest {
+            mirror: &mirror,
+            pkgbase: &pkgbase,
+            new_ver: &new_ver,
+            counterpart: counterpart.as_ref(),
+            wt: &wt,
+            history_scan_max: self.cfg.review_history_scan_max,
+        };
+        // The shell drives one interactive review per call; the "approve
+        // all" fast path is the dispatch loop's job (it decides whether to
+        // call this at all), so a single review always prompts.
+        match request.review(review::Prompting::Prompt) {
             Ok(review::Outcome::Approved) => Ok(ReviewOutcome::Approved),
             Ok(review::Outcome::ApprovedAll) => Ok(ReviewOutcome::ApprovedAll),
             Ok(review::Outcome::Skipped) => Ok(ReviewOutcome::Skipped),
@@ -1764,9 +1764,17 @@ impl ShellEnv for RealEnv<'_> {
         let (repo_deps, aur_deps) = merged_dep_rows(main_plan.as_ref(), blocker_plan.as_ref());
         let removals: Vec<PkgName> = cart.removals().to_vec();
         let metrics = upgrade::preview_metrics(aur_data, &roots, main_plan.as_ref());
-        ui::info(&ui::cost_summary(
-            &roots, &repo_deps, &aur_deps, &removals, &size_pac, &metrics,
-        ));
+        ui::info(
+            &ui::ChangeSet {
+                roots: &roots,
+                repo_deps: &repo_deps,
+                aur_deps: &aur_deps,
+                removals: &removals,
+                pac: &size_pac,
+                metrics: &metrics,
+            }
+            .summary(),
+        );
         if !ui::confirm("Proceed with this transaction?", false)
             .map_err(|e| Error::other(format!("confirm: {e}")))?
         {
@@ -1779,14 +1787,18 @@ impl ShellEnv for RealEnv<'_> {
             asdeps: false,
             gate: ConfirmGate::AlreadyConfirmed,
         };
+        let ctx = build::InstallCtx {
+            cfg: self.cfg,
+            aur: aur_data,
+            pac: &pac,
+        };
 
         // Blocker rebuilds first — installing them is what unblocks the repo
         // lane (the rebuilt packages no longer carry the dependency the
         // sysupgrade would break).
         let mut report = build::RunReport::default();
         if let Some(plan) = &blocker_plan {
-            report =
-                build::apply_plan(self.cfg, aur_data.index(), &pac, plan, opts, &mut reviewed)?;
+            report = ctx.apply_plan(plan, opts, &mut reviewed)?;
             if !report.all_landed() {
                 // The blocker didn't land, so the repo lane would fail exactly
                 // as preflighted — stop before it runs. The repo rows haven't
@@ -1805,8 +1817,7 @@ impl ShellEnv for RealEnv<'_> {
         // Build + install the main AUR (and any fresh-install) half. Already
         // gated by the confirm above, so `apply_plan` doesn't re-ask.
         if let Some(plan) = &main_plan {
-            let main_report =
-                build::apply_plan(self.cfg, aur_data.index(), &pac, plan, opts, &mut reviewed)?;
+            let main_report = ctx.apply_plan(plan, opts, &mut reviewed)?;
             report.absorb(main_report);
         }
         let outcome = cart_apply_outcome(&report, cart, aur_data, true);
@@ -1922,15 +1933,15 @@ impl RealEnv<'_> {
             .resolved;
         let roots = txn_roots(cart, aur_data, &r.size_pac);
         let removals: Vec<PkgName> = cart.removals().to_vec();
-        Ok(ui::transaction_table(
-            &roots,
-            &r.repo_deps,
-            &r.aur_deps,
-            &removals,
-            &r.size_pac,
-            &r.metrics,
-            ui::Paint::detect(),
-        ))
+        Ok(ui::ChangeSet {
+            roots: &roots,
+            repo_deps: &r.repo_deps,
+            aur_deps: &r.aur_deps,
+            removals: &removals,
+            pac: &r.size_pac,
+            metrics: &r.metrics,
+        }
+        .table(ui::Paint::detect()))
     }
 
     /// Ensure [`Self::view`] holds a resolution valid for `cart`, re-resolving
@@ -2019,15 +2030,12 @@ impl RealEnv<'_> {
         if targets.is_empty() {
             return Ok(None);
         }
-        let plan = build::resolve_targets(
-            self.cfg,
-            aur_data.index(),
-            aur_data.lookup(),
+        let ctx = build::InstallCtx {
+            cfg: self.cfg,
+            aur: aur_data,
             pac,
-            targets,
-            false,
-        )?;
-        Ok(Some(plan))
+        };
+        Ok(Some(ctx.resolve_targets(targets, false)?))
     }
 
     /// Turn the staged repo upgrades into the partial-`-Syu` selection: the

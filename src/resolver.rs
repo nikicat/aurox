@@ -1,9 +1,9 @@
 //! Recursive dependency resolution: targets → ordered Plan.
 
-use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::index::AurIndexData;
+use crate::index::IndexEntry;
 use crate::index::lookup::{self, Lookup};
-use crate::index::{IndexEntry, IndexFile};
 use crate::names::{PkgBase, PkgName, PkgTarget};
 use crate::pacman::alpm_db::PacmanIndex;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -141,19 +141,14 @@ impl Origin {
     }
 }
 
-/// Resolve `targets` against the index + pacman DBs into a [`Plan`].
+/// Resolve `targets` against the AUR data + pacman DBs into a [`Plan`].
 ///
-/// With no AUR data in play `idx`/`by` are simply *empty* (the loader seam's
+/// With no AUR data in play `aur` is simply *empty* (the loader seam's
 /// pacman-only view); classification then degenerates to pacman-only and any
 /// unknown name short-circuits to [`Source::Missing`].
-#[instrument(skip(_cfg, idx, by, pac), fields(targets = targets.len()))]
-pub fn resolve(
-    _cfg: &Config,
-    idx: &IndexFile,
-    by: &Lookup,
-    pac: &PacmanIndex,
-    targets: &[String],
-) -> Result<Plan> {
+#[instrument(skip(aur, pac), fields(targets = targets.len()))]
+pub fn resolve(aur: &AurIndexData, pac: &PacmanIndex, targets: &[String]) -> Result<Plan> {
+    let (idx, by) = (aur.index(), aur.lookup());
     let mut plan = Plan::default();
     let mut visited_aur: BTreeSet<PkgBase> = BTreeSet::new();
     // Concrete repo pkgnames whose `depends` we've already expanded. Repo
@@ -383,7 +378,7 @@ fn resolve_target_source(by: &Lookup, pac: &PacmanIndex, bare: &str, origin: Ori
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::defaults::default_config;
+    use crate::index::IndexFile;
     use crate::index::schema::IndexEntry;
     use crate::pacman::alpm_db::PacmanIndex;
 
@@ -425,25 +420,21 @@ mod tests {
             entries,
             ..IndexFile::empty()
         };
-        let by = Lookup::build(&idx);
+        let aur = AurIndexData::from_index(idx);
         let mut pac = PacmanIndex::default();
         for n in repo {
             pac.sync_versions.insert((*n).into(), "1.0-1".into());
         }
-        let cfg = default_config();
         let targets: Vec<String> = targets.iter().map(|s| (*s).to_owned()).collect();
-        resolve(&cfg, &idx, &by, &pac, &targets)
+        resolve(&aur, &pac, &targets)
     }
 
     /// Resolve `targets` against a caller-built [`PacmanIndex`] and no AUR
     /// index — the seam for repo→repo dependency-walk tests, which set up
     /// `sync_versions` / `sync_depends` / `installed` with typed values.
     fn resolve_repo(pac: &PacmanIndex, targets: &[&str]) -> Plan {
-        let idx = IndexFile::empty();
-        let by = Lookup::build(&idx);
-        let cfg = default_config();
         let targets: Vec<String> = targets.iter().map(|s| (*s).to_owned()).collect();
-        resolve(&cfg, &idx, &by, pac, &targets).unwrap()
+        resolve(&AurIndexData::empty(), pac, &targets).unwrap()
     }
 
     /// Register a sync package with its dependency list, typed at the seam:
@@ -824,7 +815,7 @@ mod tests {
             entries: vec![entry("paru", &[], &["cargo", "libalpm.so"])],
             ..IndexFile::empty()
         };
-        let by = Lookup::build(&idx);
+        let aur = AurIndexData::from_index(idx);
         let mut pac = PacmanIndex::default();
         pac.sync_versions.insert("rust".into(), "1.80.0-1".into());
         pac.sync_providers
@@ -832,8 +823,7 @@ mod tests {
         pac.sync_versions.insert("pacman".into(), "6.1.0-1".into());
         pac.sync_providers
             .insert("libalpm.so".into(), vec!["pacman".into()]);
-        let cfg = default_config();
-        let plan = resolve(&cfg, &idx, &by, &pac, &["paru".to_owned()]).unwrap();
+        let plan = resolve(&aur, &pac, &["paru".to_owned()]).unwrap();
 
         assert_eq!(plan.aur_strata, vec![vec!["paru".to_owned()]]);
         let mut t = plan.transitive_repo.clone();
@@ -851,7 +841,7 @@ mod tests {
             entries: vec![entry("paru", &[], &["cargo"])],
             ..IndexFile::empty()
         };
-        let by = Lookup::build(&idx);
+        let aur = AurIndexData::from_index(idx);
         let mut pac = PacmanIndex::default();
         pac.installed.insert("rust".into(), "1.80.0-1".into());
         pac.installed_providers
@@ -860,8 +850,7 @@ mod tests {
         pac.sync_versions.insert("rust".into(), "1.80.0-1".into());
         pac.sync_providers
             .insert("cargo".into(), vec!["rust".into()]);
-        let cfg = default_config();
-        let plan = resolve(&cfg, &idx, &by, &pac, &["paru".to_owned()]).unwrap();
+        let plan = resolve(&aur, &pac, &["paru".to_owned()]).unwrap();
 
         assert_eq!(plan.aur_strata, vec![vec!["paru".to_owned()]]);
         assert!(plan.transitive_repo.is_empty());
@@ -878,20 +867,12 @@ mod tests {
             entries: vec![entry("paru", &[], &["cargo"])],
             ..IndexFile::empty()
         };
-        let by = Lookup::build(&idx);
+        let aur = AurIndexData::from_index(idx);
         let mut pac = PacmanIndex::default();
         pac.sync_versions.insert("rust".into(), "1.80.0-1".into());
         pac.sync_providers
             .insert("cargo".into(), vec!["rust".into()]);
-        let cfg = default_config();
-        let plan = resolve(
-            &cfg,
-            &idx,
-            &by,
-            &pac,
-            &["rust".to_owned(), "paru".to_owned()],
-        )
-        .unwrap();
+        let plan = resolve(&aur, &pac, &["rust".to_owned(), "paru".to_owned()]).unwrap();
 
         assert_eq!(plan.direct_repo, vec!["rust".to_owned()]);
         assert!(
@@ -913,12 +894,11 @@ mod tests {
             entries: vec![entry("brave-bin", &[], &[])],
             ..IndexFile::empty()
         };
-        let by = Lookup::build(&idx);
+        let aur = AurIndexData::from_index(idx);
         let mut pac = PacmanIndex::default();
         pac.installed
             .insert("brave-bin".into(), "1:1.90.121-1".into());
-        let cfg = default_config();
-        let plan = resolve(&cfg, &idx, &by, &pac, &["brave-bin".to_owned()]).unwrap();
+        let plan = resolve(&aur, &pac, &["brave-bin".to_owned()]).unwrap();
         assert_eq!(plan.aur_strata, vec![vec!["brave-bin".to_owned()]]);
     }
 
@@ -931,11 +911,10 @@ mod tests {
             entries: vec![entry("client", &[], &["helper"]), entry("helper", &[], &[])],
             ..IndexFile::empty()
         };
-        let by = Lookup::build(&idx);
+        let aur = AurIndexData::from_index(idx);
         let mut pac = PacmanIndex::default();
         pac.installed.insert("helper".into(), "1.0-1".into());
-        let cfg = default_config();
-        let plan = resolve(&cfg, &idx, &by, &pac, &["client".to_owned()]).unwrap();
+        let plan = resolve(&aur, &pac, &["client".to_owned()]).unwrap();
         // Only client should be in the build plan; helper stays satisfied.
         assert_eq!(plan.aur_strata, vec![vec!["client".to_owned()]]);
     }
