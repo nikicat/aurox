@@ -6,7 +6,7 @@
 //! Otherwise clap parses our aurox-owned flags + supplies auto-generated
 //! `--help`/`--version`.
 
-use crate::config::Config;
+use crate::config::ConfigHandle;
 use crate::error::Result;
 use crate::pacman::invoke;
 use crate::paths;
@@ -92,7 +92,8 @@ Persistent settings: ~/.config/aurox/config.toml";
 
 /// Top-level entry. Returns the desired process exit code.
 pub fn run() -> Result<u8> {
-    let cfg = Config::load()?;
+    let config = ConfigHandle::load()?;
+    let cfg = config.cfg();
     paths::ensure_state_dir()?;
 
     let raw_argv: Vec<String> = std::env::args().skip(1).collect();
@@ -116,10 +117,10 @@ pub fn run() -> Result<u8> {
     // through to clap + dispatch.
     if let Some(op) = first_op_letter(&raw_argv) {
         if matches!(op, 'R' | 'T' | 'D' | 'F' | 'U') {
-            return invoke::exec_pacman(&cfg, &raw_argv);
+            return invoke::exec_pacman(cfg, &raw_argv);
         }
         if op == 'Q' && !is_plain_qu(&raw_argv) {
-            return invoke::exec_pacman(&cfg, &raw_argv);
+            return invoke::exec_pacman(cfg, &raw_argv);
         }
     }
 
@@ -129,7 +130,7 @@ pub fn run() -> Result<u8> {
         .as_deref()
         .map_or_else(|| cfg.color_mode(), parse_color_mode);
     ui::set_color(mode);
-    dispatch::dispatch(&cfg, &cli)
+    dispatch::dispatch(&config, &cli)
 }
 
 /// Decide whether argv is the aurox-owned `-Qu` form (merge of repo + AUR

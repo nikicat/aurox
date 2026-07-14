@@ -55,12 +55,20 @@ pub(crate) struct AurReload {
 /// subsequent `search`/`info`/`upgrade` see current data. Under
 /// [`FetchPolicy::WhenStale`] a recently-fetched mirror skips the network fetch,
 /// but the in-memory AUR data is still reloaded from disk so an external `pacman
-/// -Sy`/`-Syu` is reflected. The first-ever fetch needs the bootstrap clone,
-/// which [`mirror::cmd_refresh`]'s consent gate announces and confirms; a
-/// decline surfaces in [`AurReload::outcome`] so the caller can hint.
+/// -Sy`/`-Syu` is reflected.
+///
+/// The policy also picks the bootstrap-consent stance (see
+/// [`mirror::RefreshReason`]): the explicit `refresh` command is
+/// pre-consented — the shell's launch prompt already spelled out the clone
+/// cost — while `upgrade`'s TTL fetch never bootstraps, skipping the AUR half
+/// with a hintable [`AurReload::outcome`] instead.
 pub(crate) fn refresh_and_reload(cfg: &Config, policy: FetchPolicy) -> Result<AurReload> {
     let outcome = if should_fetch(cfg, policy) {
-        Some(mirror::cmd_refresh(cfg, mirror::RefreshReason::Shell)?)
+        let reason = match policy {
+            FetchPolicy::Always => mirror::RefreshReason::ShellRefresh,
+            FetchPolicy::WhenStale => mirror::RefreshReason::ShellUpgrade,
+        };
+        Some(mirror::cmd_refresh(cfg, reason)?)
     } else {
         debug!("mirror fetched within the refresh TTL; reloading from disk without a fetch");
         None

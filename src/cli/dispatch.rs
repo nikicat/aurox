@@ -5,7 +5,7 @@ use crate::cli::Cli;
 use crate::cli::flags::{self, PacFlags};
 use crate::cli::search;
 use crate::cli::shell;
-use crate::config::Config;
+use crate::config::{Config, ConfigHandle};
 use crate::error::{Error, Result};
 use crate::index;
 use crate::mirror::{self, RefreshOutcome, RefreshReason, SkipCause};
@@ -17,7 +17,8 @@ use std::io::IsTerminal;
 /// Top-level routing entry — clap already pre-scanned for pacman-owned ops,
 /// so by this point `cli.args` is aurox's responsibility (`-S` family,
 /// the bare-arg yay shortcuts, or none-at-all).
-pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
+pub fn dispatch(config: &ConfigHandle, cli: &Cli) -> Result<u8> {
+    let cfg = config.cfg();
     let argv = &cli.args;
     let f = flags::parse(argv);
 
@@ -32,7 +33,7 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
         let interactive = !cli.noconfirm && std::io::stdin().is_terminal();
         if interactive {
             return shell::run(
-                cfg,
+                config,
                 build::DevelPolicy::from_enabled(cli.devel || cfg.devel),
                 &[],
             );
@@ -45,7 +46,7 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
     }
 
     match f.op {
-        Some('S') => handle_s(cfg, cli, &f, argv),
+        Some('S') => handle_s(config, cli, &f, argv),
         // Pre-scan in `cli::run` only routes the bare `-Qu` form here; every
         // other Q variant is plain pacman territory and never reaches dispatch.
         Some('Q') => build::cmd_query_upgrades(
@@ -68,7 +69,7 @@ pub fn dispatch(cfg: &Config, cli: &Cli) -> Result<u8> {
             let interactive = !cli.noconfirm && std::io::stdin().is_terminal();
             if interactive {
                 shell::run(
-                    cfg,
+                    config,
                     build::DevelPolicy::from_enabled(cli.devel || cfg.devel),
                     &terms,
                 )
@@ -93,7 +94,8 @@ fn pkg_targets(positional: &[String]) -> Vec<PkgTarget> {
 }
 
 /// Handle the `-S` family (`-S`, `-Sy`, `-Syu`, `-Ss`, `-Si`, `-Sc`).
-fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8> {
+fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8> {
+    let cfg = config.cfg();
     // `--noconfirm` / `--asdeps` / `--devel` may appear before *or* after the
     // operation (`aurox --noconfirm -S foo` vs `aurox -S --noconfirm foo`).
     // clap's `trailing_var_arg` captures everything after `-S`, so flags that

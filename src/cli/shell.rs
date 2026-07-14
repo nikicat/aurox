@@ -26,7 +26,7 @@
 use crate::build::{self, ConfirmGate, DevelPolicy, InstallOpts, review};
 use crate::cli::dispatch;
 use crate::cli::search::{Row, rank_rows, search_row};
-use crate::config::Config;
+use crate::config::{Config, ConfigHandle};
 use crate::error::{Error, Result};
 use crate::index::{self, AurIndexData, IndexEntry};
 use crate::mirror::{self, MirrorRepo};
@@ -183,12 +183,15 @@ pub trait ShellEnv {
 }
 
 /// Word one `refresh` outcome: the AUR half may have been skipped (bootstrap
-/// declined, or pacman-only mode) while the repo databases still refreshed.
+/// declined, not set up, or pacman-only mode) while the repo databases still
+/// refreshed.
 const fn refresh_message(outcome: mirror::RefreshOutcome) -> &'static str {
     match outcome {
         mirror::RefreshOutcome::Refreshed => "mirror + index refreshed",
         mirror::RefreshOutcome::AurSkipped(
-            mirror::SkipCause::Declined | mirror::SkipCause::NonInteractive,
+            mirror::SkipCause::Declined
+            | mirror::SkipCause::NonInteractive
+            | mirror::SkipCause::NotSetUp,
         ) => "AUR setup skipped — repo databases refreshed; run `refresh` again when ready",
         mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::Disabled) => {
             "official databases refreshed (AUR disabled in config)"
@@ -1241,10 +1244,11 @@ fn help_topic(topic: &str) -> String {
         )
 }
 
-/// The pre-prompt banner: what this session covers and — when the AUR isn't
-/// set up yet — what setting it up costs. Pure so the wording is testable.
-/// Pacman-only mode gets a marker instead of a nag: `aur = false` is a
-/// standing choice, not a missing step.
+/// The pre-prompt banner: what this session covers. Pure so the wording is
+/// testable. Runs *after* the first-launch question, so `NotSetUp` here means
+/// the user chose "later" — one reminder line, not a re-pitch (the question
+/// already spelled out the cost). Pacman-only mode gets a marker instead of a
+/// nag: `aur = false` is a standing choice, not a missing step.
 fn startup_lines(aur: index::AurState) -> Vec<&'static str> {
     match aur {
         index::AurState::Ready => {
@@ -1252,13 +1256,42 @@ fn startup_lines(aur: index::AurState) -> Vec<&'static str> {
         }
         index::AurState::NotSetUp => vec![
             "aurox shell — type `help` for commands, `quit` to leave",
-            "AUR is not set up yet — search/info/install cover the official repos only",
-            "`refresh` sets it up: a one-time ~2 GiB download (~8-9 min); afterwards it's incremental",
+            "pacman-only this session — `refresh` syncs the AUR anytime",
         ],
         index::AurState::Disabled => {
             vec!["aurox shell (pacman-only) — type `help` for commands, `quit` to leave"]
         }
     }
+}
+
+/// The shell's first-launch question, asked while the AUR is enabled but was
+/// never synced: sync now / pacman-only from now on / later.
+///
+/// Persistence is minimal by construction — "yes" persists as the mirror +
+/// index artifact itself, "no" as an `aur = false` line written through
+/// [`ConfigHandle::update`] (the one place aurox edits its own config, which
+/// also flips the in-memory view so the rest of the session sees the
+/// choice), "later" as nothing at all (asked again next launch).
+fn first_launch_setup(mut config: ConfigHandle) -> Result<ConfigHandle> {
+    if index::AurState::probe(config.cfg()) != index::AurState::NotSetUp {
+        return Ok(config);
+    }
+    match ui::aur_setup_prompt().map_err(|e| Error::other(format!("setup prompt: {e}")))? {
+        ui::AurSetupChoice::SyncNow => {
+            // Consent was just given — ShellRefresh runs the bootstrap
+            // without a second question.
+            mirror::cmd_refresh(config.cfg(), mirror::RefreshReason::ShellRefresh)?;
+        }
+        ui::AurSetupChoice::PacmanOnly => {
+            config.update(|c| c.aur = Some(false))?;
+            ui::note(&format!(
+                "pacman-only mode saved (`aur = false` in {}) — delete the line and `refresh` to opt back in",
+                config.path().display()
+            ));
+        }
+        ui::AurSetupChoice::Later => {}
+    }
+    Ok(config)
 }
 
 /// Run the interactive shell. Returns the desired process exit code.
@@ -1267,9 +1300,13 @@ fn startup_lines(aur: index::AurState) -> Vec<&'static str> {
 /// shortcut (`aurox <term>…`), dispatch passes the typed terms here and the shell
 /// runs one `search` before the prompt loop — identical to starting the shell
 /// and typing `search <term>…`. Empty for the plain no-arg `aurox` launch.
-#[instrument(skip(cfg))]
-pub fn run(cfg: &Config, devel: DevelPolicy, initial_search: &[SearchTerm]) -> Result<u8> {
+#[instrument(skip(config))]
+pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTerm]) -> Result<u8> {
     info!(devel = ?devel, terms = initial_search.len(), "shell session start");
+    // First-launch question (no-op unless the AUR is enabled-but-unsynced).
+    // Owns a local handle so a "pacman-only" answer takes effect immediately.
+    let config = first_launch_setup(config.clone())?;
+    let cfg = config.cfg();
     // Once per session: load the AUR index (+ lookup maps) and the name
     // universe. Not repeated per command; `refresh` (later phase) re-fetches.
     // The AUR data loads empty (not absent) when the AUR isn't in play.
@@ -1498,15 +1535,17 @@ impl ShellEnv for RealEnv<'_> {
         // back-to-back `upgrade`s don't each pay a network round-trip. The
         // explicit `refresh` command forces a fetch.
         let outcome = self.reload(upgrade::FetchPolicy::WhenStale)?;
-        // The first-ever `upgrade` may have just offered the bootstrap clone;
-        // a decline degrades to repo-only below, but say so — a silent half
-        // answer reads as "nothing to upgrade in the AUR". (`Disabled` is the
-        // user's standing choice: no note, no nagging.)
+        // `upgrade` never bootstraps (the user's launch-time "later" stands),
+        // so its fetch skips an unsynced AUR — degrade to repo-only below,
+        // but say so: a silent half answer reads as "nothing to upgrade in
+        // the AUR". (`Disabled` is the user's standing choice: no note.)
         if let Some(mirror::RefreshOutcome::AurSkipped(
-            mirror::SkipCause::Declined | mirror::SkipCause::NonInteractive,
+            mirror::SkipCause::NotSetUp
+            | mirror::SkipCause::Declined
+            | mirror::SkipCause::NonInteractive,
         )) = outcome
         {
-            ui::note("AUR skipped — upgrades are repo-only; `refresh` sets it up");
+            ui::note("AUR not synced — upgrades are repo-only; `refresh` syncs it");
         }
         // With empty AUR data the recompute naturally yields repo upgrades
         // only — no separate fallback path.
@@ -2644,18 +2683,21 @@ mod tests {
         assert!(!env.lines.contains("mirror + index refreshed"));
     }
 
-    /// The pre-prompt banner: a ready session gets the one-liner, a
-    /// not-set-up AUR announces the `refresh` cost, and pacman-only mode is
-    /// marked instead of nagged.
+    /// The pre-prompt banner: a ready session gets the one-liner, a "later"
+    /// answer gets one reminder line (the launch question already pitched
+    /// the cost), and pacman-only mode is marked instead of nagged.
     #[test]
     fn startup_banner_variants() {
         let ready = startup_lines(index::AurState::Ready);
         assert_eq!(ready.len(), 1, "ready session banners one line: {ready:?}");
 
-        let pending = startup_lines(index::AurState::NotSetUp).join("\n");
-        assert_contains!(pending, "AUR is not set up yet");
-        assert_contains!(pending, "~2 GiB");
-        assert_contains!(pending, "`refresh`");
+        let later = startup_lines(index::AurState::NotSetUp);
+        assert_eq!(
+            later.len(),
+            2,
+            "one reminder line, not a re-pitch: {later:?}"
+        );
+        assert_contains!(later[1], "`refresh`");
 
         let pacman_only = startup_lines(index::AurState::Disabled);
         assert_eq!(
