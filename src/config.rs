@@ -15,6 +15,12 @@ pub mod defaults;
 pub struct Config {
     /// Where per-pkgbase worktrees live.
     pub build_dir: PathBuf,
+    /// Enable the AUR half of aurox. `false` is pacman-only mode: no mirror
+    /// clone (and no bootstrap prompt), no AUR search/info/install/upgrades —
+    /// `-Sy`/`refresh` touch the official-repo databases only. Flip back to
+    /// `true` (or delete the line) and run `refresh` to opt into the one-time
+    /// ~2 GiB mirror clone.
+    pub aur: bool,
     /// Git URL of the AUR mirror to clone.
     pub mirror_url: String,
     /// Abort a fetch if the HTTP transport sees fewer than 1 byte/sec
@@ -95,5 +101,20 @@ impl Config {
             "never" => ColorMode::Never,
             _ => ColorMode::Auto,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pacman-only knob must default on (existing configs say nothing
+    /// about it) and parse off.
+    #[test]
+    fn aur_defaults_on_and_parses_off() {
+        let cfg: Config = toml::from_str("").expect("empty config parses");
+        assert!(cfg.aur, "missing `aur` key defaults to enabled");
+        let cfg: Config = toml::from_str("aur = false").expect("`aur = false` parses");
+        assert!(!cfg.aur);
     }
 }

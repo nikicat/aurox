@@ -8,7 +8,7 @@ use crate::cli::shell;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index;
-use crate::mirror;
+use crate::mirror::{self, RefreshOutcome, RefreshReason, SkipCause};
 use crate::names::{PkgTarget, SearchTerm};
 use crate::pacman::invoke;
 use crate::ui;
@@ -134,10 +134,20 @@ fn handle_s(cfg: &Config, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8
     let refresh = f.has('y');
     // Pacman convention: -Sy is incremental, -Syy forces a full re-fetch.
     // For aurox that means re-cloning the bare mirror from scratch.
-    let force_reclone = f.op_letters.iter().filter(|c| **c == 'y').count() >= 2;
+    let reason = if f.op_letters.iter().filter(|c| **c == 'y').count() >= 2 {
+        RefreshReason::ForceReclone
+    } else {
+        RefreshReason::ExplicitSync
+    };
 
     if refresh {
-        mirror::cmd_refresh(cfg, force_reclone)?;
+        // A decline is a choice, not a failure: exit 0, remind how to opt in
+        // later. (`Disabled` already printed its own note in the consent plan.)
+        if let RefreshOutcome::AurSkipped(SkipCause::Declined | SkipCause::NonInteractive) =
+            mirror::cmd_refresh(cfg, reason)?
+        {
+            ui::note("AUR setup skipped — run `aurox -Sy` when ready");
+        }
     }
 
     if !f.positional.is_empty() {

@@ -140,8 +140,10 @@ pub trait ShellEnv {
     /// Re-fetch the mirror + index and reload the session (fresh data for
     /// `search`/`info`/classification/completion) **without** seeding the cart —
     /// `upgrade` is the stage-the-upgrades variant; `refresh` is just the
-    /// re-fetch.
-    fn refresh(&mut self) -> Result<()>;
+    /// re-fetch. The outcome says whether the AUR half actually refreshed or
+    /// was skipped (bootstrap declined / AUR disabled), so the dispatch core
+    /// can word the result.
+    fn refresh(&mut self) -> Result<mirror::RefreshOutcome>;
     /// Run a combined repo + AUR search; returns rows for the numbered list.
     fn search(&mut self, terms: &[SearchTerm]) -> Result<Vec<ListItem>>;
     /// Print `-Si`-style info for the already-resolved targets.
@@ -178,6 +180,20 @@ pub trait ShellEnv {
     /// Returns the bytes freed. The in-memory session stays loaded — search
     /// and info keep working from it until a `refresh` re-fetches everything.
     fn system_prune(&mut self) -> Result<Option<ByteSize>>;
+}
+
+/// Word one `refresh` outcome: the AUR half may have been skipped (bootstrap
+/// declined, or pacman-only mode) while the repo databases still refreshed.
+const fn refresh_message(outcome: mirror::RefreshOutcome) -> &'static str {
+    match outcome {
+        mirror::RefreshOutcome::Refreshed => "mirror + index refreshed",
+        mirror::RefreshOutcome::AurSkipped(
+            mirror::SkipCause::Declined | mirror::SkipCause::NonInteractive,
+        ) => "AUR setup skipped — repo databases refreshed; run `refresh` again when ready",
+        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::Disabled) => {
+            "official databases refreshed (AUR disabled in config)"
+        }
+    }
 }
 
 /// `system <show|prune>` — the maintenance group. A free function rather than
@@ -324,7 +340,7 @@ impl State {
                 // Re-fetch + reload the session; the cart is left untouched
                 // (`upgrade` is the seed-the-cart variant).
                 match env.refresh() {
-                    Ok(()) => env.print("mirror + index refreshed"),
+                    Ok(outcome) => env.print(refresh_message(outcome)),
                     Err(e) => env.print(&format!("refresh: {e}")),
                 }
                 Flow::Continue
@@ -1455,7 +1471,17 @@ impl ShellEnv for RealEnv<'_> {
         // `refresh_max_age_secs` is skipped (the session still reloads), so
         // back-to-back `upgrade`s don't each pay a network round-trip. The
         // explicit `refresh` command forces a fetch.
-        self.reload(upgrade::FetchPolicy::WhenStale)?;
+        let outcome = self.reload(upgrade::FetchPolicy::WhenStale)?;
+        // The first-ever `upgrade` may have just offered the bootstrap clone;
+        // a decline degrades to repo-only below, but say so — a silent half
+        // answer reads as "nothing to upgrade in the AUR". (`Disabled` is the
+        // user's standing choice: no note, no nagging.)
+        if let Some(mirror::RefreshOutcome::AurSkipped(
+            mirror::SkipCause::Declined | mirror::SkipCause::NonInteractive,
+        )) = outcome
+        {
+            ui::note("AUR skipped — upgrades are repo-only; `refresh` sets it up");
+        }
         match &self.session {
             Some(session) => session.recompute_remaining(self.devel),
             // No AUR index even after a refresh: repo upgrades are still
@@ -1464,9 +1490,12 @@ impl ShellEnv for RealEnv<'_> {
         }
     }
 
-    fn refresh(&mut self) -> Result<()> {
-        // `refresh` is the always-fetch command — it ignores the TTL.
-        self.reload(upgrade::FetchPolicy::Always)
+    fn refresh(&mut self) -> Result<mirror::RefreshOutcome> {
+        // `refresh` is the always-fetch command — it ignores the TTL, so the
+        // reload always carries an outcome.
+        Ok(self
+            .reload(upgrade::FetchPolicy::Always)?
+            .unwrap_or(mirror::RefreshOutcome::Refreshed))
     }
 
     fn search(&mut self, terms: &[SearchTerm]) -> Result<Vec<ListItem>> {
@@ -1849,14 +1878,16 @@ impl RealEnv<'_> {
     /// session in place, rebuilding the name caches so fresh data backs
     /// subsequent `search`/`info`/classification + completion. Shared by
     /// `upgrade` (which then recomputes candidates) and `refresh` (which stops
-    /// here). Invalidates the `show` resolution cache — the mirror/db data it was
-    /// resolved against may have just changed.
-    fn reload(&mut self, policy: upgrade::FetchPolicy) -> Result<()> {
-        let session = upgrade::refresh_and_reload(self.cfg, policy)?;
-        self.caches = build_universe(session.as_ref());
-        self.session = session;
+    /// here); both consume the returned outcome (`None` when the TTL skipped
+    /// the fetch) to word what the refresh actually did. Invalidates the `show`
+    /// resolution cache — the mirror/db data it was resolved against may have
+    /// just changed.
+    fn reload(&mut self, policy: upgrade::FetchPolicy) -> Result<Option<mirror::RefreshOutcome>> {
+        let reload = upgrade::refresh_and_reload(self.cfg, policy)?;
+        self.caches = build_universe(reload.session.as_ref());
+        self.session = reload.session;
         self.view = None;
-        Ok(())
+        Ok(reload.outcome)
     }
 
     /// Build the unified change-set table for `show` from the cached resolution,
@@ -2321,6 +2352,8 @@ mod tests {
         /// `None` = the user declined the prompt.
         prune_outcome: Option<ByteSize>,
         prune_calls: CallCount,
+        /// What `refresh` reports; `None` ⇒ a full `Refreshed`.
+        refresh_outcome: Option<mirror::RefreshOutcome>,
     }
 
     impl ShellEnv for FakeEnv {
@@ -2331,9 +2364,11 @@ mod tests {
             self.upgrades.bump();
             Ok(self.upgrade_candidates.clone())
         }
-        fn refresh(&mut self) -> Result<()> {
+        fn refresh(&mut self) -> Result<mirror::RefreshOutcome> {
             self.refreshes.bump();
-            Ok(())
+            Ok(self
+                .refresh_outcome
+                .unwrap_or(mirror::RefreshOutcome::Refreshed))
         }
         fn search(&mut self, _terms: &[SearchTerm]) -> Result<Vec<ListItem>> {
             Ok(self.search_result.clone())
@@ -2565,6 +2600,36 @@ mod tests {
             "refresh leaves the cart intact"
         );
         assert!(env.lines.contains("refreshed"));
+    }
+
+    /// A declined bootstrap is worded as a skip (with the retry hint), not as
+    /// a full "mirror + index refreshed".
+    #[test]
+    fn refresh_decline_words_the_skip() {
+        let mut env = FakeEnv {
+            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
+                mirror::SkipCause::Declined,
+            )),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("refresh"), &mut env);
+        assert!(env.lines.contains("AUR setup skipped"));
+        assert!(!env.lines.contains("mirror + index refreshed"));
+    }
+
+    /// Pacman-only mode: `refresh` still reports the repo-db half without
+    /// pretending the mirror was touched.
+    #[test]
+    fn refresh_disabled_words_the_repo_only_refresh() {
+        let mut env = FakeEnv {
+            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
+                mirror::SkipCause::Disabled,
+            )),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("refresh"), &mut env);
+        assert!(env.lines.contains("AUR disabled in config"));
+        assert!(!env.lines.contains("mirror + index refreshed"));
     }
 
     #[test]

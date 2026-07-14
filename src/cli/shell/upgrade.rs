@@ -42,23 +42,34 @@ pub(crate) enum FetchPolicy {
     WhenStale,
 }
 
+/// One session reload's result: what the refresh did to the AUR mirror (when
+/// one ran at all) plus the freshly loaded session.
+pub(crate) struct SessionReload {
+    /// `None` when the TTL said the mirror was fresh and no fetch ran.
+    pub outcome: Option<mirror::RefreshOutcome>,
+    /// `None` when no index is on disk even now (e.g. the bootstrap prompt was
+    /// declined, or AUR is disabled) — the caller degrades to repo-only.
+    pub session: Option<UpgradeSession>,
+}
+
 /// Refresh the mirror + index (subject to `policy`), then reload the session so
 /// subsequent `search`/`info`/`upgrade` see current data. Under
 /// [`FetchPolicy::WhenStale`] a recently-fetched mirror skips the network fetch,
 /// but the in-memory session is still reloaded from disk so an external `pacman
-/// -Sy`/`-Syu` is reflected. `Ok(None)` when no index exists even after
-/// (shouldn't happen once a clone is on disk, but the caller degrades
-/// gracefully).
-pub(crate) fn refresh_and_reload(
-    cfg: &Config,
-    policy: FetchPolicy,
-) -> Result<Option<UpgradeSession>> {
-    if should_fetch(cfg, policy) {
-        mirror::cmd_refresh(cfg, false)?;
+/// -Sy`/`-Syu` is reflected. The first-ever fetch needs the bootstrap clone,
+/// which [`mirror::cmd_refresh`]'s consent gate announces and confirms; a
+/// decline surfaces in [`SessionReload::outcome`] so the caller can hint.
+pub(crate) fn refresh_and_reload(cfg: &Config, policy: FetchPolicy) -> Result<SessionReload> {
+    let outcome = if should_fetch(cfg, policy) {
+        Some(mirror::cmd_refresh(cfg, mirror::RefreshReason::Shell)?)
     } else {
         debug!("mirror fetched within the refresh TTL; reloading from disk without a fetch");
-    }
-    UpgradeSession::load(cfg)
+        None
+    };
+    Ok(SessionReload {
+        outcome,
+        session: UpgradeSession::load(cfg)?,
+    })
 }
 
 /// Whether [`refresh_and_reload`] should hit the network: always under
