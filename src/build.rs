@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::context;
 use crate::error::{Error, Result};
 use crate::index::{self, AurIndexData};
-use crate::mirror::{self, MirrorRepo};
+use crate::mirror::{self, MirrorRepo, RefreshOutcome, RefreshReason};
 use crate::names::{PkgBase, PkgName, PkgTarget, PkgTargetSetExt};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke;
@@ -21,6 +21,7 @@ use crate::resolver::{self, PkgbasePlan, Plan};
 use crate::ui;
 use crate::version::Version;
 use std::collections::{HashMap, HashSet};
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
@@ -186,11 +187,29 @@ pub fn cmd_install(
     };
     let report = match ctx.install(targets, opts, &mut reviewed) {
         // Unresolvable targets: when no AUR data was in play the names may
-        // simply live in the (unavailable) AUR — say what would bring it in.
+        // simply live in the (unavailable) AUR — offer to bring it in and
+        // retry once, else say what would.
         Err(Error::UnknownTargets(names)) => {
-            return Err(Error::UnknownTargets(unknown_targets_hint(
-                names, aur_state,
-            )));
+            let Some(aur_data) = offer_aur_setup(cfg, &names, aur_state, noconfirm)? else {
+                return Err(Error::UnknownTargets(unknown_targets_hint(
+                    names, aur_state,
+                )));
+            };
+            let ctx = InstallCtx {
+                cfg,
+                aur: &aur_data,
+                pac: &pac,
+            };
+            match ctx.install(targets, opts, &mut reviewed) {
+                // Still unknown with a fresh index: genuinely not a package.
+                Err(Error::UnknownTargets(names)) => {
+                    return Err(Error::UnknownTargets(unknown_targets_hint(
+                        names,
+                        index::AurState::probe(cfg),
+                    )));
+                }
+                other => other?,
+            }
         }
         other => other?,
     };
@@ -199,6 +218,40 @@ pub fn cmd_install(
     Ok(u8::from(
         report.had_failures() || !report.interrupted.is_empty(),
     ))
+}
+
+/// After `-S` hit unknown targets with the AUR enabled-but-unsynced: the
+/// names may simply live in the AUR, so offer the one-time mirror setup —
+/// through the consent gate's [`RefreshReason::InstallOffer`] row, which
+/// announces the cost and prompts — and return the freshly loaded index on
+/// "yes". `None` ⇒ the offer doesn't apply ([`offer_applies`]) or the user
+/// declined; the caller reports the plain unknown-target error instead.
+fn offer_aur_setup(
+    cfg: &Config,
+    names: &str,
+    aur: index::AurState,
+    noconfirm: bool,
+) -> Result<Option<AurIndexData>> {
+    if !offer_applies(aur, noconfirm, std::io::stdin().is_terminal()) {
+        return Ok(None);
+    }
+    ui::note(&format!(
+        "{names}: not in the official repos — may be in the AUR"
+    ));
+    match mirror::cmd_refresh(cfg, RefreshReason::InstallOffer)? {
+        RefreshOutcome::Refreshed => Ok(Some(AurIndexData::load(cfg)?)),
+        RefreshOutcome::AurSkipped(_) => Ok(None),
+    }
+}
+
+/// Whether an unknown-target failure should offer the AUR setup: only when
+/// the AUR is enabled-but-unsynced (with a ready index the names are
+/// genuinely unknown; pacman-only mode is a standing choice), and only where
+/// a human can answer — a TTY without `--noconfirm`. The consent gate
+/// enforces the same rule ([`RefreshReason::InstallOffer`]); this pre-gate
+/// just avoids a pointless repo-DB refresh on the refusal path.
+const fn offer_applies(aur: index::AurState, noconfirm: bool, stdin_is_tty: bool) -> bool {
+    matches!(aur, index::AurState::NotSetUp) && !noconfirm && stdin_is_tty
 }
 
 /// Suffix an [`Error::UnknownTargets`] with why the AUR couldn't answer: when
@@ -1067,6 +1120,19 @@ mod tests {
         assert_contains!(not_set_up, "aurox -Sy");
         let disabled = unknown_targets_hint("spotify".into(), index::AurState::Disabled);
         assert_contains!(disabled, "aur = false");
+    }
+
+    /// The setup offer fires only for an enabled-but-unsynced AUR on an
+    /// interactive run: a ready index means the names are genuinely unknown,
+    /// pacman-only mode is a standing choice, and neither `--noconfirm` nor
+    /// a pipe has a human to answer the prompt.
+    #[test]
+    fn offer_applies_only_interactive_and_not_set_up() {
+        assert!(offer_applies(index::AurState::NotSetUp, false, true));
+        assert!(!offer_applies(index::AurState::NotSetUp, true, true));
+        assert!(!offer_applies(index::AurState::NotSetUp, false, false));
+        assert!(!offer_applies(index::AurState::Ready, false, true));
+        assert!(!offer_applies(index::AurState::Disabled, false, true));
     }
 
     /// `blocking_dep` is the resilience gate: it answers "should I skip

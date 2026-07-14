@@ -159,6 +159,9 @@ pub trait ShellEnv {
     /// Whether AUR items stage pre-approved — the effective `aur_approval`
     /// policy (see [`AurApproval::from_config`](cart::AurApproval::from_config)).
     fn aur_policy(&self) -> AurApproval;
+    /// Where the AUR half stands this session — wording only (e.g. `add`'s
+    /// unknown-name nudge); data flow stays uniform through the empty index.
+    fn aur_state(&self) -> index::AurState;
     /// The pkgbase a staged AUR target resolves to, for the reviewed set fed
     /// into the build pipeline. `None` when it isn't a known AUR package.
     fn pkgbase_of(&self, target: &PkgTarget) -> Option<PkgBase>;
@@ -483,27 +486,34 @@ impl State {
         let policy = env.aur_policy();
         let before = self.cart.clone();
         let mut changed = false;
+        let mut any_unknown = false;
         for t in targets {
-            match env.classify(&t) {
-                Some(StageClass { source, repo }) => {
-                    let name = t.as_str().to_owned();
-                    // Show the concrete repo (`core`/`extra`) when known, else
-                    // the coarse source label.
-                    let label = repo
-                        .clone()
-                        .map_or_else(|| source.label().to_owned(), RepoName::into_inner);
-                    match self.cart.add(CartItem::new(t, source, repo, policy)) {
-                        StageResult::Staged => {
-                            env.print(&format!("staged {name} ({label})"));
-                            changed = true;
-                        }
-                        StageResult::AlreadyStaged => {
-                            env.print(&format!("{name} is already staged"));
-                        }
-                    }
+            let Some(StageClass { source, repo }) = env.classify(&t) else {
+                env.print(&format!("unknown package `{}` — not staged", t.as_str()));
+                any_unknown = true;
+                continue;
+            };
+            let name = t.as_str().to_owned();
+            // Show the concrete repo (`core`/`extra`) when known, else the
+            // coarse source label.
+            let label = repo
+                .clone()
+                .map_or_else(|| source.label().to_owned(), RepoName::into_inner);
+            match self.cart.add(CartItem::new(t, source, repo, policy)) {
+                StageResult::Staged => {
+                    env.print(&format!("staged {name} ({label})"));
+                    changed = true;
                 }
-                None => env.print(&format!("unknown package `{}` — not staged", t.as_str())),
+                StageResult::AlreadyStaged => {
+                    env.print(&format!("{name} is already staged"));
+                }
             }
+        }
+        // With the AUR enabled but unsynced, "unknown" may just mean "only in
+        // the AUR" — one nudge for the whole batch. Pacman-only mode is a
+        // standing choice and stays quiet.
+        if any_unknown && env.aur_state() == index::AurState::NotSetUp {
+            env.print("unknown names may be in the AUR — `refresh` syncs it (one-time ~2 GiB)");
         }
         // Keep the resulting transaction on screen so the user needn't `show`
         // after every stage (post-5c UX). Skipped when nothing actually changed
@@ -1644,6 +1654,10 @@ impl ShellEnv for RealEnv<'_> {
         AurApproval::from_config(self.cfg.aur_approval, &self.cfg.review_default)
     }
 
+    fn aur_state(&self) -> index::AurState {
+        self.aur_state
+    }
+
     fn pkgbase_of(&self, target: &PkgTarget) -> Option<PkgBase> {
         self.aur_data
             .lookup()
@@ -2318,6 +2332,10 @@ mod tests {
         fn joined(&self) -> String {
             self.0.join("\n")
         }
+        /// How many printed lines contain `needle` — for once-per-batch checks.
+        fn count_containing(&self, needle: &str) -> usize {
+            self.0.iter().filter(|l| l.contains(needle)).count()
+        }
     }
 
     /// How many times a scripted env effect ran. A typed counter so the fake's
@@ -2366,6 +2384,8 @@ mod tests {
         prune_calls: CallCount,
         /// What `refresh` reports; `None` ⇒ a full `Refreshed`.
         refresh_outcome: Option<mirror::RefreshOutcome>,
+        /// What `aur_state` reports; `None` ⇒ `Ready` (no nudges).
+        aur_state: Option<index::AurState>,
     }
 
     impl ShellEnv for FakeEnv {
@@ -2402,6 +2422,10 @@ mod tests {
         }
         fn aur_policy(&self) -> AurApproval {
             self.policy
+        }
+        fn aur_state(&self) -> index::AurState {
+            // Most dispatch tests don't care; `Ready` keeps them nudge-free.
+            self.aur_state.unwrap_or(index::AurState::Ready)
         }
         fn pkgbase_of(&self, target: &PkgTarget) -> Option<PkgBase> {
             Some(PkgBase::from(target.as_str()))
@@ -2764,6 +2788,34 @@ mod tests {
         state.dispatch(&command::parse("add nope"), &mut env);
         assert!(state.cart.is_empty());
         assert!(env.lines.contains("unknown package"));
+        // With a ready index "unknown" is authoritative — no AUR speculation.
+        assert!(!env.lines.contains("may be in the AUR"));
+    }
+
+    /// With the AUR enabled but unsynced, an unknown `add` target may simply
+    /// live there: one nudge per batch points at `refresh` (never a prompt —
+    /// staging must stay cheap). Pacman-only mode keeps the standing silence.
+    #[test]
+    fn add_unknown_nudges_at_the_aur_only_when_not_set_up() {
+        let mut env = FakeEnv {
+            aur_state: Some(index::AurState::NotSetUp),
+            ..FakeEnv::default()
+        };
+        let mut state = State::default();
+        state.dispatch(&command::parse("add nope nada"), &mut env);
+        assert!(env.lines.contains("may be in the AUR"));
+        assert_eq!(
+            env.lines.count_containing("may be in the AUR"),
+            1,
+            "one nudge for the whole batch"
+        );
+
+        let mut env = FakeEnv {
+            aur_state: Some(index::AurState::Disabled),
+            ..FakeEnv::default()
+        };
+        state.dispatch(&command::parse("add nope"), &mut env);
+        assert!(!env.lines.contains("may be in the AUR"));
     }
 
     #[test]

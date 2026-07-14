@@ -19,7 +19,8 @@
 //! | on        | absent         | any             | bootstrap (first run)          |
 //!
 //! Second, how a wanted bootstrap obtains consent ([`consent_mode`]), by
-//! trigger (`--noconfirm` short-circuits every row to auto-yes):
+//! trigger (`--noconfirm` short-circuits every row to auto-yes — except the
+//! install offer, which it refuses):
 //!
 //! | trigger                     | stdin a TTY | consent                                    |
 //! |-----------------------------|-------------|--------------------------------------------|
@@ -29,6 +30,8 @@
 //! | shell `upgrade`             | (tty)       | refuse quietly (`SkipCause::NotSetUp`)     |
 //! | schema-bump resync (implicit) | yes       | announce + Y/n prompt (default yes)        |
 //! | schema-bump resync (implicit) | no        | refuse — never bootstrap behind a pipe     |
+//! | `-S` unknown-target offer   | yes         | announce + Y/n prompt (default yes)        |
+//! | `-S` unknown-target offer   | no / `--noconfirm` | refuse — an offer is never auto-accepted |
 //!
 //! The shell rows exist because the shell asks its own three-way question at
 //! launch (sync now / pacman-only / later): after "later", typing `refresh`
@@ -70,6 +73,13 @@ pub enum RefreshReason {
     /// user typed something unrelated (`-Ss`, `-S`, …), so a non-interactive
     /// run must never bootstrap on its behalf.
     IndexResync,
+    /// `aurox -S <target>` hit unknown targets with the AUR
+    /// enabled-but-unsynced — the names may simply live there, so the install
+    /// path offers the one-time setup and retries. An *offer*, not a command:
+    /// it prompts on a TTY and is refused everywhere else — `--noconfirm`
+    /// included, since `-S --noconfirm <typo>` in a script must not pull a
+    /// surprise ~2 GiB clone.
+    InstallOffer,
 }
 
 /// What one [`super::cmd_refresh`] actually did.
@@ -173,10 +183,17 @@ enum ConsentMode {
 /// Pure consent-resolution core, kept parameter-injected for the unit tests
 /// ([`plan`] feeds it the live `--noconfirm` flag and stdin's TTY-ness).
 const fn consent_mode(reason: RefreshReason, noconfirm: bool, stdin_is_tty: bool) -> ConsentMode {
-    if noconfirm {
-        return ConsentMode::AutoYes;
-    }
     match reason {
+        // The one trigger `--noconfirm` refuses instead of auto-accepting:
+        // it's an offer aurox volunteered, not something the user asked for.
+        RefreshReason::InstallOffer => {
+            if stdin_is_tty && !noconfirm {
+                ConsentMode::Prompt
+            } else {
+                ConsentMode::Refuse
+            }
+        }
+        _ if noconfirm => ConsentMode::AutoYes,
         RefreshReason::ExplicitSync | RefreshReason::ForceReclone => ConsentMode::Prompt,
         RefreshReason::ShellRefresh => ConsentMode::AutoYes,
         RefreshReason::ShellUpgrade => ConsentMode::Refuse,
@@ -191,7 +208,9 @@ const fn consent_mode(reason: RefreshReason, noconfirm: bool, stdin_is_tty: bool
 }
 
 /// What a [`ConsentMode::Refuse`] skip reports: `upgrade` skips because the
-/// AUR isn't set up yet; the implicit resync because there was nobody to ask.
+/// AUR isn't set up yet; the implicit resync — and a refused install offer —
+/// because there was nobody to ask (the install path pre-gates on a TTY and
+/// falls back to its plain unknown-target error either way).
 const fn refusal_cause(reason: RefreshReason) -> SkipCause {
     match reason {
         RefreshReason::ShellUpgrade => SkipCause::NotSetUp,
@@ -304,27 +323,52 @@ const fn question(kind: BootstrapKind) -> &'static str {
 mod tests {
     use super::*;
 
-    const ALL_REASONS: [RefreshReason; 5] = [
+    const ALL_REASONS: [RefreshReason; 6] = [
         RefreshReason::ExplicitSync,
         RefreshReason::ForceReclone,
         RefreshReason::ShellRefresh,
         RefreshReason::ShellUpgrade,
         RefreshReason::IndexResync,
+        RefreshReason::InstallOffer,
     ];
 
     /// `--noconfirm` is the automation opt-in: it approves a bootstrap for any
-    /// trigger, terminal or not.
+    /// trigger the user actually issued, terminal or not. The install offer is
+    /// the exception — aurox volunteered it, so `--noconfirm` refuses.
     #[test]
-    fn noconfirm_auto_approves_every_reason() {
+    fn noconfirm_auto_approves_every_reason_except_the_offer() {
         for reason in ALL_REASONS {
+            let expected = if reason == RefreshReason::InstallOffer {
+                ConsentMode::Refuse
+            } else {
+                ConsentMode::AutoYes
+            };
             for tty in [true, false] {
                 assert_eq!(
                     consent_mode(reason, true, tty),
-                    ConsentMode::AutoYes,
+                    expected,
                     "{reason:?} tty={tty}"
                 );
             }
         }
+    }
+
+    /// The install offer prompts only where a human can answer: a TTY without
+    /// `--noconfirm`. Everywhere else it refuses — never a surprise clone.
+    #[test]
+    fn install_offer_prompts_only_on_an_interactive_tty() {
+        assert_eq!(
+            consent_mode(RefreshReason::InstallOffer, false, true),
+            ConsentMode::Prompt
+        );
+        assert_eq!(
+            consent_mode(RefreshReason::InstallOffer, false, false),
+            ConsentMode::Refuse
+        );
+        assert_eq!(
+            consent_mode(RefreshReason::InstallOffer, true, true),
+            ConsentMode::Refuse
+        );
     }
 
     /// An explicit CLI sync carries the intent even on a pipe — the prompt's
@@ -408,6 +452,7 @@ mod tests {
             RefreshReason::ShellRefresh,
             RefreshReason::ShellUpgrade,
             RefreshReason::IndexResync,
+            RefreshReason::InstallOffer,
         ] {
             assert_eq!(
                 decide(true, MirrorState::Ready, reason),
