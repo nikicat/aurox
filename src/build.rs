@@ -247,7 +247,11 @@ fn offer_aur_setup(
     ui::note(&format!(
         "{names}: not in the official repos — may be in the AUR"
     ));
-    match mirror::cmd_refresh(cfg, RefreshReason::InstallOffer)? {
+    match mirror::cmd_refresh(
+        cfg,
+        RefreshReason::InstallOffer,
+        mirror::RefreshScope::Everything,
+    )? {
         RefreshOutcome::Refreshed => Ok(Some(AurIndexData::load(cfg)?)),
         RefreshOutcome::AurSkipped(_) => Ok(None),
     }

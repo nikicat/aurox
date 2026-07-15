@@ -110,8 +110,12 @@ fn bootstrap(cfg: &Config) {
         noconfirm: true,
         ..saved
     });
-    mirror::cmd_refresh(cfg, mirror::RefreshReason::ExplicitSync)
-        .expect("initial bootstrap must succeed");
+    mirror::cmd_refresh(
+        cfg,
+        mirror::RefreshReason::ExplicitSync,
+        mirror::RefreshScope::Everything,
+    )
+    .expect("initial bootstrap must succeed");
     runopts::set(saved);
 }
 
@@ -240,8 +244,12 @@ fn cmd_refresh_rebuilds_when_existing_index_is_unreadable() {
     // Second refresh: bare is bootstrapped, fetch returns no updates, the
     // existing index fails to load → recovery branch fires. The mirror is
     // Ready, so no consent prompt is involved.
-    mirror::cmd_refresh(&cfg, mirror::RefreshReason::ExplicitSync)
-        .expect("cmd_refresh must recover from a bad index");
+    mirror::cmd_refresh(
+        &cfg,
+        mirror::RefreshReason::ExplicitSync,
+        mirror::RefreshScope::Everything,
+    )
+    .expect("cmd_refresh must recover from a bad index");
 
     let idx = index::load(&idx_path).expect("rebuilt index must be loadable");
     assert_eq!(idx.entries.len(), 2, "both fixture branches indexed");

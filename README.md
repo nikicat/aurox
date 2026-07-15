@@ -91,7 +91,7 @@ If unset, `review_default = "skip"` still auto-approves (legacy behavior).
 `aur = false` opts out of the AUR half entirely (the shell's first-launch
 question writes it for you if you answer "no"): search, info, install, and
 upgrades run against the official repos only, and nothing ever asks about the
-mirror. Delete the line and run `refresh` (or `aurox -Sy`) to opt back in.
+mirror. Delete the line and run `refresh aur` (or `aurox -Sy`) to opt back in.
 
 ## Layout on disk
 

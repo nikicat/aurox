@@ -36,8 +36,8 @@ pub struct Config {
     /// Enable the AUR half of aurox. `false` is pacman-only mode: no mirror
     /// clone (and no bootstrap prompt), no AUR search/info/install/upgrades —
     /// `-Sy`/`refresh` touch the official-repo databases only. Flip back to
-    /// `true` (or delete the line) and run `refresh` to opt into the one-time
-    /// ~2 GiB mirror clone.
+    /// `true` (or delete the line) and run `refresh aur` to opt into the
+    /// one-time ~2 GiB mirror clone.
     pub aur: bool,
     /// Git URL of the AUR mirror to clone.
     pub mirror_url: String,

@@ -147,7 +147,8 @@ offer, which it refuses:
 |--------------------------------|-------------|---------------------------------------------|
 | `-Sy` / `-Syy`                 | yes         | announce cost + Y/n prompt (default yes)    |
 | `-Sy` / `-Syy`                 | no          | announce + read line: EOF ⇒ yes, `n` ⇒ no   |
-| shell `refresh`                | (tty)       | auto-yes — the launch question already asked |
+| shell `refresh aur` / launch "yes" | (tty)   | auto-yes — asking for the AUR by name IS the consent |
+| shell `refresh` (bare)         | (tty)       | refuse quietly; points at `refresh aur`     |
 | shell `upgrade`                | (tty)       | refuse quietly; upgrade degrades to repo-only |
 | schema-bump resync (implicit)  | yes         | announce + Y/n prompt (default yes)         |
 | schema-bump resync (implicit)  | no          | refuse — never bootstrap behind a pipe      |
@@ -157,12 +158,14 @@ offer, which it refuses:
 The shell rows exist because the shell asks its own three-way question at
 first launch while the AUR is enabled-but-unsynced — **sync now** (bootstraps
 immediately) / **no** (persists `aur = false` via the config handle) /
-**later**, the Enter default (persists nothing) — so typing `refresh` after
-"later" IS the consent and gets a one-line heads-up instead of a second Y/n,
-while `upgrade`'s TTL-driven fetch must not spring the clone on someone who
-just said "later". The `-S` offer row is `cmd_install`'s inline retry: an
-unknown target with the AUR unsynced offers the setup, bootstraps on yes,
-reloads, and retries the install once.
+**later**, the Enter default (persists nothing) — so typing `refresh aur`
+after "later" IS the consent and gets a one-line heads-up instead of a second
+Y/n, while the bare `refresh` and `upgrade`'s TTL-driven fetch must not spring
+the clone on someone who just said "later" (`refresh` also takes a scope:
+bare = everything it can do without a bootstrap, `aur` / `pacman` = one half).
+The `-S` offer row is `cmd_install`'s inline retry: an unknown target with the
+AUR unsynced offers the setup, bootstraps on yes, reloads, and retries the
+install once.
 
 A decline or refusal still refreshes the official sync DBs, still stamps the
 fetch TTL (so `upgrade` doesn't re-nag within the window), and surfaces as
