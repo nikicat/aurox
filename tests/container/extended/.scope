@@ -3,11 +3,11 @@
 # pattern (source lib.sh; bootstrap; reset_state; aurox …; assert_*).
 #
 # PKGBUILD-driven cases:
-#   - provides_virtual_resolves.sh       (`-S myvirt` → test-provides-virt;
-#       the fixture is baked into the image, nothing references it yet)
-#   - install_hook_runs.sh               (post_install scriptlet touches
-#       /var/lib/test-install-hook-ran; fixture test-install-hook is baked,
-#       nothing references it yet)
+#   (landed: 13_provides_virtual_resolves.sh — `-S myvirt` resolves through
+#    by_provides to test-provides-virt, installed Explicit; the virtual is
+#    satisfied with no literal myvirt package)
+#   (landed: 14_install_hook_runs.sh — test-install-hook's post_install
+#    scriptlet runs at the final pacman -U, proven by its marker file)
 #   (graduated to smoke: epoch_dominates_version → smoke/40,
 #    vcs_pkg_skipped_without_devel → smoke/41,
 #    vcs_pkg_picked_up_with_devel → smoke/42)
