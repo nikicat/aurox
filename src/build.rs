@@ -135,6 +135,23 @@ pub struct InstallOpts {
     pub gate: ConfirmGate,
 }
 
+/// Whether the unknown-target path may offer the one-time AUR setup.
+///
+/// The caller answers it from what already happened this invocation:
+/// `-Sy <targets>` runs the sync consent prompt before the install half
+/// ([`offer_aur_setup`]), and a user who just declined it must not be asked
+/// the same question again seconds later (`mirror/consent.rs`: no
+/// double-prompts after an informed explicit command).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupOffer {
+    /// Nothing asked yet this invocation — the offer may prompt (still
+    /// subject to [`offer_applies`]).
+    Open,
+    /// An explicit sync in this same invocation already asked and was
+    /// declined; the answer stands for the rest of the invocation.
+    AlreadyDeclined,
+}
+
 /// Entry point for `aurox -S <targets>`.
 ///
 /// Loads the pacman snapshot and (optionally) the AUR index in parallel, then
@@ -145,9 +162,8 @@ pub struct InstallOpts {
 pub fn cmd_install(
     cfg: &Config,
     targets: &[Target],
-    noconfirm: bool,
-    asdeps: bool,
-    already_confirmed: bool,
+    opts: InstallOpts,
+    offer: SetupOffer,
 ) -> Result<u8> {
     // Probed once: drives only the unknown-target wording below. The data
     // flow is uniform — an unavailable AUR loads as empty AUR data.
@@ -171,15 +187,6 @@ pub fn cmd_install(
     // `-S` has no cross-call review memory, so a fresh per-invocation set. The
     // upgrade loop keeps its own session-scoped set across batches instead.
     let mut reviewed = HashSet::new();
-    let opts = InstallOpts {
-        noconfirm,
-        asdeps,
-        gate: if already_confirmed {
-            ConfirmGate::AlreadyConfirmed
-        } else {
-            ConfirmGate::Ask
-        },
-    };
     let ctx = InstallCtx {
         cfg,
         aur: &aur_data,
@@ -190,7 +197,8 @@ pub fn cmd_install(
         // simply live in the (unavailable) AUR — offer to bring it in and
         // retry once, else say what would.
         Err(Error::UnknownTargets(names)) => {
-            let Some(aur_data) = offer_aur_setup(cfg, &names, aur_state, noconfirm)? else {
+            let Some(aur_data) = offer_aur_setup(cfg, &names, aur_state, opts.noconfirm, offer)?
+            else {
                 return Err(Error::UnknownTargets(unknown_targets_hint(
                     names, aur_state,
                 )));
@@ -231,8 +239,9 @@ fn offer_aur_setup(
     names: &str,
     aur: index::AurState,
     noconfirm: bool,
+    offer: SetupOffer,
 ) -> Result<Option<AurIndexData>> {
-    if !offer_applies(aur, noconfirm, std::io::stdin().is_terminal()) {
+    if !offer_applies(aur, noconfirm, std::io::stdin().is_terminal(), offer) {
         return Ok(None);
     }
     ui::note(&format!(
@@ -246,12 +255,22 @@ fn offer_aur_setup(
 
 /// Whether an unknown-target failure should offer the AUR setup: only when
 /// the AUR is enabled-but-unsynced (with a ready index the names are
-/// genuinely unknown; pacman-only mode is a standing choice), and only where
-/// a human can answer — a TTY without `--noconfirm`. The consent gate
-/// enforces the same rule ([`RefreshReason::InstallOffer`]); this pre-gate
-/// just avoids a pointless repo-DB refresh on the refusal path.
-const fn offer_applies(aur: index::AurState, noconfirm: bool, stdin_is_tty: bool) -> bool {
-    matches!(aur, index::AurState::NotSetUp) && !noconfirm && stdin_is_tty
+/// genuinely unknown; pacman-only mode is a standing choice), only where
+/// a human can answer — a TTY without `--noconfirm` — and never when this
+/// invocation's explicit sync already asked and was declined
+/// ([`SetupOffer::AlreadyDeclined`]). The consent gate enforces the
+/// TTY/`--noconfirm` rule too ([`RefreshReason::InstallOffer`]); this
+/// pre-gate just avoids a pointless repo-DB refresh on the refusal path.
+const fn offer_applies(
+    aur: index::AurState,
+    noconfirm: bool,
+    stdin_is_tty: bool,
+    offer: SetupOffer,
+) -> bool {
+    matches!(offer, SetupOffer::Open)
+        && matches!(aur, index::AurState::NotSetUp)
+        && !noconfirm
+        && stdin_is_tty
 }
 
 /// Suffix an [`Error::UnknownTargets`] with why the AUR couldn't answer: when
@@ -1125,14 +1144,27 @@ mod tests {
     /// The setup offer fires only for an enabled-but-unsynced AUR on an
     /// interactive run: a ready index means the names are genuinely unknown,
     /// pacman-only mode is a standing choice, and neither `--noconfirm` nor
-    /// a pipe has a human to answer the prompt.
+    /// a pipe has a human to answer the prompt. And it never re-asks a user
+    /// who just declined the same question via `-Sy <targets>`.
     #[test]
     fn offer_applies_only_interactive_and_not_set_up() {
-        assert!(offer_applies(index::AurState::NotSetUp, false, true));
-        assert!(!offer_applies(index::AurState::NotSetUp, true, true));
-        assert!(!offer_applies(index::AurState::NotSetUp, false, false));
-        assert!(!offer_applies(index::AurState::Ready, false, true));
-        assert!(!offer_applies(index::AurState::Disabled, false, true));
+        use SetupOffer::{AlreadyDeclined, Open};
+        assert!(offer_applies(index::AurState::NotSetUp, false, true, Open));
+        assert!(!offer_applies(index::AurState::NotSetUp, true, true, Open));
+        assert!(!offer_applies(
+            index::AurState::NotSetUp,
+            false,
+            false,
+            Open
+        ));
+        assert!(!offer_applies(index::AurState::Ready, false, true, Open));
+        assert!(!offer_applies(index::AurState::Disabled, false, true, Open));
+        assert!(!offer_applies(
+            index::AurState::NotSetUp,
+            false,
+            true,
+            AlreadyDeclined
+        ));
     }
 
     /// `blocking_dep` is the resilience gate: it answers "should I skip

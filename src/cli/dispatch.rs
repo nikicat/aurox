@@ -142,6 +142,7 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
         RefreshReason::ExplicitSync
     };
 
+    let mut offer = build::SetupOffer::Open;
     if refresh {
         // A decline is a choice, not a failure: exit 0, remind how to opt in
         // later. (`Disabled` already printed its own note in the consent plan.)
@@ -149,6 +150,9 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
             mirror::cmd_refresh(cfg, reason)?
         {
             ui::note("AUR setup skipped — run `aurox -Sy` when ready");
+            // The install half below must not re-ask the question this sync
+            // just heard "no" to.
+            offer = build::SetupOffer::AlreadyDeclined;
         }
     }
 
@@ -165,7 +169,12 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
             .cloned()
             .map(build::Target::bare)
             .collect();
-        return build::cmd_install(cfg, &targets, noconfirm, asdeps, false);
+        let opts = build::InstallOpts {
+            noconfirm,
+            asdeps,
+            gate: build::ConfirmGate::Ask,
+        };
+        return build::cmd_install(cfg, &targets, opts, offer);
     } else if !refresh {
         return Err(Error::other("no targets specified"));
     }
