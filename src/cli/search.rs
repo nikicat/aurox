@@ -142,7 +142,9 @@ pub fn cmd_search(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
     for row in &rows {
-        let install = ui::InstallState::from_installed(pac.is_installed(row.picked().bare()));
+        let install = ui::InstallState::from_installed(
+            pac.is_installed(&PkgName::new(row.picked().into_inner())),
+        );
         write_search_result(&mut out, row, install)?;
     }
     Ok(0)
@@ -226,12 +228,12 @@ pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
 pub(crate) fn search_row(row: &Row<'_>, pac: &PacmanIndex) -> ui::SearchRow {
     let name = PkgName::new(row.picked().into_inner());
     let available = Some(row.version());
-    let installed = pac.is_installed(name.as_str());
+    let installed = pac.is_installed(&name);
     // Surface the installed version (→ an `old → new` diff) only when it's
     // actually behind the available one; a same-version row just shows the
     // version.
     let old_ver = if installed {
-        pac.installed_version(name.as_str())
+        pac.installed_version(&name)
             .filter(|iv| {
                 available
                     .as_ref()

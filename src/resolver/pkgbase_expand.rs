@@ -115,7 +115,7 @@ pub fn expand_pkgbase_targets(
         // resolver still classifies the spec via `resolve_target_source`
         // and can land on an AUR pkgbase even when expand did no rewrite.
         // The dotnet-runtime regression: a foreign virtual that's installed
-        // hits `pac.is_installed` → passes through → resolver routes to
+        // hits `pac.owns_name` → passes through → resolver routes to
         // pkgbase via `by_provides` → without a hint, counterpart picks the
         // first declared provides (wrong). Record the hint here so it's in
         // the map regardless of what expand decides next.
@@ -124,7 +124,7 @@ pub fn expand_pkgbase_targets(
         // Per-branch deciders return a TargetDecision; no `&mut` flows into
         // the branches themselves. Order matches the resolver's fallback
         // chain in `resolve_target_source`.
-        let decision = if pac.is_installed(bare) || pac.in_sync(bare) {
+        let decision = if pac.owns_name(bare) {
             decide_pacman_wins(idx, by, t, bare)
         } else if by.by_name.contains_key(bare) {
             decide_pkgname(idx, by, t, bare)

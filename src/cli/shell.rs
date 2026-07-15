@@ -1850,7 +1850,7 @@ impl ShellEnv for RealEnv<'_> {
         let installed_removals: Vec<&PkgName> = cart
             .removals()
             .iter()
-            .filter(|n| pac.is_installed(n.as_str()))
+            .filter(|n| pac.is_installed(n))
             .collect();
         if !installed_removals.is_empty() {
             // Stringify only here, at pacman's argv boundary.
