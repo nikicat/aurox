@@ -25,17 +25,19 @@ use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 use tracing::{debug, warn};
 
-/// Whether a session reload re-fetches the mirror unconditionally or only when
-/// the on-disk clone has gone stale.
+/// Whether a session reload re-fetches unconditionally (and how much of the
+/// package data) or only when the on-disk clone has gone stale.
 ///
-/// A named policy rather than a bare bool so the call sites read intent: the
-/// explicit `refresh` command forces a fetch, while `upgrade` defers to the TTL
-/// so back-to-back `upgrade`s don't each re-hit the network.
+/// A named policy rather than bare flags so the call sites read intent: the
+/// explicit `refresh` command forces a fetch of whatever it was scoped to,
+/// while `upgrade` defers to the TTL so back-to-back `upgrade`s don't each
+/// re-hit the network.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FetchPolicy {
-    /// Always fetch — the explicit `refresh` command.
-    Always,
-    /// Fetch only when the last fetch predates
+    /// Always fetch — the explicit `refresh [aur|pacman]` command, carrying
+    /// its scope.
+    Refresh(mirror::RefreshScope),
+    /// Fetch everything, but only when the last fetch predates
     /// [`Config::refresh_max_age_secs`]; otherwise reload from disk without a
     /// network round-trip — `upgrade`'s default.
     WhenStale,
@@ -58,17 +60,24 @@ pub(crate) struct AurReload {
 /// -Sy`/`-Syu` is reflected.
 ///
 /// The policy also picks the bootstrap-consent stance (see
-/// [`mirror::RefreshReason`]): the explicit `refresh` command is
-/// pre-consented — the shell's launch prompt already spelled out the clone
-/// cost — while `upgrade`'s TTL fetch never bootstraps, skipping the AUR half
-/// with a hintable [`AurReload::outcome`] instead.
+/// [`mirror::RefreshReason`]): the explicit `refresh aur` is pre-consented —
+/// the shell's launch prompt already spelled out the clone cost, and naming
+/// the AUR is the answer — while the bare `refresh` and `upgrade`'s TTL fetch
+/// never bootstrap, skipping the AUR half with a hintable
+/// [`AurReload::outcome`] instead.
 pub(crate) fn refresh_and_reload(cfg: &Config, policy: FetchPolicy) -> Result<AurReload> {
     let outcome = if should_fetch(cfg, policy) {
-        let reason = match policy {
-            FetchPolicy::Always => mirror::RefreshReason::ShellRefresh,
-            FetchPolicy::WhenStale => mirror::RefreshReason::ShellUpgrade,
+        let (reason, scope) = match policy {
+            FetchPolicy::Refresh(scope @ mirror::RefreshScope::Aur) => {
+                (mirror::RefreshReason::ShellAurSync, scope)
+            }
+            FetchPolicy::Refresh(scope) => (mirror::RefreshReason::ShellRefresh, scope),
+            FetchPolicy::WhenStale => (
+                mirror::RefreshReason::ShellUpgrade,
+                mirror::RefreshScope::Everything,
+            ),
         };
-        Some(mirror::cmd_refresh(cfg, reason)?)
+        Some(mirror::cmd_refresh(cfg, reason, scope)?)
     } else {
         debug!("mirror fetched within the refresh TTL; reloading from disk without a fetch");
         None
@@ -80,11 +89,11 @@ pub(crate) fn refresh_and_reload(cfg: &Config, policy: FetchPolicy) -> Result<Au
 }
 
 /// Whether [`refresh_and_reload`] should hit the network: always under
-/// [`FetchPolicy::Always`], else only once the mirror is older than
+/// [`FetchPolicy::Refresh`], else only once the mirror is older than
 /// [`Config::refresh_max_age_secs`] (or was never fetched).
 fn should_fetch(cfg: &Config, policy: FetchPolicy) -> bool {
     match policy {
-        FetchPolicy::Always => true,
+        FetchPolicy::Refresh(_) => true,
         FetchPolicy::WhenStale => match mirror::last_fetch_age() {
             Some(age) => age >= Duration::from_secs(cfg.refresh_max_age_secs),
             None => true,
@@ -436,6 +445,7 @@ mod tests {
     };
     use crate::config::Config;
     use crate::index::IndexEntry;
+    use crate::mirror::RefreshScope;
     use crate::names::{PkgName, PkgTarget};
     use crate::pacman::preflight;
     use crate::paths;
@@ -543,12 +553,18 @@ mod tests {
     }
 
     #[test]
-    fn always_policy_ignores_a_fresh_stamp() {
+    fn refresh_policy_ignores_a_fresh_stamp() {
         let dir = TempDir::new().unwrap();
         let _root = ScopedStateRoot::new(dir.path().to_path_buf());
         let cfg = Config::default();
         stamp_secs_ago(0); // fresh — would skip under WhenStale
-        assert!(should_fetch(&cfg, FetchPolicy::Always));
+        for scope in [
+            RefreshScope::Everything,
+            RefreshScope::Aur,
+            RefreshScope::Pacman,
+        ] {
+            assert!(should_fetch(&cfg, FetchPolicy::Refresh(scope)), "{scope:?}");
+        }
     }
 
     #[test]

@@ -2,11 +2,13 @@
 //! default — used by `tests/container/extended/12_shell_first_launch.sh`.
 //!
 //! ```text
-//!   (launch)  → the three-way question; nothing clones on its own
-//!   Enter     → "Later": banner + the pacman-only-this-session reminder
-//!   refresh   → pre-consented: brief heads-up, bootstrap, index refreshed
-//!   search    → an AUR row resolves in the same session (data reloaded)
-//!   quit      → clean exit
+//!   (launch)     → the three-way question; nothing clones on its own
+//!   Enter        → "Later": banner + the pacman-only-this-session reminder
+//!   refresh      → stays pacman-only: skip note pointing at `refresh aur`,
+//!                  no clone
+//!   refresh aur  → pre-consented: brief heads-up, bootstrap, index refreshed
+//!   search       → an AUR row resolves in the same session (data reloaded)
+//!   quit         → clean exit
 //! ```
 //!
 //! The `.sh` asserts the flip side: "Later" persisted nothing to config.toml.
@@ -22,9 +24,16 @@ fn main() {
     pty.send(b"\r");
     pty.expect("later reminder", |s| s.contains("pacman-only this session"));
 
-    // `refresh` after the launch question IS the consent — a one-line
-    // heads-up instead of a second Y/n, then the bootstrap runs.
+    // A bare `refresh` after "Later" must NOT spring the ~2 GiB clone: it
+    // skips the AUR half and points at the explicit scope word instead.
     pty.send(b"refresh\r");
+    pty.expect("bare refresh skips the AUR", |s| {
+        s.contains("AUR not synced — `refresh aur` runs the one-time setup")
+    });
+
+    // `refresh aur` after the launch question IS the consent — a one-line
+    // heads-up instead of a second Y/n, then the bootstrap runs.
+    pty.send(b"refresh aur\r");
     pty.expect("pre-consented heads-up", |s| {
         s.contains("syncing the AUR — one-time")
     });

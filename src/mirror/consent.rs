@@ -26,7 +26,8 @@
 //! |-----------------------------|-------------|--------------------------------------------|
 //! | `-Sy` / `-Syy`              | yes         | announce + Y/n prompt (default yes)        |
 //! | `-Sy` / `-Syy`              | no          | announce + read line: EOF ⇒ yes, `n` ⇒ no  |
-//! | shell `refresh`             | (tty)       | auto-yes — the launch prompt already asked |
+//! | shell `refresh aur` / launch "yes" | (tty) | auto-yes — asking for the AUR by name IS the consent |
+//! | shell `refresh` (bare)      | (tty)       | refuse quietly (`SkipCause::NotSetUp`)     |
 //! | shell `upgrade`             | (tty)       | refuse quietly (`SkipCause::NotSetUp`)     |
 //! | schema-bump resync (implicit) | yes       | announce + Y/n prompt (default yes)        |
 //! | schema-bump resync (implicit) | no        | refuse — never bootstrap behind a pipe     |
@@ -34,9 +35,10 @@
 //! | `-S` unknown-target offer   | no / `--noconfirm` | refuse — an offer is never auto-accepted |
 //!
 //! The shell rows exist because the shell asks its own three-way question at
-//! launch (sync now / pacman-only / later): after "later", typing `refresh`
-//! IS the consent — no second Y/n — while `upgrade`'s TTL-driven fetch must
-//! not spring the clone on someone who just said "later".
+//! launch (sync now / pacman-only / later): after "later", the session is
+//! pacman-only until the user names the AUR — `refresh aur` IS the consent,
+//! no second Y/n — while the bare `refresh` and `upgrade`'s TTL-driven fetch
+//! must not spring the clone on someone who just said "later".
 //!
 //! A decline or refusal still refreshes the official sync DBs, still records
 //! the fetch-TTL stamp (so a TTL-driven `upgrade` doesn't re-fetch within
@@ -61,9 +63,14 @@ pub enum RefreshReason {
     ExplicitSync,
     /// `aurox -Syy` — explicit forced re-clone (wipes the mirror first).
     ForceReclone,
-    /// Shell `refresh` — pre-consented: the shell's first-launch prompt (or
-    /// the startup hint) already spelled out the bootstrap cost, and typing
-    /// `refresh` after that IS the answer — no second Y/n.
+    /// Shell's explicit AUR sync — `refresh aur`, or a "yes" to the
+    /// first-launch question. Pre-consented: the launch prompt (or the
+    /// startup hint) already spelled out the bootstrap cost, and naming the
+    /// AUR after that IS the answer — no second Y/n.
+    ShellAurSync,
+    /// Shell's bare `refresh` — refreshes what the session already has and
+    /// must never spring a bootstrap on a user who chose "later" at launch:
+    /// skip the AUR half quietly and let the caller point at `refresh aur`.
     ShellRefresh,
     /// Shell `upgrade` — its TTL-driven fetch must never spring a bootstrap
     /// on a user who chose "later" at launch: skip the AUR half quietly and
@@ -98,11 +105,15 @@ pub enum SkipCause {
     Disabled,
     /// The user answered "n" to the bootstrap prompt.
     Declined,
-    /// The AUR was never synced and this trigger (`upgrade`) doesn't prompt —
-    /// the user's launch-time "later" stands until they say `refresh`.
+    /// The AUR was never synced and this trigger (bare `refresh`, `upgrade`)
+    /// doesn't prompt — the user's launch-time "later" stands until they say
+    /// `refresh aur`.
     NotSetUp,
     /// An implicit trigger needed a bootstrap but had no terminal to ask on.
     NonInteractive,
+    /// The command's [`RefreshScope`](super::RefreshScope) excluded the AUR
+    /// half (`refresh pacman`) — nothing to consent to, nothing to report.
+    NotRequested,
 }
 
 impl fmt::Display for SkipCause {
@@ -112,6 +123,7 @@ impl fmt::Display for SkipCause {
             Self::Declined => "declined",
             Self::NotSetUp => "AUR not set up",
             Self::NonInteractive => "non-interactive run",
+            Self::NotRequested => "not requested",
         })
     }
 }
@@ -195,8 +207,8 @@ const fn consent_mode(reason: RefreshReason, noconfirm: bool, stdin_is_tty: bool
         }
         _ if noconfirm => ConsentMode::AutoYes,
         RefreshReason::ExplicitSync | RefreshReason::ForceReclone => ConsentMode::Prompt,
-        RefreshReason::ShellRefresh => ConsentMode::AutoYes,
-        RefreshReason::ShellUpgrade => ConsentMode::Refuse,
+        RefreshReason::ShellAurSync => ConsentMode::AutoYes,
+        RefreshReason::ShellRefresh | RefreshReason::ShellUpgrade => ConsentMode::Refuse,
         RefreshReason::IndexResync => {
             if stdin_is_tty {
                 ConsentMode::Prompt
@@ -207,13 +219,14 @@ const fn consent_mode(reason: RefreshReason, noconfirm: bool, stdin_is_tty: bool
     }
 }
 
-/// What a [`ConsentMode::Refuse`] skip reports: `upgrade` skips because the
-/// AUR isn't set up yet; the implicit resync — and a refused install offer —
-/// because there was nobody to ask (the install path pre-gates on a TTY and
-/// falls back to its plain unknown-target error either way).
+/// What a [`ConsentMode::Refuse`] skip reports: the bare `refresh` and
+/// `upgrade` skip because the AUR isn't set up yet; the implicit resync — and
+/// a refused install offer — because there was nobody to ask (the install
+/// path pre-gates on a TTY and falls back to its plain unknown-target error
+/// either way).
 const fn refusal_cause(reason: RefreshReason) -> SkipCause {
     match reason {
-        RefreshReason::ShellUpgrade => SkipCause::NotSetUp,
+        RefreshReason::ShellRefresh | RefreshReason::ShellUpgrade => SkipCause::NotSetUp,
         _ => SkipCause::NonInteractive,
     }
 }
@@ -245,10 +258,10 @@ pub(super) fn plan(cfg: &Config, reason: RefreshReason) -> Result<AurAction> {
             action =
                 match consent_mode(reason, runopts::noconfirm(), std::io::stdin().is_terminal()) {
                     // The shell's launch prompt already spelled out the full
-                    // cost this session; `refresh` just gets a brief heads-up
-                    // that the long clone is starting.
+                    // cost this session; `refresh aur` just gets a brief
+                    // heads-up that the long clone is starting.
                     ConsentMode::AutoYes
-                        if reason == RefreshReason::ShellRefresh
+                        if reason == RefreshReason::ShellAurSync
                             && kind == BootstrapKind::FirstRun =>
                     {
                         ui::info("syncing the AUR — one-time ~2 GiB clone (~10 min)");
@@ -323,9 +336,10 @@ const fn question(kind: BootstrapKind) -> &'static str {
 mod tests {
     use super::*;
 
-    const ALL_REASONS: [RefreshReason; 6] = [
+    const ALL_REASONS: [RefreshReason; 7] = [
         RefreshReason::ExplicitSync,
         RefreshReason::ForceReclone,
+        RefreshReason::ShellAurSync,
         RefreshReason::ShellRefresh,
         RefreshReason::ShellUpgrade,
         RefreshReason::IndexResync,
@@ -387,24 +401,24 @@ mod tests {
         }
     }
 
-    /// The shell asked its own three-way question at launch: `refresh` after
-    /// that is pre-consented (no second Y/n), while `upgrade` must never
-    /// spring the clone on a user who answered "later".
+    /// The shell asked its own three-way question at launch: `refresh aur`
+    /// after that is pre-consented (no second Y/n), while the bare `refresh`
+    /// and `upgrade` must never spring the clone on a user who answered
+    /// "later".
     #[test]
-    fn shell_refresh_preconsented_and_upgrade_refuses() {
+    fn shell_aur_sync_preconsented_and_bare_refresh_and_upgrade_refuse() {
         assert_eq!(
-            consent_mode(RefreshReason::ShellRefresh, false, true),
+            consent_mode(RefreshReason::ShellAurSync, false, true),
             ConsentMode::AutoYes
         );
-        assert_eq!(
-            consent_mode(RefreshReason::ShellUpgrade, false, true),
-            ConsentMode::Refuse
-        );
-        assert_eq!(
-            refusal_cause(RefreshReason::ShellUpgrade),
-            SkipCause::NotSetUp,
-            "upgrade's skip must read as \"not set up\", not \"non-interactive\""
-        );
+        for reason in [RefreshReason::ShellRefresh, RefreshReason::ShellUpgrade] {
+            assert_eq!(consent_mode(reason, false, true), ConsentMode::Refuse);
+            assert_eq!(
+                refusal_cause(reason),
+                SkipCause::NotSetUp,
+                "{reason:?}'s skip must read as \"not set up\", not \"non-interactive\""
+            );
+        }
         assert_eq!(
             refusal_cause(RefreshReason::IndexResync),
             SkipCause::NonInteractive
@@ -449,6 +463,7 @@ mod tests {
     fn ready_mirror_fetches_unless_force_recloned() {
         for reason in [
             RefreshReason::ExplicitSync,
+            RefreshReason::ShellAurSync,
             RefreshReason::ShellRefresh,
             RefreshReason::ShellUpgrade,
             RefreshReason::IndexResync,
@@ -491,5 +506,6 @@ mod tests {
         assert_eq!(SkipCause::Declined.to_string(), "declined");
         assert_eq!(SkipCause::NotSetUp.to_string(), "AUR not set up");
         assert_eq!(SkipCause::NonInteractive.to_string(), "non-interactive run");
+        assert_eq!(SkipCause::NotRequested.to_string(), "not requested");
     }
 }

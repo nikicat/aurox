@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # The shell's first-launch three-way AUR question, end to end under a PTY:
-# Enter (= Later) persists nothing and `refresh` bootstraps without a second
-# question; `n` persists `aur = false` and the next launch neither asks nor
-# nags. Driven by the shell_bootstrap_{later,decline}_e2e examples.
+# Enter (= Later) persists nothing, a bare `refresh` stays pacman-only, and
+# `refresh aur` bootstraps without a second question; `n` persists
+# `aur = false` and the next launch neither asks nor nags. Driven by the
+# shell_bootstrap_{later,decline}_e2e examples.
 source /work/tests/container/lib.sh
 bootstrap; reset_state
 
@@ -20,7 +21,7 @@ run_driver() {
 }
 
 # Later: nothing persisted — no `aur` key in config — and the in-session
-# `refresh` bootstrapped the mirror.
+# `refresh aur` bootstrapped the mirror.
 run_driver shell_bootstrap_later_e2e SHELL_BOOTSTRAP_LATER_E2E_OK
 ! grep -q '^aur =' "$CONFIG_DIR/config.toml" \
     || { echo "'later' must not write config" >&2; cat "$CONFIG_DIR/config.toml" >&2; exit 1; }
