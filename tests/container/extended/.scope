@@ -28,44 +28,61 @@
 #    constraints are ever honored.)
 #
 # State / idempotency:
-#   - rebuild_after_artifact_deleted.sh  (cached .pkg.tar.zst removed →
-#       rebuild; the complement of smoke/43's cached-skip)
-#   - declined_install_keeps_artifacts.sh
-#   - sc_clears_worktrees.sh             (-Sc)
+#   (landed: 15_rebuild_after_artifact_deleted.sh — deleting the cached
+#    .pkg.tar.zst flips smoke/43's artifact-derived check the other way:
+#    the next -S reruns makepkg)
+#   (landed: 16_declined_install_keeps_artifacts.sh — "n" at the elevation
+#    gate keeps the built artifact; the retry hits "already built")
+#   (landed: 17_sc_clears_worktrees.sh — -Sc forwards to pacman, empties
+#    $STATE_DIR/pkgs, keeps installs; a later -S rebuilds cleanly)
 #   (graduated to smoke: rebuild_cached_skips → smoke/43)
 #
 # Refresh:
-#   - sy_incremental_fetch.sh            (delta only)
-#   - syy_force_reclone.sh               (accepted branch re-clones from
-#       scratch; the declined branch landed as smoke/64)
-#   - mirror_unreachable.sh              (move /srv/mock-aur away mid-test —
-#       the hard-fail half; the dead-socket timeout half landed as
-#       extended/01_fetch_idle_timeout)
+#   (landed: 18_sy_incremental_fetch.sh — no-change -Sy says "no ref
+#    updates"; after one branch bump the next -Sy fetches "1 ref(s)
+#    updated" and search serves the new version. Found + fixed a fixture
+#    bug: the mock AUR's bare-init HEAD dangled at refs/heads/master,
+#    which breaks gix's update-refs pass on any update-carrying fetch —
+#    setup-fixtures now points HEAD at the seed branch, matching GitHub's
+#    always-resolvable default branch)
+#   (landed: 19_syy_force_reclone.sh — the accepted branch: a canary file
+#    in the mirror dir vanishes (wipe + re-clone) and the index rebuilds;
+#    the declined branch is smoke/64)
+#   (landed: 20_mirror_unreachable.sh — mirror moved away: -Sy fails
+#    cleanly while -Ss serves the on-disk index and -S still builds from
+#    the local clone; the dead-socket timeout half is extended/01)
 #
 # UX / flags:
-#   - color_never_strips_ansi.sh
-#   - help_for_unknown_op.sh             (smoke/15 covers --help/-h only)
+#   (landed: 21_color_never_strips_ansi.sh — under script(1) PTYs:
+#    Auto-on-TTY colors the aur prefix (control; needs TERM set), then
+#    `color = "never"` emits zero escape bytes on the same TTY)
+#   (landed: 24_help_for_unknown_op.sh — an op nobody owns fails loudly
+#    with aurox's "unsupported aurox op" diagnostic, nonzero exit; known
+#    pacman ops keep passing through)
 #   (covered elsewhere: color_always_keeps_ansi → smoke/52 (`color =
 #    "always"` forces ANSI onto a pipe); noconfirm_skips_prompts → the whole
 #    suite runs TTY-less under --noconfirm — any prompt would hang a run —
 #    and smoke/51 pins the confirm gating)
 #
 # Pacman pass-through:
-#   - rns_removes_with_deps.sh
-#   - u_install_local_file.sh
+#   (landed: 22_rns_removes_with_deps.sh — -Rns forwards elevated and takes
+#    the orphaned dep with the target)
+#   (landed: 23_u_install_local_file.sh — -U of a staged foreign artifact
+#    forwards elevated and lands in the localdb)
 #   (obsolete: syu_calls_pacman_first — `-Su`/`-Syu` are plain passthrough
 #    now that the picker is gone; smoke/45 pins bare `aurox` → `-Syu`,
 #    smoke/66 pins the `-Su` elevation)
 #
 # Concurrency:
-#   - parallel_invocations_serialized.sh (two concurrent `-Sy`s: the dbpath
-#       flock in src/pacman/sync.rs must serialize them, with no "unable to
-#       lock database" leaking to either)
+#   (landed: 26_parallel_invocations_serialized.sh — two concurrent `-Sy`s
+#    with the rootless repo sync on: the dbpath RefreshLock serializes the
+#    critical section, no "unable to lock database" leaks, both exit 0,
+#    and the raced mirror/index state stays servable)
 #
 # Failure modes:
-#   - missing_dep_errors_with_hint.sh    (an AUR dep that resolves nowhere;
-#       smoke/10 exercises the unknown *target* error, the unknown dep path
-#       is untested)
+#   (landed: 25_missing_dep_errors_with_hint.sh — a dep that resolves
+#    nowhere (test-missing-dep) fails resolution naming the missing spec;
+#    smoke/10 pins the unknown *target* flavor)
 #   (covered elsewhere: makepkg_fails_stops_pipeline → superseded — failures
 #    *isolate* rather than stop: smoke/28 (stratum sibling survives) +
 #    smoke/29 (dependents skipped); corrupt_index_recoverable → load() maps
