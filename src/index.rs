@@ -121,7 +121,11 @@ pub fn load_or_resync(cfg: &Config, path: &Path) -> Result<IndexFile> {
                 )));
             }
             ui::info(&format!("AUR index {reason}; resyncing database"));
-            match mirror::cmd_refresh(cfg, mirror::RefreshReason::IndexResync)? {
+            match mirror::cmd_refresh(
+                cfg,
+                mirror::RefreshReason::IndexResync,
+                mirror::RefreshScope::Everything,
+            )? {
                 mirror::RefreshOutcome::Refreshed => load(path),
                 // The refresh left the mirror alone (AUR disabled, bootstrap
                 // declined, or no terminal to ask on), so the incompatible

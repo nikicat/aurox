@@ -15,7 +15,8 @@
 //! all-approved, then runs the partial `pacman -Syu` repo lane + the AUR
 //! build/install + `pacman -R` removals, with the cost-overlay change-set
 //! preview ([`upgrade`]). This replaced the old `upgrade_loop` driver +
-//! dialoguer picker. `refresh` lands in phase 5.
+//! dialoguer picker. `refresh [aur|pacman]` re-fetches the package data
+//! (both halves, or one) and reloads the session without touching the cart.
 //!
 //! The [`ShellEnv`]/[`State::dispatch`] split keeps command handling
 //! unit-testable with a scripted fake: the side-effecting I/O (classification,
@@ -138,13 +139,13 @@ pub trait ShellEnv {
     /// fresh data too), and return the current upgrade candidates (repo ∪ AUR)
     /// for `upgrade` to seed into the cart.
     fn upgrade(&mut self) -> Result<Vec<PkgUpgrade>>;
-    /// Re-fetch the mirror + index and reload the session (fresh data for
-    /// `search`/`info`/classification/completion) **without** seeding the cart —
-    /// `upgrade` is the stage-the-upgrades variant; `refresh` is just the
-    /// re-fetch. The outcome says whether the AUR half actually refreshed or
-    /// was skipped (bootstrap declined / AUR disabled), so the dispatch core
-    /// can word the result.
-    fn refresh(&mut self) -> Result<mirror::RefreshOutcome>;
+    /// Re-fetch the package data `scope` covers and reload the session (fresh
+    /// data for `search`/`info`/classification/completion) **without** seeding
+    /// the cart — `upgrade` is the stage-the-upgrades variant; `refresh` is
+    /// just the re-fetch. The outcome says whether the AUR half actually
+    /// refreshed or was skipped (never set up / AUR disabled / out of scope),
+    /// so the dispatch core can word the result.
+    fn refresh(&mut self, scope: mirror::RefreshScope) -> Result<mirror::RefreshOutcome>;
     /// Run a combined repo + AUR search; returns rows for the numbered list.
     fn search(&mut self, terms: &[SearchTerm]) -> Result<Vec<ListItem>>;
     /// Print `-Si`-style info for the already-resolved targets.
@@ -182,7 +183,8 @@ pub trait ShellEnv {
     /// `system prune`: delete the re-derivable caches (mirror, index, sync
     /// dbs, build trees) behind a y/N confirm. `Ok(None)` = user declined.
     /// Returns the bytes freed. The in-memory AUR data stays loaded — search
-    /// and info keep working from it until a `refresh` re-fetches everything.
+    /// and info keep working from it until a `refresh aur` re-fetches the
+    /// mirror + index.
     fn system_prune(&mut self) -> Result<Option<ByteSize>>;
 }
 
@@ -190,17 +192,40 @@ pub trait ShellEnv {
 /// reports for itself from inside [`mirror::cmd_refresh`] (refreshed / up to
 /// date / failed) and doesn't run at all when `check_repo_updates` is off,
 /// so any claim about it here would double-report at best and lie at worst.
-const fn refresh_message(outcome: mirror::RefreshOutcome) -> &'static str {
+/// `None` when there is nothing to say about the AUR half — `refresh pacman`
+/// scoped it out on purpose, so the repo half's own report is the whole story.
+const fn refresh_message(outcome: mirror::RefreshOutcome) -> Option<&'static str> {
     match outcome {
-        mirror::RefreshOutcome::Refreshed => "mirror + index refreshed",
-        mirror::RefreshOutcome::AurSkipped(
-            mirror::SkipCause::Declined
-            | mirror::SkipCause::NonInteractive
-            | mirror::SkipCause::NotSetUp,
-        ) => "AUR setup skipped — run `refresh` again when ready",
-        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::Disabled) => {
-            "AUR refresh skipped (aur = false in config.toml)"
+        mirror::RefreshOutcome::Refreshed => Some("mirror + index refreshed"),
+        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::NotSetUp) => {
+            Some("AUR not synced — `refresh aur` runs the one-time setup")
         }
+        mirror::RefreshOutcome::AurSkipped(
+            mirror::SkipCause::Declined | mirror::SkipCause::NonInteractive,
+        ) => Some("AUR setup skipped — run `refresh aur` when ready"),
+        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::Disabled) => {
+            Some("AUR refresh skipped (aur = false in config.toml)")
+        }
+        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::NotRequested) => None,
+    }
+}
+
+/// `refresh [aur|pacman]` — re-fetch what the scope covers and reload the
+/// session; the cart is left untouched (`upgrade` is the seed-the-cart
+/// variant). A free function like [`system_dispatch`]: it reads no session
+/// state, only the env seam. `None` is an unrecognized scope word — usage
+/// line, never a silently-widened full refresh.
+fn refresh_dispatch<E: ShellEnv>(scope: Option<mirror::RefreshScope>, env: &mut E) {
+    match scope {
+        None => env.print("usage: refresh [aur|pacman] — see `help refresh`"),
+        Some(scope) => match env.refresh(scope) {
+            Ok(outcome) => {
+                if let Some(msg) = refresh_message(outcome) {
+                    env.print(msg);
+                }
+            }
+            Err(e) => env.print(&format!("refresh: {e}")),
+        },
     }
 }
 
@@ -216,7 +241,7 @@ fn system_dispatch<E: ShellEnv>(action: Option<SystemAction>, env: &mut E) {
         }
         Some(SystemAction::Prune) => match env.system_prune() {
             Ok(Some(freed)) => env.print(&format!(
-                "caches pruned — {freed} freed; `refresh` re-fetches the mirror + index"
+                "caches pruned — {freed} freed; `refresh aur` re-fetches the mirror + index"
             )),
             Ok(None) => env.print("prune cancelled — nothing removed"),
             Err(e) => env.print(&format!("prune: {e}")),
@@ -344,13 +369,8 @@ impl State {
                 }
                 Flow::Continue
             }
-            Command::Refresh => {
-                // Re-fetch + reload the session; the cart is left untouched
-                // (`upgrade` is the seed-the-cart variant).
-                match env.refresh() {
-                    Ok(outcome) => env.print(refresh_message(outcome)),
-                    Err(e) => env.print(&format!("refresh: {e}")),
-                }
+            Command::Refresh(scope) => {
+                refresh_dispatch(*scope, env);
                 Flow::Continue
             }
             Command::System(action) => {
@@ -514,7 +534,7 @@ impl State {
         // the AUR" — one nudge for the whole batch. Pacman-only mode is a
         // standing choice and stays quiet.
         if any_unknown && env.aur_state() == index::AurState::NotSetUp {
-            env.print("unknown names may be in the AUR — `refresh` syncs it (one-time ~2 GiB)");
+            env.print("unknown names may be in the AUR — `refresh aur` syncs it (one-time ~2 GiB)");
         }
         // Keep the resulting transaction on screen so the user needn't `show`
         // after every stage (post-5c UX). Skipped when nothing actually changed
@@ -1105,24 +1125,24 @@ fn select_from_candidates(
 /// the commands themselves.
 const HELP_TEXT: &str = "\
 commands:
-  search <terms…>     find packages (repo + AUR)
-  info <sel…>         show package details (sel = name | number | range | glob)
-  add <sel…>          stage packages to install
-  drop <sel…>         unstage packages from the cart (alias: discard)
-  keep <sel…>         keep only these staged packages, drop the rest
-  remove <sel…>       stage packages to uninstall
-  upgrade [pkg…]      upgrade installed packages (repo + AUR)
-  review [sel…]       view a PKGBUILD/diff and approve it (no sel = review all)
-  approve <sel…>      approve staged AUR packages without a diff (try `approve *`)
-  show                preview the staged transaction
-  apply               build + install the staged transaction
-  undo                revert the last cart change
-  redo                reapply the last undone change
-  clear               empty the cart
-  refresh             re-fetch the AUR mirror + index
-  system show|prune   disk usage of aurox's state / delete the caches
-  help [topic]        this list, or `help <command>` for detail on one
-  quit                leave the shell (also: Ctrl-D)
+  search <terms…>       find packages (repo + AUR)
+  info <sel…>           show package details (sel = name | number | range | glob)
+  add <sel…>            stage packages to install
+  drop <sel…>           unstage packages from the cart (alias: discard)
+  keep <sel…>           keep only these staged packages, drop the rest
+  remove <sel…>         stage packages to uninstall
+  upgrade [pkg…]        upgrade installed packages (repo + AUR)
+  review [sel…]         view a PKGBUILD/diff and approve it (no sel = review all)
+  approve <sel…>        approve staged AUR packages without a diff (try `approve *`)
+  show                  preview the staged transaction
+  apply                 build + install the staged transaction
+  undo                  revert the last cart change
+  redo                  reapply the last undone change
+  clear                 empty the cart
+  refresh [aur|pacman]  re-fetch the AUR mirror and/or the official repo DBs
+  system show|prune     disk usage of aurox's state / delete the caches
+  help [topic]          this list, or `help <command>` for detail on one
+  quit                  leave the shell (also: Ctrl-D)
 selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
            `aur`/`core`/… (whole repo — e.g. `drop aur`, `add extra`)
 numbers index the list you last brought up — search results (`search`) or the
@@ -1218,12 +1238,15 @@ const TOPICS: &[(Verb, &str)] = &[
     (Verb::Clear, "clear\n  Empty the cart."),
     (
         Verb::Refresh,
-        "refresh\n  \
-         Re-fetch the AUR mirror and reload the index — fresh data for\n  \
+        "refresh [aur|pacman]\n  \
+         Re-fetch package data and reload the session — fresh data for\n  \
          search / info / upgrade / completion. Leaves the cart untouched.\n  \
-         If the AUR was never synced (you answered \"later\" at launch),\n  \
-         this runs the one-time ~2 GiB clone — typing it is the consent,\n  \
-         so there is no second question.",
+         No argument refreshes everything: the AUR mirror + index and the\n  \
+         official repo databases; `refresh aur` / `refresh pacman` narrow\n  \
+         it to one half. If the AUR was never synced (you answered\n  \
+         \"later\" at launch), a bare `refresh` stays pacman-only —\n  \
+         `refresh aur` runs the one-time ~2 GiB clone; typing it is the\n  \
+         consent, so there is no second question.",
     ),
     (
         Verb::System,
@@ -1231,9 +1254,10 @@ const TOPICS: &[(Verb, &str)] = &[
          Maintenance for aurox's on-disk state. `system show` prints each\n  \
          category's disk usage (AUR mirror, package index, repo db snapshot,\n  \
          build worktrees, logs, …). `system prune` deletes the re-derivable\n  \
-         caches after a y/N confirm — the next `refresh` / build recreates\n  \
-         them (pruning the AUR mirror means the next sync re-asks before the\n  \
-         full re-clone); build metrics and shell history are never touched.",
+         caches after a y/N confirm — the next `refresh aur` / build\n  \
+         recreates them (pruning the AUR mirror means the next AUR sync\n  \
+         runs the full ~2 GiB re-clone); build metrics and shell history\n  \
+         are never touched.",
     ),
     (
         Verb::Help,
@@ -1272,7 +1296,7 @@ fn startup_lines(aur: index::AurState) -> Vec<&'static str> {
         }
         index::AurState::NotSetUp => vec![
             "aurox shell — type `help` for commands, `quit` to leave",
-            "pacman-only this session — `refresh` syncs the AUR anytime",
+            "pacman-only this session — `refresh aur` syncs the AUR anytime",
         ],
         index::AurState::Disabled => {
             vec!["aurox shell (pacman-only) — type `help` for commands, `quit` to leave"]
@@ -1294,14 +1318,18 @@ fn first_launch_setup(mut config: ConfigHandle) -> Result<ConfigHandle> {
     }
     match ui::aur_setup_prompt().map_err(|e| Error::other(format!("setup prompt: {e}")))? {
         ui::AurSetupChoice::SyncNow => {
-            // Consent was just given — ShellRefresh runs the bootstrap
+            // Consent was just given — ShellAurSync runs the bootstrap
             // without a second question.
-            mirror::cmd_refresh(config.cfg(), mirror::RefreshReason::ShellRefresh)?;
+            mirror::cmd_refresh(
+                config.cfg(),
+                mirror::RefreshReason::ShellAurSync,
+                mirror::RefreshScope::Everything,
+            )?;
         }
         ui::AurSetupChoice::PacmanOnly => {
             config.update(|c| c.aur = Some(false))?;
             ui::note(&format!(
-                "pacman-only mode saved (`aur = false` in {}) — delete the line and `refresh` to opt back in",
+                "pacman-only mode saved (`aur = false` in {}) — delete the line and `refresh aur` to opt back in",
                 config.path().display()
             ));
         }
@@ -1561,18 +1589,18 @@ impl ShellEnv for RealEnv<'_> {
             | mirror::SkipCause::NonInteractive,
         )) = outcome
         {
-            ui::note("AUR not synced — upgrades are repo-only; `refresh` syncs it");
+            ui::note("AUR not synced — upgrades are repo-only; `refresh aur` syncs it");
         }
         // With empty AUR data the recompute naturally yields repo upgrades
         // only — no separate fallback path.
         self.aur_data.recompute_remaining(self.devel)
     }
 
-    fn refresh(&mut self) -> Result<mirror::RefreshOutcome> {
+    fn refresh(&mut self, scope: mirror::RefreshScope) -> Result<mirror::RefreshOutcome> {
         // `refresh` is the always-fetch command — it ignores the TTL, so the
         // reload always carries an outcome.
         Ok(self
-            .reload(upgrade::FetchPolicy::Always)?
+            .reload(upgrade::FetchPolicy::Refresh(scope))?
             .unwrap_or(mirror::RefreshOutcome::Refreshed))
     }
 
@@ -1618,13 +1646,13 @@ impl ShellEnv for RealEnv<'_> {
 
     fn show_info(&mut self, targets: &[PkgTarget]) -> Result<()> {
         // The shared repo-then-AUR lookup (`-Si` runs the same one); only the
-        // miss wording is the shell's — its sync verb is `refresh`.
+        // miss wording is the shell's — its sync verb is `refresh aur`.
         let missing = InfoLookup::open(&self.aur_data)?.print_all(targets);
         if !missing.is_empty() {
             ui::warn(&info::missing_warning(
                 self.aur_state,
                 &missing,
-                "`refresh`",
+                "`refresh aur`",
             ));
         }
         Ok(())
@@ -1888,8 +1916,8 @@ impl ShellEnv for RealEnv<'_> {
         }
         // The in-memory AUR data (mmap of the now-deleted index) stays valid
         // and loaded on purpose: search/info keep answering from it, and the
-        // next `refresh`/`upgrade` re-bootstraps the mirror + index from
-        // scratch.
+        // next `refresh aur` re-bootstraps the mirror + index from scratch
+        // (the bare `refresh`/`upgrade` never spring the re-clone).
         system::prune().map(Some)
     }
 }
@@ -2389,6 +2417,8 @@ mod tests {
         prune_calls: CallCount,
         /// What `refresh` reports; `None` ⇒ a full `Refreshed`.
         refresh_outcome: Option<mirror::RefreshOutcome>,
+        /// The scopes `refresh` was called with, in order.
+        refresh_scopes: Vec<mirror::RefreshScope>,
         /// What `aur_state` reports; `None` ⇒ `Ready` (no nudges).
         aur_state: Option<index::AurState>,
     }
@@ -2401,8 +2431,9 @@ mod tests {
             self.upgrades.bump();
             Ok(self.upgrade_candidates.clone())
         }
-        fn refresh(&mut self) -> Result<mirror::RefreshOutcome> {
+        fn refresh(&mut self, scope: mirror::RefreshScope) -> Result<mirror::RefreshOutcome> {
             self.refreshes.bump();
+            self.refresh_scopes.push(scope);
             Ok(self
                 .refresh_outcome
                 .unwrap_or(mirror::RefreshOutcome::Refreshed))
@@ -2631,6 +2662,11 @@ mod tests {
         state.dispatch(&command::parse("refresh"), &mut env);
         assert_eq!(env.refreshes.count(), 1, "refresh re-fetches once");
         assert_eq!(
+            env.refresh_scopes,
+            vec![mirror::RefreshScope::Everything],
+            "a bare refresh covers everything"
+        );
+        assert_eq!(
             env.upgrades.count(),
             0,
             "refresh is not an upgrade recompute"
@@ -2641,6 +2677,71 @@ mod tests {
             "refresh leaves the cart intact"
         );
         assert!(env.lines.contains("refreshed"));
+    }
+
+    /// `refresh aur` / `refresh pacman` narrow the scope; the words come from
+    /// the one table the parser and completer share.
+    #[test]
+    fn refresh_scope_words_reach_the_env() {
+        let mut env = FakeEnv::default();
+        let mut state = State::default();
+        state.dispatch(&command::parse("refresh aur"), &mut env);
+        state.dispatch(&command::parse("refresh pacman"), &mut env);
+        assert_eq!(
+            env.refresh_scopes,
+            vec![mirror::RefreshScope::Aur, mirror::RefreshScope::Pacman]
+        );
+    }
+
+    /// A typo'd scope prints usage and never reaches the env — it must not
+    /// silently widen into a full refresh.
+    #[test]
+    fn refresh_with_unknown_scope_prints_usage_and_does_nothing() {
+        let mut env = FakeEnv::default();
+        State::default().dispatch(&command::parse("refresh pacmna"), &mut env);
+        assert_eq!(env.refreshes.count(), 0);
+        assert!(
+            env.lines
+                .any(|l| l.starts_with("usage: refresh [aur|pacman]")),
+            "{:?}",
+            env.lines
+        );
+    }
+
+    /// `refresh pacman` scoped the AUR half out on purpose: the repo half
+    /// reports for itself inside `cmd_refresh`, so the dispatch core adds no
+    /// line of its own (an "AUR skipped" note would be noise).
+    #[test]
+    fn refresh_pacman_scope_says_nothing_about_the_aur() {
+        let mut env = FakeEnv {
+            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
+                mirror::SkipCause::NotRequested,
+            )),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("refresh pacman"), &mut env);
+        assert_eq!(env.refreshes.count(), 1);
+        assert!(env.lines.is_empty(), "{:?}", env.lines);
+    }
+
+    /// A bare `refresh` in a never-synced session stays pacman-only and
+    /// points at `refresh aur` — it must never read as a full refresh.
+    #[test]
+    fn refresh_not_set_up_words_the_skip_with_the_aur_hint() {
+        let mut env = FakeEnv {
+            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
+                mirror::SkipCause::NotSetUp,
+            )),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("refresh"), &mut env);
+        assert!(
+            env.lines
+                .any(|l| l.contains("AUR not synced") && l.contains("`refresh aur`")),
+            "{:?}",
+            env.lines
+        );
+        assert!(!env.lines.contains("mirror + index refreshed"));
     }
 
     /// A declined bootstrap is worded as a skip (with the retry hint), not as
@@ -2691,7 +2792,7 @@ mod tests {
             2,
             "one reminder line, not a re-pitch: {later:?}"
         );
-        assert_contains!(later[1], "`refresh`");
+        assert_contains!(later[1], "`refresh aur`");
 
         let pacman_only = startup_lines(index::AurState::Disabled);
         assert_eq!(
@@ -2763,7 +2864,7 @@ mod tests {
         assert_eq!(env.prune_calls.count(), 1);
         assert!(
             env.lines
-                .any(|l| l.contains("3.00 MiB freed") && l.contains("`refresh`")),
+                .any(|l| l.contains("3.00 MiB freed") && l.contains("`refresh aur`")),
             "{:?}",
             env.lines
         );

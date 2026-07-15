@@ -31,6 +31,24 @@ pub mod worktree;
 use consent::AurAction;
 pub use consent::{RefreshOutcome, RefreshReason, SkipCause};
 
+/// Which halves of the package data one [`cmd_refresh`] covers.
+///
+/// The CLI (`-Sy`) and the shell's bare `refresh` cover everything; the
+/// shell's `refresh aur` / `refresh pacman` narrow it to one half. Scope is
+/// orthogonal to [`RefreshReason`], which picks how a needed AUR bootstrap
+/// obtains consent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshScope {
+    /// AUR mirror + index, and (unless [`Config::check_repo_updates`] is off)
+    /// the official-repo sync DBs.
+    Everything,
+    /// Only the AUR mirror + index.
+    Aur,
+    /// Only the official-repo sync DBs; the AUR mirror is left alone —
+    /// consent included, so this can never prompt for a bootstrap.
+    Pacman,
+}
+
 /// Build the `http::Options` payload gix's curl transport downcasts in its
 /// `configure()` hook. Sets `lowSpeedLimit=1`, `lowSpeedTime=idle_timeout_secs`
 /// so the connection aborts after `idle_timeout_secs` of <1 byte/s — i.e., true
@@ -94,14 +112,16 @@ impl MirrorRepo {
     }
 }
 
-/// Refresh aurox's databases: the AUR mirror — subject to the bootstrap
-/// consent gate — and, unless [`Config::check_repo_updates`] is off, the
-/// official-repo sync DBs in parallel.
+/// Refresh aurox's databases, per `scope`: the AUR mirror — subject to the
+/// bootstrap consent gate — and, unless [`Config::check_repo_updates`] is
+/// off, the official-repo sync DBs in parallel.
 ///
 /// Both halves draw into one shared [`MultiProgress`] so the AUR fetch rows and
 /// the per-repo db-download rows line up in a single display. The repo sync is
 /// best-effort: a failure there is reported as a warning and never fails the
-/// AUR refresh (whose result is what this returns).
+/// AUR refresh (whose result is what this returns). A scope that excludes the
+/// AUR half returns [`SkipCause::NotRequested`] without ever consulting the
+/// consent gate.
 ///
 /// `reason` says who asked (see [`RefreshReason`]): [`RefreshReason::ForceReclone`]
 /// (`aurox -Syy`) blows away the existing bare clone and re-bootstraps from
@@ -109,13 +129,27 @@ impl MirrorRepo {
 /// obtained — the ~2 GiB clone never starts without a yes. A decline (or
 /// `aur = false` in config.toml) still refreshes the sync DBs and returns
 /// [`RefreshOutcome::AurSkipped`] so callers can hint at what was skipped.
-pub fn cmd_refresh(cfg: &Config, reason: RefreshReason) -> Result<RefreshOutcome> {
+pub fn cmd_refresh(
+    cfg: &Config,
+    reason: RefreshReason,
+    scope: RefreshScope,
+) -> Result<RefreshOutcome> {
     // Resolve consent before the progress display exists: dialoguer and
     // indicatif both draw on the terminal, and a prompt under live progress
     // rows gets clobbered by redraws.
-    let action = consent::plan(cfg, reason)?;
+    let action = if scope == RefreshScope::Pacman {
+        AurAction::Skip(SkipCause::NotRequested)
+    } else {
+        consent::plan(cfg, reason)?
+    };
+    let run_repo = cfg.check_repo_updates && scope != RefreshScope::Aur;
+    if scope == RefreshScope::Pacman && !run_repo {
+        // The explicitly-repo-scoped refresh would otherwise do nothing,
+        // silently — say why.
+        ui::note("official-repo refresh is disabled (check_repo_updates = false in config.toml)");
+    }
     let mp = MultiProgress::new();
-    let aur = if cfg.check_repo_updates {
+    let aur = if run_repo {
         // Scoped thread: the official-repo db sync (libalpm download) overlaps
         // the network-bound AUR fetch. It borrows `cfg`/`mp` for the scope and
         // draws its own rows into the shared display.
@@ -133,8 +167,10 @@ pub fn cmd_refresh(cfg: &Config, reason: RefreshReason) -> Result<RefreshOutcome
     mp.clear().ok();
     // A successful refresh stamps the TTL that the shell's `upgrade` honours.
     // Deliberately stamped on `AurSkipped` too: a declined bootstrap must not
-    // re-prompt on every TTL-driven `upgrade` within the window.
-    if aur.is_ok() {
+    // re-prompt on every TTL-driven `upgrade` within the window. A repo-only
+    // scope never stamps — the mirror wasn't touched, and claiming otherwise
+    // would make `upgrade` skip a fetch the user still needs.
+    if scope != RefreshScope::Pacman && aur.is_ok() {
         record_fetch_stamp();
     }
     aur

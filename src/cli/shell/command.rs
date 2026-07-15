@@ -5,6 +5,7 @@
 //! argument-bearing verbs keep their args as raw strings; later phases parse
 //! them into `Selector`s (numbers / ranges / names / globs).
 
+use crate::mirror::RefreshScope;
 use crate::names::SearchTerm;
 
 /// The canonical command verbs.
@@ -116,6 +117,28 @@ impl SystemAction {
     }
 }
 
+/// The typeable `refresh` scope words, in help order.
+///
+/// One site for the vocabulary, shared by [`parse`] and the completer so
+/// they can't drift. Bare `refresh` means [`RefreshScope::Everything`],
+/// which deliberately has no word: you get it by typing nothing.
+pub const REFRESH_SCOPES: &[(RefreshScope, &str)] =
+    &[(RefreshScope::Aur, "aur"), (RefreshScope::Pacman, "pacman")];
+
+/// Resolve `refresh`'s optional argument: no word is the full refresh, a
+/// scope word narrows it, and anything else is `None` (dispatch prints the
+/// usage line — a typo'd scope must not silently widen to a full refresh).
+fn parse_refresh_scope(arg: Option<&String>) -> Option<RefreshScope> {
+    let Some(word) = arg else {
+        return Some(RefreshScope::Everything);
+    };
+    let word = word.to_ascii_lowercase();
+    REFRESH_SCOPES
+        .iter()
+        .find(|(_, w)| *w == word)
+        .map(|(scope, _)| *scope)
+}
+
 /// One parsed shell command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -148,8 +171,10 @@ pub enum Command {
     Redo,
     /// `clear` — empty the cart.
     Clear,
-    /// `refresh` — re-fetch the AUR mirror + index.
-    Refresh,
+    /// `refresh [aur|pacman]` — re-fetch the AUR mirror + index and/or the
+    /// official sync DBs. `None` when the argument is unrecognized (dispatch
+    /// prints the usage line, like `system`).
+    Refresh(Option<RefreshScope>),
     /// `system <show|prune>` — state disk usage / cache pruning. `None` when
     /// the action is missing or unrecognized (dispatch prints the usage line).
     System(Option<SystemAction>),
@@ -185,7 +210,7 @@ impl Command {
             Self::Undo => Some(Verb::Undo),
             Self::Redo => Some(Verb::Redo),
             Self::Clear => Some(Verb::Clear),
-            Self::Refresh => Some(Verb::Refresh),
+            Self::Refresh(_) => Some(Verb::Refresh),
             Self::System(_) => Some(Verb::System),
             Self::Help(_) => Some(Verb::Help),
             Self::Quit => Some(Verb::Quit),
@@ -223,7 +248,7 @@ pub fn parse(line: &str) -> Command {
         "undo" => Command::Undo,
         "redo" => Command::Redo,
         "clear" => Command::Clear,
-        "refresh" => Command::Refresh,
+        "refresh" => Command::Refresh(parse_refresh_scope(args.first())),
         "system" => Command::System(
             args.first()
                 .and_then(|a| SystemAction::parse(&a.to_ascii_lowercase())),
@@ -348,8 +373,32 @@ mod tests {
 
     #[test]
     fn arg_only_verbs_ignore_extra_tokens() {
-        // `show`/`apply`/`clear`/`refresh` take no args in phase 1.
+        // `show`/`apply`/`clear` take no args in phase 1.
         assert_eq!(parse("show now please"), Command::Show);
         assert_eq!(parse("apply"), Command::Apply);
+    }
+
+    #[test]
+    fn refresh_scopes_parse_and_are_case_insensitive() {
+        assert_eq!(
+            parse("refresh"),
+            Command::Refresh(Some(RefreshScope::Everything))
+        );
+        for (scope, word) in REFRESH_SCOPES {
+            let line = format!("refresh {word}");
+            assert_eq!(parse(&line), Command::Refresh(Some(*scope)), "`{line}`");
+        }
+        assert_eq!(
+            parse("REFRESH Pacman"),
+            Command::Refresh(Some(RefreshScope::Pacman))
+        );
+    }
+
+    #[test]
+    fn refresh_with_unknown_scope_parses_to_none() {
+        // Dispatch turns the `None` into a usage line; a typo'd scope must
+        // never silently widen into a full refresh.
+        assert_eq!(parse("refresh everything-please"), Command::Refresh(None));
+        assert_eq!(parse("refresh repos"), Command::Refresh(None));
     }
 }

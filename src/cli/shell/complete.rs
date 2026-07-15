@@ -9,6 +9,7 @@
 //! | arg of `search` / `add` / `info` / `remove` | the full name universe |
 //! | arg of `drop` / `keep` / `review` / `approve` / `upgrade` | names currently in the cart |
 //! | arg of `help` | command verbs |
+//! | arg of `system` / `refresh` | their sub-words (`show`/`prune`, `aur`/`pacman`) |
 //! | a numeric token, or an arg of `show`/`apply`/… | nothing |
 //!
 //! The active verb is recovered by parsing the line *before* the word under the
@@ -44,11 +45,13 @@ enum ArgKind {
     Verbs,
     /// `system <action>` — the maintenance sub-verbs.
     SystemActions,
+    /// `refresh [aur|pacman]` — the optional scope words.
+    RefreshScopes,
     /// `search`/`add`/`info`/`remove` — the full name universe.
     Universe,
     /// `drop`/`keep`/`review`/`approve`/`upgrade` — names currently in the cart.
     Cart,
-    /// `show`/`apply`/`clear`/`refresh`/`quit` — nothing to complete.
+    /// `show`/`apply`/`clear`/`quit` — nothing to complete.
     None,
 }
 
@@ -59,19 +62,12 @@ const fn arg_kind(verb: Option<Verb>) -> ArgKind {
     match verb {
         Some(Verb::Help) => ArgKind::Verbs,
         Some(Verb::System) => ArgKind::SystemActions,
+        Some(Verb::Refresh) => ArgKind::RefreshScopes,
         Some(Verb::Search | Verb::Add | Verb::Info | Verb::Remove) => ArgKind::Universe,
         Some(Verb::Drop | Verb::Keep | Verb::Review | Verb::Approve | Verb::Upgrade) => {
             ArgKind::Cart
         }
-        Some(
-            Verb::Show
-            | Verb::Apply
-            | Verb::Undo
-            | Verb::Redo
-            | Verb::Clear
-            | Verb::Refresh
-            | Verb::Quit,
-        )
+        Some(Verb::Show | Verb::Apply | Verb::Undo | Verb::Redo | Verb::Clear | Verb::Quit)
         | None => ArgKind::None,
     }
 }
@@ -84,6 +80,11 @@ fn verb_names() -> impl Iterator<Item = &'static str> {
 /// The `system` action names, in help order.
 fn action_names() -> impl Iterator<Item = &'static str> {
     SystemAction::ALL.iter().map(|a| a.name())
+}
+
+/// The `refresh` scope words, in help order — the same table the parser reads.
+fn refresh_scope_names() -> impl Iterator<Item = &'static str> {
+    command::REFRESH_SCOPES.iter().map(|(_, w)| *w)
 }
 
 /// The shell's rustyline helper.
@@ -139,6 +140,7 @@ impl ShellHelper {
             match arg_kind(command::parse(before).verb()) {
                 ArgKind::Verbs => word_candidates(verb_names(), word),
                 ArgKind::SystemActions => word_candidates(action_names(), word),
+                ArgKind::RefreshScopes => word_candidates(refresh_scope_names(), word),
                 ArgKind::Universe => self.name_candidates(word),
                 ArgKind::Cart => prefix_pairs(self.cart.iter().map(PkgTarget::as_str), word),
                 ArgKind::None => Vec::new(),
@@ -201,6 +203,7 @@ impl ShellHelper {
         match arg_kind(command::parse(before).verb()) {
             ArgKind::Verbs => word_hint(verb_names(), word),
             ArgKind::SystemActions => word_hint(action_names(), word),
+            ArgKind::RefreshScopes => word_hint(refresh_scope_names(), word),
             ArgKind::Universe => self.universe_hint(word),
             ArgKind::Cart => cart_hint(&self.cart, word),
             ArgKind::None => None,
@@ -424,6 +427,23 @@ mod tests {
         let h = helper(&[], &[]);
         assert_eq!(hint(&h, "system pr").as_deref(), Some("une "));
         assert_eq!(hint(&h, "system s").as_deref(), Some("how "));
+    }
+
+    #[test]
+    fn refresh_arg_completes_the_scopes() {
+        let h = helper(&["aurutils", "pacman-contrib"], &[]);
+        // The `refresh` argument position offers the scope words — never the
+        // universe names that share the prefix.
+        assert_eq!(complete(&h, "refresh "), vec!["aur ", "pacman "]);
+        assert_eq!(complete(&h, "refresh a"), vec!["aur "]);
+        assert_eq!(complete(&h, "refresh pac"), vec!["pacman "]);
+    }
+
+    #[test]
+    fn refresh_arg_hints_the_first_matching_scope() {
+        let h = helper(&[], &[]);
+        assert_eq!(hint(&h, "refresh a").as_deref(), Some("ur "));
+        assert_eq!(hint(&h, "refresh p").as_deref(), Some("acman "));
     }
 
     #[test]
