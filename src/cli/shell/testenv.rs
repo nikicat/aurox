@@ -219,3 +219,14 @@ pub(super) fn up(repo: &str, name: &str) -> PkgUpgrade {
         new_ver: Version::from("2-1"),
     }
 }
+
+/// The staged install specs, in cart order — the assertion view of the cart
+/// the repo-filter tests compare against.
+pub(super) fn cart_specs(state: &State) -> Vec<PkgTarget> {
+    state
+        .cart
+        .items()
+        .iter()
+        .map(|i| PkgTarget::new(i.spec()))
+        .collect()
+}
