@@ -1,4 +1,4 @@
-//! Lookup lookup tables built after loading the primary index.
+//! Lookup tables built after loading the primary index.
 
 use crate::index::schema::{IndexEntry, IndexFile};
 use crate::names::{PkgBase, PkgName, VirtualName};
