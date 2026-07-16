@@ -85,11 +85,14 @@ src/
 ├── config/
 │   └── defaults.rs     built-in defaults when a field/file is absent
 │
-├── ui.rs            colored CLI output (banners, package lists, bars, prompts)
+├── ui.rs            colored CLI output (banners, bars, prompts)
 ├── ui/
-│   ├── tables.rs       aligned install/upgrade tables (shared rendering primitives)
-│   ├── change_set.rs   pre-apply change-set preview for the upgrade loop
-│   ├── cost.rs         per-row cost cells shared by tables.rs + change_set.rs
+│   ├── grid.rs         the one column-layout engine (Grid/Col/Cell/Width) + Paint/Table
+│   ├── cells.rs        shared semantic cells: the verdiff VersionColumn, repo cell
+│   ├── tables.rs       flag-path tables (-S install plan, -Qu/-Su upgrades) over the grid
+│   ├── search_table.rs the ranked search list (shell + pipe listing) over the grid
+│   ├── change_set.rs   the shell's unified show/transaction table over the grid
+│   ├── cost.rs         per-row size/build-time cells shared by the tables
 │   ├── progress.rs     indicatif bars / spinners
 │   ├── gix_progress.rs adapter wiring gix's progress traits onto our bars
 │   └── prompts.rs      y/n + per-pkgname pickers

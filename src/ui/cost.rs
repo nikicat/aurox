@@ -13,7 +13,7 @@
 //! - [`TimeEst`] — the build-time cell, plus [`built_tag`], the trailing
 //!   `built` marker.
 
-use super::tables::{Paint, Width};
+use super::grid::{Cell, Paint, Width};
 use super::{human_bytes, human_duration};
 use crate::names::{PkgBase, PkgName, RepoName, RepoRank};
 use crate::pacman::alpm_db::PacmanIndex;
@@ -215,7 +215,7 @@ impl RowCost {
 
     /// The cell text as it renders for this row. The `to_string` round-trip
     /// respects `console`'s color gate, so piped output stays plain.
-    fn cell(self, paint: Paint) -> String {
+    fn rendered(self, paint: Paint) -> String {
         if self.built && matches!(self.time, TimeEst::Unknown) {
             return String::new();
         }
@@ -230,11 +230,14 @@ impl RowCost {
         }
     }
 
-    /// Visible width of [`Self::cell`] — measured from the plain form so ANSI
-    /// escapes in a dimmed cell don't skew column padding. Callers max this
-    /// across rows to size the build-time column.
-    pub(super) fn visible_width(self) -> Width {
-        Width::of(&self.cell(Paint::Plain))
+    /// The build-time cell for the grid: the rendered (possibly dimmed) text
+    /// carrying its plain visible width, so a dimmed estimate's ANSI escapes
+    /// never skew column padding.
+    pub(super) fn cell(self, paint: Paint) -> Cell {
+        Cell::sized(
+            self.rendered(paint),
+            Width::of(&self.rendered(Paint::Plain)),
+        )
     }
 }
 
@@ -271,14 +274,6 @@ fn built_tag(paint: Paint) -> String {
     } else {
         "built".to_owned()
     }
-}
-
-/// A right-justified build-time column padded to `width` visible columns. The
-/// pad is measured from the plain cell so a dimmed estimate's ANSI escapes
-/// don't skew it. AUR rows fill the column; repo rows ([`RowCost::none`])
-/// collapse to blanks that keep it aligned.
-pub(super) fn time_col(cost: RowCost, width: Width, paint: Paint) -> String {
-    format!("{}{}", width.gap(cost.visible_width()), cost.cell(paint))
 }
 
 /// The trailing `  built` tag (with its leading gap) for an already-built row,
@@ -339,21 +334,21 @@ mod tests {
     }
 
     /// A built `Unknown` row renders an empty time cell (the `built` tag carries
-    /// the signal), while a built `Estimate` keeps its number; `visible_width`
-    /// tracks the cell actually rendered, not the canonical `render()`.
+    /// the signal), while a built `Estimate` keeps its number; the cell's width
+    /// tracks the text actually rendered, not the canonical `render()`.
     #[test]
     fn built_unknown_cell_is_empty() {
         let built_unknown = RowCost::aur(TimeEst::Unknown, false, true);
-        assert_eq!(built_unknown.cell(Paint::Plain), "");
-        assert_eq!(built_unknown.visible_width().cells(), 0);
+        assert_eq!(built_unknown.rendered(Paint::Plain), "");
+        assert_eq!(built_unknown.cell(Paint::Plain).width(), Width::ZERO);
         // Not built: the Unknown row still shows `?`.
         let unknown = RowCost::aur(TimeEst::Unknown, false, false);
-        assert_eq!(unknown.cell(Paint::Plain), "?");
-        assert_eq!(unknown.visible_width().cells(), 1);
+        assert_eq!(unknown.rendered(Paint::Plain), "?");
+        assert_eq!(unknown.cell(Paint::Plain).width(), Width::of("?"));
         // A built estimate keeps its plain text (dimming only adds ANSI, which
         // the plain-paint path skips).
         assert_eq!(
-            RowCost::aur(TimeEst::Estimate(dur(60)), false, true).cell(Paint::Plain),
+            RowCost::aur(TimeEst::Estimate(dur(60)), false, true).rendered(Paint::Plain),
             "1m 0s"
         );
     }

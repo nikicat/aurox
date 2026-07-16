@@ -222,22 +222,36 @@ impl ShellEnv for RealEnv<'_> {
         // Resolve installed state + versions against the live pacman DBs and
         // render the aligned table (installed rows emphasized, with an `old → new`
         // diff + build-time estimate). The build-time overlay is filled only for
-        // the installed AUR rows. The match-site annotation is part of the
-        // rendered line, so it survives in the remembered `ListItem.label`.
+        // the installed AUR rows. The match-site annotation renders in the
+        // printed table; the remembered list carries only selector data.
         let pac = upgrade::system_pac()?;
         let search_rows: Vec<ui::SearchRow> = ranked.iter().map(|r| r.search_row(&pac)).collect();
         let metrics = self.search_metrics(&search_rows);
-        let table = ui::search_table(&search_rows, &pac, &metrics);
-        Ok(table
-            .lines()
+        let table = ui::search_table(
+            &search_rows,
+            &pac,
+            &metrics,
+            ui::RowNumbers::Numbered,
+            ui::Paint::detect(),
+        );
+        let items = ranked
             .iter()
-            .zip(&ranked)
-            .map(|(line, r)| ListItem {
+            .map(|r| ListItem {
                 target: r.row.picked(),
-                label: line.clone(),
                 repo: Some(RepoName::from(r.row.repo_name())),
             })
-            .collect())
+            .collect();
+        // `ranked` borrows the session's AUR data, so it must be done before
+        // printing takes `&mut self`.
+        drop(ranked);
+        // The table is best-first (row 1 = best), each row carrying its `№`
+        // cell. Print it worst-first so the strongest matches land at the
+        // bottom, next to the prompt the shell scrolls to — and the low,
+        // easy-to-type numbers are the good ones. The numbers still key the
+        // best-first list returned below, so `add 1` is always the top match
+        // regardless of print direction.
+        self.print_table(&table.reversed());
+        Ok(items)
     }
 
     fn show_info(&mut self, targets: &[PkgTarget]) -> Result<()> {
@@ -348,9 +362,7 @@ impl ShellEnv for RealEnv<'_> {
         // landing behind `show`).
         match self.transaction_view(cart) {
             Ok(table) => {
-                for line in table.lines() {
-                    self.print(line);
-                }
+                self.print_table(&table);
                 // The sysupgrade preflight verdict for the staged repo lane —
                 // "upgrading X breaks Y" plus the shell-native way out —
                 // belongs on this same screen, ahead of any `apply`.
@@ -362,9 +374,7 @@ impl ShellEnv for RealEnv<'_> {
             }
             Err(e) => {
                 debug!(error = %e, "show preview resolve failed; flat fallback");
-                for line in flat_cart_lines(cart, &e) {
-                    self.print(&line);
-                }
+                self.print_table(&flat_cart_lines(cart, &e));
             }
         }
     }
@@ -916,22 +926,34 @@ fn aur_age(it: &CartItem, aur_data: &AurIndexData, now: SystemTime) -> Option<Du
 /// The graceful-degradation rendering for `show` when the resolve behind the
 /// unified table fails (unknown target, mirror gap): a note plus the flat staged
 /// rows, so `show` still tells the user what's in the cart instead of erroring.
-fn flat_cart_lines(cart: &Cart, err: &Error) -> Vec<String> {
-    let mut out = vec![format!(
+/// Laid out by [`ui::Grid`] with the version transition as the row tail; the
+/// removal rows keep their own literal shape beneath.
+fn flat_cart_lines(cart: &Cart, err: &Error) -> ui::Table {
+    let mut out = ui::Table::new();
+    out.push(format!(
         "  (couldn't resolve the full change set: {err} — showing staged items)"
-    )];
+    ));
+    let mut grid = ui::Grid::new(vec![
+        ui::Col::right().min(ui::Width::of("999")), // № — the {:>3} it replaces
+        ui::Col::left(),                            // repo label
+        ui::Col::left(),                            // approval
+        ui::Col::left(),                            // spec
+    ]);
     for (i, it) in cart.items().iter().enumerate() {
         let ver = it
             .version_transition()
             .map_or_else(String::new, |t| format!("  {t}"));
-        out.push(format!(
-            "{:>3}  {}  {}  {}{ver}",
-            i + 1,
-            it.repo_label(),
-            it.approval.label(),
-            it.spec(),
-        ));
+        grid.push(
+            ui::GridRow::new(vec![
+                ui::Cell::plain((i + 1).to_string()),
+                ui::Cell::plain(it.repo_label().to_string()),
+                ui::Cell::plain(it.approval.label()),
+                ui::Cell::plain(it.spec()),
+            ])
+            .tail(ver),
+        );
     }
+    out.append(grid.render());
     for name in cart.removals() {
         out.push(format!("     remove  {name}"));
     }
@@ -943,6 +965,32 @@ mod tests {
     use super::*;
 
     use crate::cli::shell::testenv::up;
+
+    /// The flat fallback keeps `show` alive when the resolve fails: the note
+    /// names the error, every staged item renders as an aligned numbered row,
+    /// and removals list beneath. Nothing else pins this shape — it only
+    /// renders on a resolve failure.
+    #[test]
+    fn flat_cart_lines_note_rows_and_removals() {
+        use super::super::cart::{AurApproval, Source};
+        use crate::{assert_contains, assert_regex};
+
+        let mut cart = Cart::default();
+        cart.add(CartItem::new(
+            PkgTarget::new("some-aur-thing"),
+            Source::Aur,
+            None,
+            AurApproval::Review,
+        ));
+        cart.stage_remove(PkgName::from("old-cruft"));
+
+        let table = flat_cart_lines(&cart, &Error::other("mirror gap"));
+        let lines = table.lines();
+        assert_contains!(lines[0], "couldn't resolve the full change set");
+        assert_contains!(lines[0], "mirror gap");
+        assert_regex!(lines[1], r"^  1  aur\s+review\s+some-aur-thing$");
+        assert_eq!(lines[2], "     remove  old-cruft");
+    }
 
     /// A `review` target that names a pkgname/provides becomes the hint —
     /// it says which installed package the user means. One naming the

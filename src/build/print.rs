@@ -26,25 +26,36 @@ pub(super) fn plan(plan: &Plan, idx: &IndexFile, pac: &PacmanIndex) {
         ui::info("plan: nothing to do");
         return;
     }
+    let paint = ui::Paint::detect();
     if !plan.direct_repo.is_empty() {
         ui::install_table(
             "Repo packages (explicit)",
             &rows_for_repo(&plan.direct_repo, pac),
-        );
+            paint,
+        )
+        .eprint_framed();
     }
     if !repo_deps.is_empty() {
-        ui::install_table("Repo dependencies", &rows_for_repo(&repo_deps, pac));
+        ui::install_table("Repo dependencies", &rows_for_repo(&repo_deps, pac), paint)
+            .eprint_framed();
     }
     if !plan.aur_strata.is_empty() {
         let total = plan.aur_strata.len();
         if total == 1 {
-            ui::install_table("AUR build order", &rows_for_aur(&plan.aur_strata[0], idx));
+            ui::install_table(
+                "AUR build order",
+                &rows_for_aur(&plan.aur_strata[0], idx),
+                paint,
+            )
+            .eprint_framed();
         } else {
             for (i, stratum) in plan.aur_strata.iter().enumerate() {
                 ui::install_table(
                     &format!("AUR build stratum {}/{total}", i + 1),
                     &rows_for_aur(stratum, idx),
-                );
+                    paint,
+                )
+                .eprint_framed();
             }
         }
     }

@@ -223,7 +223,13 @@ pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
     // (empty metrics — no store lookups), so installed AUR rows show `~?` there.
     let pac = PacmanIndex::build(&alpm_db::open()?);
     let search_rows: Vec<ui::SearchRow> = rows.iter().map(|r| r.search_row(&pac)).collect();
-    let table = ui::search_table(&search_rows, &pac, &ui::PreviewMetrics::empty());
+    let table = ui::search_table(
+        &search_rows,
+        &pac,
+        &ui::PreviewMetrics::empty(),
+        ui::RowNumbers::Plain,
+        ui::Paint::detect(),
+    );
     for line in table.lines() {
         println!("{line}");
     }

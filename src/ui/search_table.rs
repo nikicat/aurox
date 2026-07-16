@@ -4,11 +4,11 @@
 //!
 //! Columns: `repo · name · version · size · build-time · description`, plus a
 //! dimmed trailing [`MatchNote`] annotation when the match site is invisible
-//! on the row (a hidden split member, a `provides=` name, a group). It shares
-//! the change-set/upgrade table's cell machinery so the same bugs are fixed
-//! once — [`version_block`](super::tables::version_block) for the `old → new`
-//! verdiff, [`size_of`](super::cost::size_of)/[`cost_of`](super::cost::cost_of)
-//! for the size + build-time cells, and [`Width`]/[`Cell`] for the padding.
+//! on the row (a hidden split member, a `provides=` name, a group). It
+//! renders through the shared [`Grid`] engine and cell vocabulary so the same
+//! bugs are fixed once — [`VersionColumn`] for the `old → new` verdiff,
+//! [`size_of`](super::cost::size_of)/[`cost_of`](super::cost::cost_of) for the
+//! size + build-time cells.
 //!
 //! Installed packages are set apart by emphasis, not a column (the user's call):
 //! an installed row keeps full color with a **bold** name and, when an upgrade
@@ -16,13 +16,15 @@
 //! not-installed row is dimmed so it recedes. Under `--color=never` the emphasis
 //! collapses (there's nothing to dim), but the version/size columns still align.
 //!
-//! The row *number* and best-last print order are the shell's job
-//! ([`crate::cli::shell`]); this renders bodies only, one line per row, in the
-//! order given.
+//! The shell's selector `№` column is part of the row ([`RowNumbers`]), so the
+//! number a user types (`add 3`) and the number printed can't drift; the
+//! best-last print order stays the shell's job ([`crate::cli::shell`]) — this
+//! renders one line per row, in the order given.
 
-use super::cost::{PreviewMetrics, RowCost, SizeEst, cost_of, size_of, time_col};
-use super::tables::{Cell, Paint, Table, Width, version_block};
-use super::{color_on, dim, repo as repo_style};
+use super::cells::VersionColumn;
+use super::cost::{PreviewMetrics, RowCost, SizeEst, cost_of, size_of};
+use super::grid::{Cell, Col, Grid, GridRow, Paint, Table, Width};
+use super::{dim, repo as repo_style};
 use crate::names::{GroupName, PkgName, RepoName, VirtualName};
 use crate::pacman::alpm_db::PacmanIndex;
 use crate::version::Version;
@@ -109,14 +111,34 @@ impl SearchRow {
     }
 }
 
+/// Whether the table carries the shell's selector row numbers as its first
+/// column.
+///
+/// The shell renders [`Self::Numbered`] — each row's `№` is the index the
+/// selector verbs (`add 3`) resolve against, so the number is part of the row,
+/// not a second layout pass bolted on top. The non-interactive pipe listing
+/// renders [`Self::Plain`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowNumbers {
+    Numbered,
+    Plain,
+}
+
 /// Render the ranked rows into an aligned table — one body line per row.
 ///
-/// Rows come out in the given order, with no number and no header (the shell
-/// adds those). `pac` backs the size cells; `metrics` backs the build-time cells
-/// (empty for the non-interactive listing → installed AUR rows show `~?`).
-pub fn search_table(rows: &[SearchRow], pac: &PacmanIndex, metrics: &PreviewMetrics) -> Table {
-    let paint = Paint::from(color_on());
-
+/// Rows come out in the given order with no header (the shell adds one);
+/// `numbers` says whether the shell's `№` selector column leads each row.
+/// `pac` backs the size cells; `metrics` backs the build-time cells
+/// (empty for the non-interactive listing → installed AUR rows show `?`).
+/// `paint` is passed in (callers use [`Paint::detect`]) rather than re-read
+/// from the environment, so tests pin the plain rendering.
+pub fn search_table(
+    rows: &[SearchRow],
+    pac: &PacmanIndex,
+    metrics: &PreviewMetrics,
+    numbers: RowNumbers,
+    paint: Paint,
+) -> Table {
     // Per-row size + cost, computed once (also feeds the column widths).
     let sizes: Vec<SizeEst> = rows
         .iter()
@@ -127,7 +149,7 @@ pub fn search_table(rows: &[SearchRow], pac: &PacmanIndex, metrics: &PreviewMetr
         .map(|r| {
             // Build-time is a property we only show for installed packages (the
             // store only has data for things we've built); a not-installed row
-            // gets an empty cell rather than a noisy `~?`.
+            // gets an empty cell rather than a noisy `?`.
             if r.install.installed() {
                 cost_of(&r.repo, &r.name, metrics)
             } else {
@@ -135,44 +157,47 @@ pub fn search_table(rows: &[SearchRow], pac: &PacmanIndex, metrics: &PreviewMetr
             }
         })
         .collect();
+    let versions =
+        VersionColumn::measure(rows.iter().map(|r| (r.upgrade_from(), r.new_ver.as_ref())));
 
-    let repo_w = Width::widest(rows.iter().map(|r| Width::of(r.repo.as_str())));
-    let name_w = Width::widest(rows.iter().map(|r| Width::of(r.name.as_str())));
-    let old_w = Width::widest(
-        rows.iter()
-            .filter_map(SearchRow::upgrade_from)
-            .map(|v| Width::of(v.as_str())),
-    );
-    let new_w = Width::widest(
-        rows.iter()
-            .filter_map(|r| r.new_ver.as_ref())
-            .map(|v| Width::of(v.as_str())),
-    );
-    let size_w = Width::widest(sizes.iter().map(|s| Width::of(&s.render())));
-    let time_w = Width::widest(costs.iter().map(|c| c.visible_width()));
-
-    let mut out = Table::new();
-    for ((row, size), cost) in rows.iter().zip(&sizes).zip(&costs) {
-        let em = &row.install;
-        let repo_cell = repo_cell(&row.repo, em, paint).pad_to(repo_w);
-        let name_cell = name_cell(&row.name, em, paint).pad_to(name_w);
-        let ver = version_cell(
-            em,
-            row.upgrade_from(),
-            row.new_ver.as_ref(),
-            old_w,
-            new_w,
-            paint,
-        );
-        let size_cell = size_cell(*size, em, paint).pad_to(size_w);
-        out.push(format!(
-            "{repo_cell}  {name_cell}  {ver}  {size_cell}  {time}{desc}{note}",
-            time = time_col(*cost, time_w, paint),
-            desc = desc_cell(row.desc.as_deref(), paint),
-            note = note_cell(row.note.as_ref(), paint),
-        ));
+    let mut cols = vec![
+        Col::left(),  // repo
+        Col::left(),  // name
+        Col::left(),  // version block
+        Col::left(),  // size (historically left-aligned here; change_set right-aligns)
+        Col::right(), // build time
+    ];
+    if numbers == RowNumbers::Numbered {
+        // Floored at three digits — the `{:>3}` the shell's second-pass
+        // numbering used to apply — and growing gracefully past row 999.
+        cols.insert(0, Col::right().min(Width::of("999")));
     }
-    out
+    let mut grid = Grid::new(cols);
+    for (i, ((row, size), cost)) in rows.iter().zip(&sizes).zip(&costs).enumerate() {
+        let em = &row.install;
+        let mut cells = vec![
+            repo_cell(&row.repo, em, paint),
+            name_cell(&row.name, em, paint),
+            version_cell(
+                &versions,
+                em,
+                row.upgrade_from(),
+                row.new_ver.as_ref(),
+                paint,
+            ),
+            size_cell(*size, em, paint),
+            cost.cell(paint),
+        ];
+        if numbers == RowNumbers::Numbered {
+            cells.insert(0, Cell::plain((i + 1).to_string()));
+        }
+        grid.push(GridRow::new(cells).tail(format!(
+            "{}{}",
+            desc_cell(row.desc.as_deref(), paint),
+            note_cell(row.note.as_ref(), paint),
+        )));
+    }
+    grid.render()
 }
 
 /// Render one hit in pacman's `-Ss` layout.
@@ -255,8 +280,7 @@ fn name_cell(name: &PkgName, em: &InstallState, paint: Paint) -> Cell {
     })
 }
 
-/// The size cell (padded to the size column at the call site) — plain when
-/// installed, dimmed when not.
+/// The size cell — plain when installed, dimmed when not.
 fn size_cell(size: SizeEst, em: &InstallState, paint: Paint) -> Cell {
     Cell::paint(&size.render(), paint, |s| {
         if em.installed() {
@@ -267,36 +291,37 @@ fn size_cell(size: SizeEst, em: &InstallState, paint: Paint) -> Cell {
     })
 }
 
-/// The version cell, padded to the full `old_w + → + new_w` block width so the
+/// The version cell, always the full `old_w + → + new_w` block width so the
 /// size column lines up across every row:
 /// - **upgrade** (`old` present): `old → new` verdiff via the shared
-///   [`version_block`], so the coloring matches the upgrade table exactly.
+///   [`VersionColumn`], so the coloring matches the transaction table exactly.
 /// - **fresh / up-to-date** (`old` is `None`): the available version alone in
 ///   the `new` slot — default color when installed, dimmed when not (green is
 ///   reserved for the transaction table's "will install").
 fn version_cell(
+    versions: &VersionColumn,
     em: &InstallState,
     old: Option<&Version>,
     new: Option<&Version>,
-    old_w: Width,
-    new_w: Width,
     paint: Paint,
-) -> String {
+) -> Cell {
     if old.is_some() {
-        return version_block(old, new, old_w, new_w, paint);
+        return versions.cell(old, new, paint);
     }
-    let full = old_w + paint.arrow() + new_w;
     let Some(v) = new else {
-        return full.blanks();
+        return Cell::plain("");
     };
-    let lead = (old_w + paint.arrow()).blanks();
-    let pad = new_w.gap(Width::of(v.as_str()));
+    // The blank old slot + arrow gap keeps fresh rows aligned with upgrades.
+    let lead = (versions.old_w + paint.arrow()).blanks();
     let shown = if paint.colored() && !em.installed() {
         dim(v.as_str()).to_string()
     } else {
         v.as_str().to_owned()
     };
-    format!("{lead}{shown}{pad}")
+    Cell::sized(
+        format!("{lead}{shown}"),
+        versions.old_w + paint.arrow() + Width::of(v.as_str()),
+    )
 }
 
 /// The trailing, unaligned description cell — dimmed, with a leading gap; empty
@@ -348,7 +373,6 @@ mod tests {
     /// cell reaches the table, and descriptions ride along as the trailing column.
     #[test]
     fn plain_table_shows_diff_only_for_upgrades() {
-        super::super::set_color(super::super::ColorMode::Never);
         let mut pac = PacmanIndex::default();
         pac.sync_download_size.insert("clang".into(), 1024);
         pac.installed_size.insert("claude-code".into(), 2048);
@@ -373,7 +397,13 @@ mod tests {
                 Some(Version::from("18.1.0-1")),
             ),
         ];
-        let table = search_table(&rows, &pac, &PreviewMetrics::empty());
+        let table = search_table(
+            &rows,
+            &pac,
+            &PreviewMetrics::empty(),
+            RowNumbers::Plain,
+            Paint::Plain,
+        );
         let lines = table.lines();
         assert_eq!(lines.len(), 3);
 
@@ -406,11 +436,48 @@ mod tests {
         assert!(lines[1].contains("claude description"));
     }
 
+    /// `Numbered` leads each row with its 1-based selector index, right-aligned
+    /// in a column floored at three digits — byte-identical to the `{:>3}  `
+    /// prefix the shell used to bolt on in a second pass.
+    #[test]
+    fn numbered_rows_carry_the_selector_index() {
+        let rows = vec![
+            row(
+                RepoName::from("aur"),
+                PkgName::from("first"),
+                InstallState::NotInstalled,
+                Some(Version::from("1-1")),
+            ),
+            row(
+                RepoName::from("aur"),
+                PkgName::from("second"),
+                InstallState::NotInstalled,
+                Some(Version::from("2-1")),
+            ),
+        ];
+        let table = search_table(
+            &rows,
+            &PacmanIndex::default(),
+            &PreviewMetrics::empty(),
+            RowNumbers::Numbered,
+            Paint::Plain,
+        );
+        assert!(
+            table.lines()[0].starts_with("  1  aur"),
+            "row 1: {:?}",
+            table.lines()[0]
+        );
+        assert!(
+            table.lines()[1].starts_with("  2  aur"),
+            "row 2: {:?}",
+            table.lines()[1]
+        );
+    }
+
     /// A not-installed row shows no build-time cell even when the metrics store
     /// has a figure for that name (build time is an installed-package property).
     #[test]
     fn not_installed_row_omits_build_time() {
-        super::super::set_color(super::super::ColorMode::Never);
         let mut metrics = PreviewMetrics::empty();
         metrics.root_build_secs.insert(PkgName::from("claude"), 200);
         let rows = vec![row(
@@ -419,7 +486,13 @@ mod tests {
             InstallState::NotInstalled,
             Some(Version::from("1.5.0-1")),
         )];
-        let table = search_table(&rows, &PacmanIndex::default(), &metrics);
+        let table = search_table(
+            &rows,
+            &PacmanIndex::default(),
+            &metrics,
+            RowNumbers::Plain,
+            Paint::Plain,
+        );
         assert!(
             !table.lines()[0].contains("3m"),
             "not-installed row must not show a build estimate: {:?}",
@@ -431,7 +504,6 @@ mod tests {
     /// the description — one wording per variant — and only when present.
     #[test]
     fn note_renders_after_desc_and_only_when_present() {
-        super::super::set_color(super::super::ColorMode::Never);
         let mut provides = row(
             RepoName::from("aur"),
             PkgName::from("linux-zz"),
@@ -465,7 +537,13 @@ mod tests {
         );
 
         let rows = vec![provides, via, group, plain];
-        let table = search_table(&rows, &PacmanIndex::default(), &PreviewMetrics::empty());
+        let table = search_table(
+            &rows,
+            &PacmanIndex::default(),
+            &PreviewMetrics::empty(),
+            RowNumbers::Plain,
+            Paint::Plain,
+        );
         let lines = table.lines();
         assert!(
             lines[0].ends_with("linux-zz description  [provides VIRTUALBOX-GUEST-MODULES]"),
@@ -583,7 +661,6 @@ mod tests {
     /// An installed AUR row with a recorded build time shows the estimate.
     #[test]
     fn installed_aur_row_shows_build_time() {
-        super::super::set_color(super::super::ColorMode::Never);
         let mut metrics = PreviewMetrics::empty();
         metrics.root_build_secs.insert(PkgName::from("claude"), 200);
         let rows = vec![row(
@@ -592,7 +669,13 @@ mod tests {
             InstallState::Installed(Version::from("1.5.0-1")),
             Some(Version::from("1.5.0-1")),
         )];
-        let table = search_table(&rows, &PacmanIndex::default(), &metrics);
+        let table = search_table(
+            &rows,
+            &PacmanIndex::default(),
+            &metrics,
+            RowNumbers::Plain,
+            Paint::Plain,
+        );
         assert!(
             table.lines()[0].contains("3m 20s"),
             "installed AUR row shows its build estimate: {:?}",

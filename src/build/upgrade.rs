@@ -47,7 +47,7 @@ impl DevelPolicy {
 /// preview before `-Syu` runs.
 #[instrument]
 pub fn cmd_query_upgrades(cfg: &Config, devel: DevelPolicy) -> Result<u8> {
-    ui::upgrade_table(&collect_upgrade_plan(cfg, devel)?);
+    ui::upgrade_table(&collect_upgrade_plan(cfg, devel)?, ui::Paint::detect()).eprint_framed();
     Ok(0)
 }
 
