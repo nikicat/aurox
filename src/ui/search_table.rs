@@ -26,29 +26,23 @@ use crate::pacman::alpm_db::PacmanIndex;
 use crate::version::Version;
 use console::style;
 
-/// Whether a searched package is installed locally.
+/// Whether a searched package is installed locally — and at which version.
 ///
 /// The domain state behind a row's emphasis (installed rows pop, not-installed
-/// rows recede) and whether the build-time cell is shown — a named two-state
-/// instead of a bare `bool`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// rows recede), the build-time cell, the table's `old → new` verdiff
+/// ([`SearchRow::upgrade_from`]), and the `-Ss` `[installed: X]` marker. The
+/// local version travels *inside* the installed variant instead of a sibling
+/// field a constructor could leave out of sync.
+#[derive(Debug, Clone, PartialEq)]
 pub enum InstallState {
-    Installed,
+    /// Installed at this local version (the pacman localdb's answer).
+    Installed(Version),
     NotInstalled,
 }
 
 impl InstallState {
-    /// Lift a `pac.is_installed(name)` answer into the domain state.
-    pub const fn from_installed(installed: bool) -> Self {
-        if installed {
-            Self::Installed
-        } else {
-            Self::NotInstalled
-        }
-    }
-
-    pub const fn installed(self) -> bool {
-        matches!(self, Self::Installed)
+    pub const fn installed(&self) -> bool {
+        matches!(self, Self::Installed(_))
     }
 }
 
@@ -58,18 +52,27 @@ impl InstallState {
 pub struct SearchRow {
     pub repo: RepoName,
     pub name: PkgName,
-    /// Whether the package is installed — drives the emphasis and whether the
-    /// build-time cell is shown.
+    /// Installed state, local version included — drives the emphasis, the
+    /// build-time cell, and the version diff/marker.
     pub install: InstallState,
-    /// The installed version, set **only** when it's an upgrade (installed <
-    /// available) so the renderer draws `old → new`; `None` for a fresh or
-    /// up-to-date row.
-    pub old_ver: Option<Version>,
     /// The available version (repo/AUR); `None` only when it couldn't be looked
     /// up (the version cell then renders blank but aligned).
     pub new_ver: Option<Version>,
     /// The one-line package description, shown dimmed as the trailing column.
     pub desc: Option<String>,
+}
+
+impl SearchRow {
+    /// The installed version when it's behind the available one — the state
+    /// behind the table's `old → new` verdiff. A same-version or *newer*
+    /// install (e.g. a VCS build ahead of the index) draws no arrow.
+    pub fn upgrade_from(&self) -> Option<&Version> {
+        let InstallState::Installed(iv) = &self.install else {
+            return None;
+        };
+        let nv = self.new_ver.as_ref()?;
+        iv.is_outdated(nv.as_ver()).then_some(iv)
+    }
 }
 
 /// Render the ranked rows into an aligned table — one body line per row.
@@ -103,7 +106,7 @@ pub fn search_table(rows: &[SearchRow], pac: &PacmanIndex, metrics: &PreviewMetr
     let name_w = Width::widest(rows.iter().map(|r| Width::of(r.name.as_str())));
     let old_w = Width::widest(
         rows.iter()
-            .filter_map(|r| r.old_ver.as_ref())
+            .filter_map(SearchRow::upgrade_from)
             .map(|v| Width::of(v.as_str())),
     );
     let new_w = Width::widest(
@@ -116,12 +119,12 @@ pub fn search_table(rows: &[SearchRow], pac: &PacmanIndex, metrics: &PreviewMetr
 
     let mut out = Table::new();
     for ((row, size), cost) in rows.iter().zip(&sizes).zip(&costs) {
-        let em = row.install;
+        let em = &row.install;
         let repo_cell = repo_cell(&row.repo, em, paint).pad_to(repo_w);
         let name_cell = name_cell(&row.name, em, paint).pad_to(name_w);
         let ver = version_cell(
             em,
-            row.old_ver.as_ref(),
+            row.upgrade_from(),
             row.new_ver.as_ref(),
             old_w,
             new_w,
@@ -137,9 +140,11 @@ pub fn search_table(rows: &[SearchRow], pac: &PacmanIndex, metrics: &PreviewMetr
     out
 }
 
-/// Render one hit in pacman's `-Ss` layout: the `repo/name version` headline
-/// (` [installed]` appended pacman-style) and the indented description line,
-/// omitted when the source has none.
+/// Render one hit in pacman's `-Ss` layout.
+///
+/// The `repo/name version` headline (the ` [installed]` / ` [installed: X]`
+/// marker appended pacman-style) and the indented description line, omitted
+/// when the source has none.
 ///
 /// Colored paint follows pacman's own `-Ss` palette — bold name, bold-green
 /// version, bold-cyan `[installed]`, plain description — except the repo,
@@ -160,11 +165,7 @@ fn headline(row: &SearchRow, paint: Paint) -> String {
     let repo = row.repo.as_str();
     let name = row.name.as_str();
     let ver = row.new_ver.as_ref().map_or("", |v| v.as_str());
-    let marker = match (row.install, paint.colored()) {
-        (InstallState::NotInstalled, _) => String::new(),
-        (InstallState::Installed, false) => " [installed]".to_owned(),
-        (InstallState::Installed, true) => format!(" {}", style("[installed]").bold().cyan()),
-    };
+    let marker = marker(row, paint);
     if paint.colored() {
         format!(
             "{}/{} {}{marker}",
@@ -177,8 +178,28 @@ fn headline(row: &SearchRow, paint: Paint) -> String {
     }
 }
 
+/// Pacman's install marker, leading space included: ` [installed]`, or
+/// ` [installed: X]` when the local version X differs from the listed one —
+/// *any* difference, a newer local build included, exactly as `pacman -Ss`
+/// decides it. Empty for a not-installed row.
+fn marker(row: &SearchRow, paint: Paint) -> String {
+    let InstallState::Installed(iv) = &row.install else {
+        return String::new();
+    };
+    let text = if row.new_ver.as_ref().is_some_and(|nv| nv != iv) {
+        format!("[installed: {iv}]")
+    } else {
+        "[installed]".to_owned()
+    };
+    if paint.colored() {
+        format!(" {}", style(text).bold().cyan())
+    } else {
+        format!(" {text}")
+    }
+}
+
 /// The repo cell — repo-colored when installed, dimmed (receding) when not.
-fn repo_cell(repo: &RepoName, em: InstallState, paint: Paint) -> Cell {
+fn repo_cell(repo: &RepoName, em: &InstallState, paint: Paint) -> Cell {
     Cell::paint(repo.as_str(), paint, |s| {
         if em.installed() {
             repo_style(s).to_string()
@@ -189,7 +210,7 @@ fn repo_cell(repo: &RepoName, em: InstallState, paint: Paint) -> Cell {
 }
 
 /// The name cell — **bold** when installed (it pops), dimmed when not.
-fn name_cell(name: &PkgName, em: InstallState, paint: Paint) -> Cell {
+fn name_cell(name: &PkgName, em: &InstallState, paint: Paint) -> Cell {
     Cell::paint(name.as_str(), paint, |s| {
         if em.installed() {
             style(s).bold().to_string()
@@ -201,7 +222,7 @@ fn name_cell(name: &PkgName, em: InstallState, paint: Paint) -> Cell {
 
 /// The size cell (padded to the size column at the call site) — plain when
 /// installed, dimmed when not.
-fn size_cell(size: SizeEst, em: InstallState, paint: Paint) -> Cell {
+fn size_cell(size: SizeEst, em: &InstallState, paint: Paint) -> Cell {
     Cell::paint(&size.render(), paint, |s| {
         if em.installed() {
             s.to_owned()
@@ -219,7 +240,7 @@ fn size_cell(size: SizeEst, em: InstallState, paint: Paint) -> Cell {
 ///   the `new` slot — default color when installed, dimmed when not (green is
 ///   reserved for the transaction table's "will install").
 fn version_cell(
-    em: InstallState,
+    em: &InstallState,
     old: Option<&Version>,
     new: Option<&Version>,
     old_w: Width,
@@ -264,7 +285,6 @@ mod tests {
         repo: RepoName,
         name: PkgName,
         install: InstallState,
-        old: Option<Version>,
         new: Option<Version>,
     ) -> SearchRow {
         let desc = Some(format!("{} description", name.as_str()));
@@ -272,7 +292,6 @@ mod tests {
             repo,
             name,
             install,
-            old_ver: old,
             new_ver: new,
             desc,
         }
@@ -292,22 +311,19 @@ mod tests {
             row(
                 RepoName::from("aur"),
                 PkgName::from("claude-code"),
-                InstallState::Installed,
-                Some(Version::from("2.0.1-1")),
+                InstallState::Installed(Version::from("2.0.1-1")),
                 Some(Version::from("2.1.0-1")),
             ),
             row(
                 RepoName::from("aur"),
                 PkgName::from("claude"),
                 InstallState::NotInstalled,
-                None,
                 Some(Version::from("1.5.0-1")),
             ),
             row(
                 RepoName::from("extra"),
                 PkgName::from("clang"),
-                InstallState::Installed,
-                None,
+                InstallState::Installed(Version::from("18.1.0-1")),
                 Some(Version::from("18.1.0-1")),
             ),
         ];
@@ -355,7 +371,6 @@ mod tests {
             RepoName::from("aur"),
             PkgName::from("claude"),
             InstallState::NotInstalled,
-            None,
             Some(Version::from("1.5.0-1")),
         )];
         let table = search_table(&rows, &PacmanIndex::default(), &metrics);
@@ -379,8 +394,7 @@ mod tests {
         let r = SearchRow {
             repo: RepoName::from("extra"),
             name: PkgName::from("qemu-desktop"),
-            install: InstallState::Installed,
-            old_ver: None,
+            install: InstallState::Installed(Version::from("11.0.2-3")),
             new_ver: Some(Version::from("11.0.2-3")),
             desc: Some("A QEMU setup for desktop environments".into()),
         };
@@ -401,6 +415,38 @@ mod tests {
         );
     }
 
+    /// An installed row whose local version differs from the listed one carries
+    /// pacman's `[installed: X]` marker — shown for *any* difference, a newer
+    /// local build included — and the colored form strips to the same bytes.
+    #[test]
+    fn search_result_marks_version_drift() {
+        console::set_colors_enabled(true);
+        let mut r = SearchRow {
+            repo: RepoName::from("extra"),
+            name: PkgName::from("qemu-desktop"),
+            install: InstallState::Installed(Version::from("11.0.1-2")),
+            new_ver: Some(Version::from("11.0.2-3")),
+            desc: None,
+        };
+        let plain = search_result(&r, Paint::Plain);
+        assert_eq!(
+            plain.lines()[0],
+            "extra/qemu-desktop 11.0.2-3 [installed: 11.0.1-2]"
+        );
+        let colored = search_result(&r, Paint::Colored);
+        assert_eq!(
+            console::strip_ansi_codes(&colored.lines()[0]),
+            plain.lines()[0]
+        );
+
+        // Newer-than-listed (a VCS build ahead of the index) still drifts.
+        r.install = InstallState::Installed(Version::from("11.0.3-1"));
+        assert_eq!(
+            search_result(&r, Paint::Plain).lines()[0],
+            "extra/qemu-desktop 11.0.2-3 [installed: 11.0.3-1]"
+        );
+    }
+
     /// A not-installed row has no marker and renders one headline line when the
     /// source has no description — in both paints.
     #[test]
@@ -410,7 +456,6 @@ mod tests {
             repo: RepoName::from("aur"),
             name: PkgName::from("qemu-rutabaga"),
             install: InstallState::NotInstalled,
-            old_ver: None,
             new_ver: Some(Version::from("9.2.3-1")),
             desc: None,
         };
@@ -433,8 +478,7 @@ mod tests {
         let rows = vec![row(
             RepoName::from("aur"),
             PkgName::from("claude"),
-            InstallState::Installed,
-            None,
+            InstallState::Installed(Version::from("1.5.0-1")),
             Some(Version::from("1.5.0-1")),
         )];
         let table = search_table(&rows, &PacmanIndex::default(), &metrics);
