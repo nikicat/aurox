@@ -142,6 +142,22 @@ impl Table {
         &self.0
     }
 
+    /// Print the table to stderr framed by blank lines — the flag-path
+    /// emission convention (`-Qu`, the `-S` plan tables). A no-op when the
+    /// table is empty, so callers never emit a stray empty frame. The shell
+    /// path doesn't use this — it routes [`Self::lines`] through its
+    /// `ShellEnv::print` seam to stdout.
+    pub fn eprint_framed(&self) {
+        if self.is_empty() {
+            return;
+        }
+        eprintln!();
+        for line in &self.0 {
+            eprintln!("{line}");
+        }
+        eprintln!();
+    }
+
     /// Whether the render produced no lines (e.g. an empty change set).
     pub const fn is_empty(&self) -> bool {
         self.0.is_empty()
