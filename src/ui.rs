@@ -11,6 +11,7 @@
 //!
 //! Splitting the two lets callers `set_message` without clobbering the label.
 
+mod cells;
 mod change_set;
 mod cost;
 mod gix_progress;

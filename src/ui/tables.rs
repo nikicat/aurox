@@ -1,15 +1,13 @@
 //! Aligned pacman/yay-style tables for the flag paths: install plans (`-S`)
-//! and upgrade plans (`-Qu`/`-Su`). The rendering primitives ([`Width`],
-//! [`Paint`], …) live in [`super::grid`]; [`version_block`] is the verdiff
-//! version cell shared with the change-set and search tables (`pub(super)`
-//! for that reason).
+//! and upgrade plans (`-Qu`/`-Su`). The rendering primitives live in
+//! [`super::grid`], the shared verdiff version cell in [`super::cells`].
 
-use super::grid::{Paint, Width};
+use super::cells::paint_suffix;
+use super::grid::Paint;
 use super::{color_on, dim};
 use crate::names::PkgName;
 use crate::pacman::invoke::PkgUpgrade;
-use crate::pacman::verdiff::{self, BumpKind};
-use crate::version::Version;
+use crate::pacman::verdiff;
 
 use console::style;
 
@@ -80,8 +78,9 @@ pub fn install_table(label: &str, rows: &[(String, String)]) {
 /// multilib → other → aur), then severity-descending within group. All four
 /// columns are space-padded uniformly across the whole list so package names
 /// align regardless of which repo they come from. Version cells dim their
-/// common prefix and color the diverging suffix by [`BumpKind`] (epoch/major
-/// red, minor yellow, patch green, pkgrel cyan).
+/// common prefix and color the diverging suffix by
+/// [`BumpKind`](crate::pacman::verdiff::BumpKind) (epoch/major red, minor
+/// yellow, patch green, pkgrel cyan).
 pub fn upgrade_table(plan: &[PkgUpgrade]) {
     if plan.is_empty() {
         return;
@@ -198,91 +197,9 @@ pub(super) fn render_row(
     )
 }
 
-fn paint_suffix(s: &str, kind: BumpKind) -> console::StyledObject<&str> {
-    match kind {
-        BumpKind::Epoch | BumpKind::Major => style(s).red().bold(),
-        BumpKind::Minor => style(s).yellow().bold(),
-        BumpKind::Patch => style(s).green(),
-        BumpKind::PkgRel => style(s).cyan(),
-        BumpKind::Other => style(s),
-    }
-}
-
-/// Render one transaction row's version block, padded to a fixed
-/// `old_w + paint.arrow() + new_w` visible width so the column after it
-/// aligns across install and upgrade rows.
-///
-/// - **Upgrade** (`old` present): verdiff coloring — common prefix dimmed, the
-///   diverging suffix colored by [`BumpKind`], joined by a dimmed ` → `. Shares
-///   the exact split logic with [`render_row`] so the shell's transaction table
-///   and the flag-path upgrade table read identically.
-/// - **Fresh install** (`old` is `None`): the arrow is suppressed (blank gap)
-///   and `new` renders green, matching [`install_table`].
-/// - **Unknown version** (`new` is `None`): an all-blank block of the same
-///   width, so a row we couldn't resolve a version for still aligns.
-pub(super) fn version_block(
-    old: Option<&Version>,
-    new: Option<&Version>,
-    old_w: Width,
-    new_w: Width,
-    paint: Paint,
-) -> String {
-    let Some(new) = new else {
-        return (old_w + paint.arrow() + new_w).blanks();
-    };
-    let new_str = new.as_str();
-    let new_pad = new_w.gap(Width::of(new_str));
-
-    let Some(old) = old else {
-        // Fresh install: blank old slot + blank arrow gap, then green `new`.
-        let lead = (old_w + paint.arrow()).blanks();
-        let shown = if paint.colored() {
-            style(new_str).green().to_string()
-        } else {
-            new_str.to_owned()
-        };
-        return format!("{lead}{shown}{new_pad}");
-    };
-
-    let old_pad = old_w.gap(Width::of(old.as_str()));
-    if !paint.colored() {
-        return format!("{}{old_pad} -> {new_str}{new_pad}", old.as_str());
-    }
-    let kind = verdiff::classify_bump(old, new);
-    let cut = verdiff::common_prefix_at_boundary(old, new);
-    let (old_pre, old_suf) = old.as_str().split_at(cut);
-    let (new_pre, new_suf) = new_str.split_at(cut);
-    format!(
-        "{}{}{old_pad}{}{}{}{new_pad}",
-        style(old_pre).dim(),
-        style(old_suf).red(),
-        dim(" → "),
-        style(new_pre).dim(),
-        paint_suffix(new_suf, kind),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn paint_suffix_dispatches_every_kind() {
-        // Smoke-test the dispatch table: every BumpKind renders a string that
-        // still contains the input text. Exact ANSI codes are an internal of
-        // `console` and not worth pinning.
-        for kind in [
-            BumpKind::Epoch,
-            BumpKind::Major,
-            BumpKind::Minor,
-            BumpKind::Patch,
-            BumpKind::PkgRel,
-            BumpKind::Other,
-        ] {
-            let s = paint_suffix("1.2.3", kind).force_styling(true).to_string();
-            assert!(s.contains("1.2.3"), "{kind:?} dropped the text: {s:?}");
-        }
-    }
 
     /// `sort_for_display` is the single source of truth for upgrade-row order.
     /// Within one repo it must emit most-severe-first, then alphabetical-by-name

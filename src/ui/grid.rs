@@ -29,7 +29,7 @@ use std::ops::Add;
 /// with a row index or a package count, and so the pad-on-*visible*-width policy
 /// — cells are padded by char count, never byte length, so embedded ANSI
 /// escapes don't skew alignment — lives in one place.
-#[derive(Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Width(usize);
 
 impl Width {
@@ -106,13 +106,15 @@ impl Cell {
     /// A pre-rendered composite cell whose visible width the caller already
     /// knows — the version block, which aligns its old/arrow/new parts
     /// internally and hands the grid one fixed-width cell.
-    #[allow(dead_code, reason = "first grid consumer lands with search_table")]
     pub(super) const fn sized(text: String, width: Width) -> Self {
         Self { text, width }
     }
 
     /// The cell's visible width — what column widths are measured from.
-    #[allow(dead_code, reason = "first grid consumer lands with search_table")]
+    #[allow(
+        dead_code,
+        reason = "first non-test consumer lands with the change-set port"
+    )]
     pub(super) const fn width(&self) -> Width {
         self.width
     }
@@ -207,7 +209,6 @@ impl From<bool> for Paint {
 }
 
 /// A grid cell's alignment within its measured column.
-#[allow(dead_code, reason = "first grid consumer lands with search_table")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Align {
     Left,
@@ -226,7 +227,6 @@ pub(super) struct Col {
     min: Width,
 }
 
-#[allow(dead_code, reason = "first grid consumer lands with search_table")]
 impl Col {
     /// A left-aligned column (names, labels).
     pub(super) const fn left() -> Self {
@@ -246,6 +246,10 @@ impl Col {
 
     /// This column with a width floor — for widths shared across sections or
     /// pinned to a widest-possible label.
+    #[allow(
+        dead_code,
+        reason = "first non-test consumer lands with the change-set port"
+    )]
     pub(super) const fn min(self, min: Width) -> Self {
         Self { min, ..self }
     }
@@ -260,7 +264,6 @@ pub(super) struct GridRow {
     tail: String,
 }
 
-#[allow(dead_code, reason = "first grid consumer lands with search_table")]
 impl GridRow {
     /// A row from its aligned cells, one per grid column.
     pub(super) const fn new(cells: Vec<Cell>) -> Self {
@@ -286,7 +289,6 @@ pub(super) struct Grid {
     indent: &'static str,
 }
 
-#[allow(dead_code, reason = "first grid consumer lands with search_table")]
 impl Grid {
     /// An empty grid over the given column specs.
     pub(super) const fn new(cols: Vec<Col>) -> Self {
@@ -299,6 +301,10 @@ impl Grid {
 
     /// Prefix every rendered line with `prefix` (the table's left margin —
     /// `"    "` for the flag tables, `"        "` for the dep block).
+    #[allow(
+        dead_code,
+        reason = "first non-test consumer lands with the change-set port"
+    )]
     pub(super) const fn indent(mut self, prefix: &'static str) -> Self {
         self.indent = prefix;
         self

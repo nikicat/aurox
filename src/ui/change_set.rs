@@ -19,12 +19,12 @@
 //!   it's a shaky predictor. A *summed* total that under-counts (an unknown row
 //!   contributed 0) is a lower bound, prefixed `>`.
 
+use super::cells::version_block;
 use super::cost::{
     PreviewMetrics, RowCost, SizeEst, TimeEst, built_suffix, cost_of, size_of, size_of_repo_dep,
     time_col,
 };
 use super::grid::{Cell, Paint, Table, Width};
-use super::tables::version_block;
 use super::{dim, human_age, human_bytes, human_duration, repo as repo_style};
 use crate::names::{PkgBase, PkgName, RepoName};
 use crate::pacman::alpm_db::PacmanIndex;

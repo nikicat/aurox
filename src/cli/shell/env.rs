@@ -226,7 +226,7 @@ impl ShellEnv for RealEnv<'_> {
         let pac = upgrade::system_pac()?;
         let search_rows: Vec<ui::SearchRow> = rows.iter().map(|r| search_row(r, &pac)).collect();
         let metrics = self.search_metrics(&search_rows);
-        let table = ui::search_table(&search_rows, &pac, &metrics);
+        let table = ui::search_table(&search_rows, &pac, &metrics, ui::Paint::detect());
         Ok(table
             .lines()
             .iter()
