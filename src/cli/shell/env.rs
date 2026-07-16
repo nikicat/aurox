@@ -9,7 +9,7 @@ use super::upgrade;
 use super::{ListItem, ShellEnv, State};
 use crate::build::{self, ConfirmGate, DevelPolicy, InstallOpts, review};
 use crate::cli::dispatch;
-use crate::cli::search::{Row, rank_rows, search_row};
+use crate::cli::search::{Row, rank_rows};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::info::{self, InfoLookup};
@@ -225,7 +225,7 @@ impl ShellEnv for RealEnv<'_> {
         // the installed AUR rows. The match-site annotation is part of the
         // rendered line, so it survives in the remembered `ListItem.label`.
         let pac = upgrade::system_pac()?;
-        let search_rows: Vec<ui::SearchRow> = ranked.iter().map(|r| search_row(r, &pac)).collect();
+        let search_rows: Vec<ui::SearchRow> = ranked.iter().map(|r| r.search_row(&pac)).collect();
         let metrics = self.search_metrics(&search_rows);
         let table = ui::search_table(&search_rows, &pac, &metrics);
         Ok(table
@@ -537,7 +537,7 @@ impl RealEnv<'_> {
                 repo: r.repo.clone(),
                 approval: ui::ApprovalCell::Approved,
                 name: r.name.clone(),
-                old_ver: r.old_ver.clone(),
+                old_ver: r.upgrade_from().cloned(),
                 new_ver: r.new_ver.clone(),
                 age: None,
             })
