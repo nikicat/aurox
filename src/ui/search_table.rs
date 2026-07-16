@@ -1,5 +1,6 @@
 //! The aligned result table for the ranked search list (shell `search` + the
-//! non-interactive `aurox <term>` listing).
+//! non-interactive `aurox <term>` listing), plus the pacman-format `-Ss`
+//! block ([`search_result`]).
 //!
 //! Columns: `repo · name · version · size · build-time · description`. It shares
 //! the change-set/upgrade table's cell machinery so the same bugs are fixed
@@ -136,6 +137,46 @@ pub fn search_table(rows: &[SearchRow], pac: &PacmanIndex, metrics: &PreviewMetr
     out
 }
 
+/// Render one hit in pacman's `-Ss` layout: the `repo/name version` headline
+/// (` [installed]` appended pacman-style) and the indented description line,
+/// omitted when the source has none.
+///
+/// Colored paint follows pacman's own `-Ss` palette — bold name, bold-green
+/// version, bold-cyan `[installed]`, plain description — except the repo,
+/// which keeps the hash color the aligned table uses ([`super::repo`]), so a
+/// repo wears one color across every search surface. Plain paint renders the
+/// exact pacman byte layout.
+pub fn search_result(row: &SearchRow, paint: Paint) -> Table {
+    let mut out = Table::new();
+    out.push(headline(row, paint));
+    if let Some(desc) = row.desc.as_deref() {
+        out.push(format!("    {desc}"));
+    }
+    out
+}
+
+/// The `-Ss` headline line — see [`search_result`] for the palette.
+fn headline(row: &SearchRow, paint: Paint) -> String {
+    let repo = row.repo.as_str();
+    let name = row.name.as_str();
+    let ver = row.new_ver.as_ref().map_or("", |v| v.as_str());
+    let marker = match (row.install, paint.colored()) {
+        (InstallState::NotInstalled, _) => String::new(),
+        (InstallState::Installed, false) => " [installed]".to_owned(),
+        (InstallState::Installed, true) => format!(" {}", style("[installed]").bold().cyan()),
+    };
+    if paint.colored() {
+        format!(
+            "{}/{} {}{marker}",
+            repo_style(repo),
+            style(name).bold(),
+            style(ver).bold().green(),
+        )
+    } else {
+        format!("{repo}/{name} {ver}{marker}")
+    }
+}
+
 /// The repo cell — repo-colored when installed, dimmed (receding) when not.
 fn repo_cell(repo: &RepoName, em: InstallState, paint: Paint) -> Cell {
     Cell::paint(repo.as_str(), paint, |s| {
@@ -215,6 +256,7 @@ fn desc_cell(desc: Option<&str>, paint: Paint) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assert_contains;
 
     /// Assemble a row from domain-typed parts, deriving a description from the
     /// name so the trailing column has something to show.
@@ -322,6 +364,64 @@ mod tests {
             "not-installed row must not show a build estimate: {:?}",
             table.lines()[0]
         );
+    }
+
+    /// The colored `-Ss` block actually carries ANSI styling on the headline
+    /// (the regression that motivated it: `-Ss` printed plain bytes on a color
+    /// terminal), strips back to the exact plain bytes, and leaves the
+    /// description line plain like pacman does.
+    #[test]
+    fn search_result_colored_strips_to_plain() {
+        // `console` gates styling on its own stdout-TTY detection at render
+        // time; force it on so the colored branch is observable when the test
+        // runs piped (plain `cargo test`), not only under makepkg's tty.
+        console::set_colors_enabled(true);
+        let r = SearchRow {
+            repo: RepoName::from("extra"),
+            name: PkgName::from("qemu-desktop"),
+            install: InstallState::Installed,
+            old_ver: None,
+            new_ver: Some(Version::from("11.0.2-3")),
+            desc: Some("A QEMU setup for desktop environments".into()),
+        };
+        let plain = search_result(&r, Paint::Plain);
+        let colored = search_result(&r, Paint::Colored);
+        assert_eq!(plain.lines().len(), 2);
+        assert_eq!(plain.lines()[0], "extra/qemu-desktop 11.0.2-3 [installed]");
+        assert_contains!(colored.lines()[0], "\u{1b}[");
+        assert_eq!(
+            console::strip_ansi_codes(&colored.lines()[0]),
+            plain.lines()[0],
+            "colored headline must strip to the plain bytes"
+        );
+        assert_eq!(
+            colored.lines()[1],
+            plain.lines()[1],
+            "description line stays plain (pacman parity)"
+        );
+    }
+
+    /// A not-installed row has no marker and renders one headline line when the
+    /// source has no description — in both paints.
+    #[test]
+    fn search_result_omits_marker_and_desc() {
+        console::set_colors_enabled(true);
+        let r = SearchRow {
+            repo: RepoName::from("aur"),
+            name: PkgName::from("qemu-rutabaga"),
+            install: InstallState::NotInstalled,
+            old_ver: None,
+            new_ver: Some(Version::from("9.2.3-1")),
+            desc: None,
+        };
+        for paint in [Paint::Plain, Paint::Colored] {
+            let table = search_result(&r, paint);
+            assert_eq!(table.lines().len(), 1, "no desc line under {paint:?}");
+            assert_eq!(
+                console::strip_ansi_codes(&table.lines()[0]),
+                "aur/qemu-rutabaga 9.2.3-1"
+            );
+        }
     }
 
     /// An installed AUR row with a recorded build time shows the estimate.
