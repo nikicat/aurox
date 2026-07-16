@@ -119,21 +119,27 @@ impl Cell {
 /// type. The shell prints each [`Self::lines`] entry; tests assert over them.
 pub struct Table(Vec<String>);
 
+impl Default for Table {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Table {
     /// An empty table to build up with [`Self::push`] / [`Self::append`].
-    pub(super) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self(Vec::new())
     }
 
     /// Append one rendered line.
-    pub(super) fn push(&mut self, line: String) {
+    pub fn push(&mut self, line: String) {
         self.0.push(line);
     }
 
     /// Append another table's lines, consuming it. Lets a renderer assemble a
     /// table from sub-sections (root rows, the deps block, removals) without
     /// dropping to a bare `Vec<String>`.
-    pub(super) fn append(&mut self, other: Self) {
+    pub fn append(&mut self, other: Self) {
         self.0.extend(other.0);
     }
 
