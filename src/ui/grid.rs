@@ -47,11 +47,6 @@ impl Width {
         widths.max().unwrap_or(Self::ZERO)
     }
 
-    /// The raw cell count, for the `{:>n}` / `{:<n}` width slots in `format!`.
-    pub(super) const fn cells(self) -> usize {
-        self.0
-    }
-
     /// `self` blank cells — the filler for a fixed-width column with no content.
     pub(super) fn blanks(self) -> String {
         " ".repeat(self.0)
@@ -111,19 +106,8 @@ impl Cell {
     }
 
     /// The cell's visible width — what column widths are measured from.
-    #[allow(
-        dead_code,
-        reason = "first non-test consumer lands with the change-set port"
-    )]
     pub(super) const fn width(&self) -> Width {
         self.width
-    }
-
-    /// Left-justify to `width`: the rendered text followed by trailing blanks
-    /// to reach `width` visible columns. Only surfaces not yet ported to
-    /// [`Grid`] call this — it dies with the last hand-rolled layout.
-    pub(super) fn pad_to(self, width: Width) -> String {
-        format!("{}{}", self.text, width.gap(self.width))
     }
 }
 
@@ -246,10 +230,6 @@ impl Col {
 
     /// This column with a width floor — for widths shared across sections or
     /// pinned to a widest-possible label.
-    #[allow(
-        dead_code,
-        reason = "first non-test consumer lands with the change-set port"
-    )]
     pub(super) const fn min(self, min: Width) -> Self {
         Self { min, ..self }
     }
@@ -301,10 +281,6 @@ impl Grid {
 
     /// Prefix every rendered line with `prefix` (the table's left margin —
     /// `"    "` for the flag tables, `"        "` for the dep block).
-    #[allow(
-        dead_code,
-        reason = "first non-test consumer lands with the change-set port"
-    )]
     pub(super) const fn indent(mut self, prefix: &'static str) -> Self {
         self.indent = prefix;
         self

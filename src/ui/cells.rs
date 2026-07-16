@@ -8,8 +8,9 @@
 //! logic here — behind one constructor — is what lets the transaction, search,
 //! and upgrade tables read identically.
 
-use super::dim;
 use super::grid::{Cell, Paint, Width};
+use super::{dim, repo as repo_style};
+use crate::names::RepoName;
 use crate::pacman::verdiff::{self, BumpKind};
 use crate::version::Version;
 use console::style;
@@ -51,6 +52,13 @@ impl VersionColumn {
             self.old_w + paint.arrow() + self.new_w,
         )
     }
+}
+
+/// Style a repository name cell (`core`, `extra`, `aur`, …) with yay's hashed
+/// repo color — the repo column of the transaction and upgrade tables. The
+/// search list keeps its own variant (it dims not-installed rows instead).
+pub(super) fn repo_cell(repo: &RepoName, paint: Paint) -> Cell {
+    Cell::paint(repo.as_str(), paint, |s| repo_style(s).to_string())
 }
 
 /// Render one row's version block, padded to a fixed

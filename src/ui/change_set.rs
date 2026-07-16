@@ -19,13 +19,12 @@
 //!   it's a shaky predictor. A *summed* total that under-counts (an unknown row
 //!   contributed 0) is a lower bound, prefixed `>`.
 
-use super::cells::version_block;
+use super::cells::{VersionColumn, repo_cell};
 use super::cost::{
     PreviewMetrics, RowCost, SizeEst, TimeEst, built_suffix, cost_of, size_of, size_of_repo_dep,
-    time_col,
 };
-use super::grid::{Cell, Paint, Table, Width};
-use super::{dim, human_age, human_bytes, human_duration, repo as repo_style};
+use super::grid::{Cell, Col, Grid, GridRow, Paint, Table, Width};
+use super::{dim, human_age, human_bytes, human_duration};
 use crate::names::{PkgBase, PkgName, RepoName};
 use crate::pacman::alpm_db::PacmanIndex;
 use crate::version::Version;
@@ -111,25 +110,15 @@ impl ChangeSet<'_> {
     /// pin the plain rendering.
     pub fn table(&self, paint: Paint) -> Table {
         let fig = self.figures();
+        let versions = VersionColumn::measure(
+            self.roots
+                .iter()
+                .map(|r| (r.old_ver.as_ref(), r.new_ver.as_ref())),
+        );
 
-        // Column widths over the plain cell text — padding is applied on that visible
-        // width so embedded ANSI codes never skew the columns.
-        let num_w = Width::of(&self.roots.len().to_string());
-        let repo_w = Width::widest(self.roots.iter().map(|r| Width::of(r.repo.as_str())));
-        let appr_w = Width::widest(self.roots.iter().map(|r| Width::of(r.approval.label())));
-        let name_w = Width::widest(self.roots.iter().map(|r| Width::of(r.name.as_str())));
-        let old_w = Width::widest(
-            self.roots
-                .iter()
-                .filter_map(|r| r.old_ver.as_ref())
-                .map(|v| Width::of(v.as_str())),
-        );
-        let new_w = Width::widest(
-            self.roots
-                .iter()
-                .filter_map(|r| r.new_ver.as_ref())
-                .map(|v| Width::of(v.as_str())),
-        );
+        // The size and build-time columns span the root rows *and* the dep
+        // block: measure each over the union once and hand both grids the
+        // result as a width floor, so the figures line up across sections.
         let size_w = Width::widest(
             fig.root_sizes
                 .iter()
@@ -141,10 +130,18 @@ impl ChangeSet<'_> {
             fig.root_costs
                 .iter()
                 .chain(&fig.aur_dep_costs)
-                .map(|c| c.visible_width()),
+                .map(|c| c.cell(paint).width()),
         );
 
-        let mut out = Table::new();
+        let mut roots = Grid::new(vec![
+            Col::right(),             // №
+            Col::left(),              // repo
+            Col::left(),              // approval
+            Col::left(),              // name
+            Col::left(),              // version block
+            Col::right().min(size_w), // size — shared with the dep block
+            Col::right().min(time_w), // build time — shared with the dep block
+        ]);
         for (i, ((root, size), cost)) in self
             .roots
             .iter()
@@ -152,29 +149,25 @@ impl ChangeSet<'_> {
             .zip(&fig.root_costs)
             .enumerate()
         {
-            let repo_cell = Cell::paint(root.repo.as_str(), paint, |s| repo_style(s).to_string())
-                .pad_to(repo_w);
-            let appr_cell = root.approval.cell(paint).pad_to(appr_w);
-            let name_cell = Cell::plain(root.name.as_str()).pad_to(name_w);
-            let ver = version_block(
-                root.old_ver.as_ref(),
-                root.new_ver.as_ref(),
-                old_w,
-                new_w,
-                paint,
+            roots.push(
+                GridRow::new(vec![
+                    Cell::plain((i + 1).to_string()),
+                    repo_cell(&root.repo, paint),
+                    root.approval.cell(paint),
+                    Cell::plain(root.name.as_str()),
+                    versions.cell(root.old_ver.as_ref(), root.new_ver.as_ref(), paint),
+                    Cell::plain(size.render()),
+                    cost.cell(paint),
+                ])
+                .tail(format!(
+                    "{}{}",
+                    built_suffix(*cost, paint),
+                    age_cell(root.age, paint)
+                )),
             );
-            out.push(format!(
-            "{n:>num$}  {repo_cell}  {appr_cell}  {name_cell}  {ver}  {size:>sw$}  {time}{built}{age}",
-            n = i + 1,
-            num = num_w.cells(),
-            size = size.render(),
-            sw = size_w.cells(),
-            time = time_col(*cost, time_w, paint),
-            built = built_suffix(*cost, paint),
-            age = age_cell(root.age, paint),
-        ));
         }
 
+        let mut out = roots.render();
         out.append(dep_lines(
             self.repo_deps,
             self.aur_deps,
@@ -263,39 +256,41 @@ fn dep_lines(
     if repo_deps.is_empty() && aur_deps.is_empty() {
         return Table::new();
     }
-    let dep_w = Width::widest(
-        repo_deps
-            .iter()
-            .map(|n| Width::of(n.as_str()))
-            .chain(aur_deps.iter().map(|p| Width::of(p.as_str()))),
-    );
-    // "(install)" is the widest tag — pad both to it so the size column lines up
-    // across install and build rows.
-    let tag_w = Width::of("(install)");
-    let (dw, tw, sw, tmw) = (dep_w.cells(), tag_w.cells(), size_w.cells(), time_w.cells());
-    let mut out = Table::new();
-    out.push(marker("pulls in:", paint));
+    let mut grid = Grid::new(vec![
+        Col::left(), // dep name
+        // "(install)" is the widest tag — a floor so the size column lines up
+        // across install and build rows even when only "(build)" rows exist.
+        Col::left().min(Width::of("(install)")),
+        Col::right().min(size_w), // size — shared with the root rows
+        Col::right().min(time_w), // build time — shared with the root rows
+    ])
+    .indent("        ");
     for (name, size) in repo_deps.iter().zip(&fig.repo_dep_sizes) {
-        out.push(format!(
-            "        {name:<dw$}  {tag:<tw$}  {size:>sw$}  {empty:>tmw$}",
-            tag = "(install)",
-            size = size.render(),
-            empty = "",
-        ));
+        grid.push(GridRow::new(vec![
+            Cell::plain(name.as_str()),
+            Cell::plain("(install)"),
+            Cell::plain(size.render()),
+            Cell::plain(""),
+        ]));
     }
     for ((name, size), cost) in aur_deps
         .iter()
         .zip(&fig.aur_dep_sizes)
         .zip(&fig.aur_dep_costs)
     {
-        out.push(format!(
-            "        {name:<dw$}  {tag:<tw$}  {size:>sw$}  {time}{built}",
-            tag = "(build)",
-            size = size.render(),
-            time = time_col(*cost, time_w, paint),
-            built = built_suffix(*cost, paint),
-        ));
+        grid.push(
+            GridRow::new(vec![
+                Cell::plain(name.as_str()),
+                Cell::plain("(build)"),
+                Cell::plain(size.render()),
+                cost.cell(paint),
+            ])
+            .tail(built_suffix(*cost, paint)),
+        );
     }
+    let mut out = Table::new();
+    out.push(marker("pulls in:", paint));
+    out.append(grid.render());
     out
 }
 
