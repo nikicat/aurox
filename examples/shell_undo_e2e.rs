@@ -27,7 +27,7 @@
 //! The `.sh` runs `aurox -Sy` first so the shell's on-disk index can classify
 //! `test-trivial` and `test-epoch` as AUR (the shell does not fetch at startup).
 
-use pty_harness::Pty;
+use pty_harness::{Pty, has};
 
 fn main() {
     let mut pty = Pty::spawn_aurox();
@@ -42,8 +42,13 @@ fn main() {
     pty.send(b"add test-trivial test-epoch\r");
     pty.expect("both staged", |s| s.contains("staged test-epoch"));
     pty.send(b"show\r");
-    pty.expect("numbered transaction", |s| {
-        s.contains("transaction — 2 to install")
+    // The needle must be unique to the *table*: the staging status line also
+    // says "transaction — 2 to install", and matching it would race the next
+    // send against rustyline's redraw (the buffered-input drop — the same
+    // trap shell_cart_e2e's apply-gate needle hit). A numbered row only
+    // exists once `show` has rendered.
+    pty.expect("numbered transaction row", |s| {
+        has(s, "1 aur review test-epoch")
     });
 
     // `remove 1` lands on a staged install — you can't uninstall what isn't
