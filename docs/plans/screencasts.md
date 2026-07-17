@@ -96,22 +96,39 @@ GIF is ~1.4 MB at font-size 16 (100×30 grid).
   GIFs (pad the shorter with its last frame); later a small Pages page with
   two asciinema-player instances slaved to one scrub bar (seek API).
 
-## Change detection: keyframe transcripts
+## Change detection: path filter + human-judged side-by-side
 
-"Did the UI output change vs base?" — byte-diffing recordings is
-meaningless, so:
+"Did the UI output change vs base?" — byte-diffing recordings is meaningless
+(timing jitter), so the original plan was committed **keyframe transcripts**:
+dump the normalized vt100 `screen()` at each quiescent point, commit them,
+and let a `git diff` against base answer the question while a freshness gate
+(regen is a no-op) keeps them honest.
 
-- Phase 2/3: the demo driver dumps the vt100 `screen()` at each quiescent
-  point (command finished, prompt back) into a **normalized text transcript**
-  committed to the repo (insta-style snapshots). Normalization scrubs the
-  only known wall-clock leaks: makepkg's `Making package:`/`Finished
-  making: … (<date>)` suffixes (verified real) and seconds-level duration
-  strings. `-Si` dates are already deterministic via fixture `commit-date`.
-- "Changed relative to base" then falls out of the PR's own text diff —
-  reviewable in the files tab — and CI posts GIFs only when a transcript
-  changed. CI enforces transcript freshness (regen must be a no-op).
-- Until then (phase 1/2), the path filter above is the trigger; the cost is
-  an occasional GIF for a visually-neutral refactor.
+**That approach was tried and dropped.** It needs the demo output to be
+deterministic, and it isn't: the search/cli/repo demos deliberately show real
+`[extra]` packages (texlive-games, nwg-hello, …) for realism, and those
+versions and the result set move whenever `archlinux:latest` refreshes —
+which `demos/build.sh` re-pulls on every run. A committed-transcript
+freshness gate would flake on unrelated base-image updates. Scrubbing the
+real-repo rows would blank exactly the content worth watching for change;
+stripping real repos (as the upgrade seed does) would trade the demos' README
+realism for determinism. Not worth it.
+
+What ships instead:
+
+- **The path filter is the change gate.** The whole Screencasts workflow only
+  runs when UI-affecting files change (`src/**`, `demos/**`, `examples/**`,
+  `pty-harness/**`, the fixtures, the Dockerfile). Coarser than a transcript —
+  it can fire on a visually-neutral refactor — but robust, with zero flake.
+- **The human judges "did it actually change"** via the base-vs-PR
+  side-by-side player (`compare.html?pr=<N>` on the media repo's Pages): two
+  asciinema-players under one scrub bar, `main` beside the PR, lined up frame
+  for frame. That is the "webui screencast testing" the whole effort was for —
+  a reviewer watching, not a byte-diff gating.
+
+A deterministic transcript gate stays possible *if* a fully-hermetic,
+fixture-only demo variant is ever added (no real repos); until then it would
+be a flaky gate, so it is explicitly out.
 
 ## Demo set (each 15–30 s, 100 cols) — all recorded
 
@@ -143,16 +160,18 @@ see docs/TODO.md "Demos".
    can't rot); image bakes agg 1.9.0 (sha256-pinned) + JetBrains Mono +
    Noto Color Emoji; `demos/build.sh`; README hero GIF
    (`docs/demo/search-install.gif`, 833 KB / 20.6 s).
-3. **(partly done)** Sidecar repo
+3. **(done)** Sidecar repo
    [aurox-ci-media](https://github.com/nikicat/aurox-ci-media): `main/`
-   demos + self-hosted asciinema-player on Pages
-   (<https://nikicat.github.io/aurox-ci-media/>), pushed to by the
-   Screencasts workflow (`.github/workflows/screencasts.yml`) which records
-   the demo set on UI-path PRs, publishes `pr-<N>/`, refreshes `main/` on
-   merges, and attaches a `screencasts` check run (GIF gallery + player
-   links; fork PRs skipped — needs the `CI_MEDIA_DEPLOY_KEY` secret).
-   Still open: keyframe transcripts (precise change detection + the sticky
-   comment reserved for real changes); the synced side-by-side player;
+   demos + self-hosted asciinema-player and a synced base-vs-PR
+   `compare.html` on Pages (<https://nikicat.github.io/aurox-ci-media/>),
+   pushed to by the Screencasts workflow
+   (`.github/workflows/screencasts.yml`) which records the demo set on
+   UI-path PRs, publishes `pr-<N>/`, refreshes `main/` on merges, attaches a
+   `screencasts` check run (GIF gallery + player links), and posts/updates a
+   sticky PR comment with the gallery + the side-by-side compare link (fork
+   PRs skipped — needs the `CI_MEDIA_DEPLOY_KEY` secret). Change gate is the
+   path filter + human-judged side-by-side (see "Change detection" above for
+   why committed transcripts were dropped). Follow-up content only:
    remove/first-launch/clone/refresh demos (docs/TODO.md).
 
 ## Findings from the hero demo (the review loop paying out)
