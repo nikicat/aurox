@@ -55,11 +55,48 @@ impl Pty {
     /// bare-term launch (`aurox <term>…`), which opens the shell *seeded* with
     /// that `search` instead of the plain upgrade-loop prompt.
     pub fn spawn_aurox_args(args: &[&str]) -> Self {
-        let aurox = std::env::args()
-            .nth(1)
-            .or_else(|| std::env::var("AUROX").ok())
-            .unwrap_or_else(|| "/work/target/debug/aurox".to_owned());
+        let aurox = resolve_aurox();
+        let mut cmd = CommandBuilder::new(&aurox);
+        for a in args {
+            cmd.arg(a);
+        }
+        let title = if args.is_empty() {
+            "aurox".to_owned()
+        } else {
+            format!("aurox {}", args.join(" "))
+        };
+        Self::spawn(cmd, &[], &title)
+    }
 
+    /// An interactive bash under the PTY, for demo drivers that showcase a
+    /// CLI invocation — typing `aurox -S …` at a shell prompt is then part of
+    /// the recording, not off-screen argv. `--norc` keeps the session
+    /// hermetic; `PS1` is a minimal colored `❯`, and the resolved aurox
+    /// binary's directory is prepended to `PATH` so the typed command is a
+    /// bare `aurox`.
+    pub fn spawn_demo_shell() -> Self {
+        let aurox = resolve_aurox();
+        let bin_dir = std::path::Path::new(&aurox)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let path = format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default());
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        let overrides = [
+            // \[…\] wraps the color codes as zero-width for readline.
+            ("PS1", "\\[\\e[1;36m\\]\u{276F}\\[\\e[0m\\] ".to_owned()),
+            ("PATH", path),
+        ];
+        Self::spawn(cmd, &overrides, "demo shell")
+    }
+
+    /// Common spawn tail: inherit the container env (so aurox finds its
+    /// config, the mock mirror, pacman, sudo, and makepkg), pin `TERM`, apply
+    /// caller `overrides` last so inheritance can't clobber them, and wire up
+    /// the PTY, reader thread, and (env-gated) cast recorder.
+    fn spawn(mut cmd: CommandBuilder, overrides: &[(&str, String)], title: &str) -> Self {
         let pty = NativePtySystem::default()
             .openpty(PtySize {
                 rows: ROWS,
@@ -69,10 +106,6 @@ impl Pty {
             })
             .expect("openpty");
 
-        let mut cmd = CommandBuilder::new(&aurox);
-        for a in args {
-            cmd.arg(a);
-        }
         for (k, v) in std::env::vars() {
             cmd.env(k, v);
         }
@@ -81,20 +114,18 @@ impl Pty {
         // tracing layer doesn't share this PTY with the UI we assert on (a
         // stray WARN floods the screen). All assertable output comes from
         // `ui::*` eprintlns, which run regardless of the tracing filter.
+        for (k, v) in overrides {
+            cmd.env(k, v);
+        }
 
-        let child = pty.slave.spawn_command(cmd).expect("spawn aurox");
+        let child = pty.slave.spawn_command(cmd).expect("spawn under pty");
         drop(pty.slave);
 
         let reader = pty.master.try_clone_reader().expect("clone reader");
         let writer = pty.master.take_writer().expect("take writer");
-        let title = if args.is_empty() {
-            "aurox".to_owned()
-        } else {
-            format!("aurox {}", args.join(" "))
-        };
         Self {
             parser: Parser::new(ROWS, COLS, 0),
-            rx: spawn_reader(reader, CastRecorder::from_env(&title)),
+            rx: spawn_reader(reader, CastRecorder::from_env(title)),
             writer,
             child,
             _master: pty.master,
@@ -189,11 +220,30 @@ impl Pty {
     }
 }
 
+/// The aurox binary under test: argv[1] → `$AUROX` → the default debug path.
+fn resolve_aurox() -> String {
+    std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("AUROX").ok())
+        .unwrap_or_else(|| "/work/target/debug/aurox".to_owned())
+}
+
 /// Demo pacing: hold the current screen so a viewer can read it. Output that
 /// arrives meanwhile is still pumped into the cast by the reader thread with
 /// true timing; only the driver waits.
 pub fn dwell(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// True when the [`Pty::spawn_demo_shell`] prompt is the last non-blank line
+/// — the foreground command finished and bash is reading again. Counting `❯`
+/// occurrences breaks once earlier prompt lines scroll off the vt100 grid.
+pub fn back_at_prompt(screen: &str) -> bool {
+    screen
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.trim() == "\u{276F}")
 }
 
 /// Whitespace-insensitive containment: table columns pad to the widest staged

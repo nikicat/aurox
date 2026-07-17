@@ -22,8 +22,9 @@ CONTAINER="${CONTAINER:-podman}"
 IMAGE="aurox-test:latest"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# name → examples/demo_<name//-/_>.rs
-ALL_DEMOS=(search-install)
+# name → examples/demo_<name//-/_>.rs; a demos/seed-<name>.sh, if present, is
+# sourced in the record container before the driver (outdated installs etc.).
+ALL_DEMOS=(search-install cli-install repo-install upgrade)
 
 demos=("$@")
 [[ ${#demos[@]} -gt 0 ]] || demos=("${ALL_DEMOS[@]}")
@@ -60,6 +61,7 @@ for name in "${demos[@]}"; do
         "$IMAGE" \
         bash -c "set -e; source /work/tests/container/lib.sh; bootstrap; reset_state; \
                  sudo sed -i 's/^#Color/Color/' /etc/pacman.conf; \
+                 if [[ -f /work/demos/seed-$name.sh ]]; then source /work/demos/seed-$name.sh; fi; \
                  aurox -Sy; assert_exit 0; \"\$EXAMPLES_DIR/$driver\""
         # The sed turns on pacman's Color for this demo container only — the
         # image default (Arch's commented-out Color) stays plain for the test

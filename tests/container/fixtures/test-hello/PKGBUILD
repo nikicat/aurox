@@ -12,6 +12,7 @@ pkgdesc='aurox demo fixture: a small hello-world app with a visible build'
 url='https://example.org/test-hello'
 arch=('any')
 license=('MIT')
+install=test-hello.install
 
 build() {
     local step
@@ -28,4 +29,8 @@ build() {
 
 package() {
     install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+    # ~48 KiB payload: an empty package renders a `0 B` size cell in the
+    # upgrade demo's change-set table, which reads like a bug on camera.
+    install -d "$pkgdir/usr/share/$pkgname"
+    head -c 49152 /dev/zero > "$pkgdir/usr/share/$pkgname/data"
 }

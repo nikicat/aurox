@@ -17,12 +17,17 @@
 //! The install target is the `test-hello` fixture, whose `build()` streams a
 //! fake compile log — a real-feeling build instead of a single-frame blip.
 
-use pty_harness::{Pty, dwell};
+use pty_harness::{Pty, back_at_prompt, dwell};
 
 fn main() {
-    // Launch seeded: `aurox hello` opens the shell with that search already
-    // run — banner, then a numbered result table mixing repo and AUR rows.
-    let mut pty = Pty::spawn_aurox_args(&["hello"]);
+    // Type the launch at a real prompt — the viewer sees `aurox hello`
+    // itself, not a session that starts mid-air. The seeded launch opens the
+    // shell with that search already run: banner, then a numbered result
+    // table mixing repo and AUR rows.
+    let mut pty = Pty::spawn_demo_shell();
+    pty.expect("demo shell prompt", |s| s.contains('\u{276F}'));
+    dwell(1000);
+    pty.send_human("aurox hello");
     pty.expect("shell banner", |s| s.contains("aurox shell"));
     pty.expect("seeded search results", |s| s.contains("test-hello"));
     dwell(2500);
@@ -49,6 +54,9 @@ fn main() {
     dwell(2500);
 
     pty.send_human("quit");
+    pty.expect("back at the bash prompt", back_at_prompt);
+    dwell(1200);
+    pty.send_human("exit");
     pty.finish_clean();
     println!("DEMO_SEARCH_INSTALL_OK");
 }

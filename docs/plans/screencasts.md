@@ -113,14 +113,26 @@ meaningless, so:
 - Until then (phase 1/2), the path filter above is the trigger; the cost is
   an occasional GIF for a visually-neutral refactor.
 
-## Demo set (each 15–30 s, 100 cols)
+## Demo set (each 15–30 s, 100 cols) — all recorded
 
-1. **Hero** (top of README): bare `aurox` shell — banner, search, stage by
-   number, `apply` with change-set table and sudo gate.
-2. **Upgrade**: `upgrade` → change-set with 📥/🔨 totals → apply.
-3. **Remove**: `-R` preflight refusal + `-Rc`.
-4. Maybe: the three-way first-launch sync consent (instant against the mock
-   mirror — honest enough for a demo).
+1. **Hero** (top of README): `aurox hello` — banner, seeded search, stage,
+   review-gate refusal → approve, apply with streaming build and sudo gate.
+2. **cli-install**: `aurox -S test-hello` typed in a demo bash
+   (`Pty::spawn_demo_shell`) — PKGBUILD review view, streaming build,
+   `Continue?` elevation gate.
+3. **repo-install**: `aurox -S repo-hello` — the pacman-parity fast path,
+   straight to the disclosed pacman command; the fixture carries a ~5 MiB
+   deterministic payload + paced `.install` scriptlet so pacman's figures
+   and timing read real.
+4. **upgrade**: bare shell `upgrade` — whole system, like `pacman -Syu`.
+   Hermetic because `demos/seed-upgrade.sh` (shared with extended/36) both
+   seeds the outdated installs and strips core/extra from pacman.conf, so
+   "all pending updates" truthfully is the two fixtures. Mixed repo + AUR
+   change set, real 📥 total, two elevation gates (`-Syu` lane, then `-U`).
+
+Possible later: `-R` removal preflight; the three-way first-launch consent;
+initial mirror clone (time-compressed cast) and incremental `-Sy` refresh —
+see docs/TODO.md "Demos".
 
 ## Phases
 
@@ -141,7 +153,10 @@ Watching the first recording surfaced real UX issues no PTY assertion had:
 
 - **`-> total 📥 ?` on all-unknown batches** — fixed: `total_line` now drops
   a term with nothing measured (same rule the 🔨 term already had) and the
-  whole line when neither figure exists.
+  whole line when neither figure exists. Second review round extended the
+  same rule to the one-line `apply` summary (`· ? · ? build` was still on
+  camera): unknown size/build terms are dropped there too, never faked as
+  `0s`.
 - **Uncolored pacman output** — environment, not product: Arch ships
   `pacman.conf` with `Color` commented out; the demo record step enables it
   for the demo container only (the test suite greps uncolored output).

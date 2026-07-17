@@ -10,6 +10,23 @@ A yay-like AUR helper backed by the [`github.com/archlinux/aur`](https://github.
 
 ![aurox shell: search, stage, review-gated AUR install](docs/demo/search-install.gif)
 
+<details>
+<summary><b>More demos</b>: one-shot AUR install · repo install · system upgrade</summary>
+
+### `aurox -S <aur-package>` — one-shot install with PKGBUILD review
+
+![aurox -S: review, streamed build, explicit sudo gate](docs/demo/cli-install.gif)
+
+### `aurox -S <repo-package>` — pacman-parity fast path
+
+![aurox -S repo package: straight to the disclosed pacman command](docs/demo/repo-install.gif)
+
+### `upgrade` — repo and AUR updates in one change set
+
+![aurox shell upgrade: mixed repo + AUR change set, one apply](docs/demo/upgrade.gif)
+
+</details>
+
 ## Status
 
 Early — works end-to-end: AUR search/info/install (`-S`), recursive dep resolution, PKGBUILD review, and an interactive shell (`aurox` with no args) for staging + upgrading + applying. Repo/system upgrades go through `pacman` (`-Syu` is a passthrough). Expect rough edges.
