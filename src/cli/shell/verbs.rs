@@ -350,6 +350,24 @@ impl State {
         env.print(&self.approval_status());
     }
 
+    /// The prompt for the next read line — ambient cart state (the classic
+    /// fix for hidden state: carry it in the prompt, don't reprint it), so
+    /// the user never needs a `show` just to remember where the transaction
+    /// stands. Empty cart keeps the plain `aurox> `; a staged cart counts its
+    /// rows (installs + removals) and any review gates still open.
+    pub(super) fn prompt(&self) -> String {
+        if self.cart.is_empty() {
+            return "aurox> ".to_owned();
+        }
+        let staged = self.cart.items().len() + self.cart.removals().len();
+        let pending = self.cart.pending_review().len();
+        if pending == 0 {
+            format!("aurox [{staged} staged]> ")
+        } else {
+            format!("aurox [{staged} staged, {pending} to review]> ")
+        }
+    }
+
     /// The transaction header line, shared by `show` and [`Self::summarize`]
     /// so the two can't drift apart in wording.
     fn txn_header(&self) -> String {
@@ -1363,6 +1381,43 @@ mod tests {
             env.lines.contains("nothing to undo"),
             "apply cleared the undo history: {:?}",
             env.lines
+        );
+    }
+
+    // --- prompt: ambient cart state ---
+
+    #[test]
+    fn prompt_carries_the_cart_standing() {
+        let mut env = env_with(&[("glibc", Source::Repo), ("yay-bin", Source::Aur)]);
+        let mut state = State::default();
+        assert_eq!(
+            state.prompt(),
+            "aurox> ",
+            "empty cart keeps the plain prompt"
+        );
+        state.dispatch(&command::parse("add glibc yay-bin"), &mut env);
+        assert_eq!(
+            state.prompt(),
+            "aurox [2 staged, 1 to review]> ",
+            "counts + the open review gate"
+        );
+        state.dispatch(&command::parse("approve yay-bin"), &mut env);
+        assert_eq!(
+            state.prompt(),
+            "aurox [2 staged]> ",
+            "gates cleared drop the review part"
+        );
+        state.dispatch(&command::parse("remove oldpkg"), &mut env);
+        assert_eq!(
+            state.prompt(),
+            "aurox [3 staged]> ",
+            "staged removals count as rows"
+        );
+        state.dispatch(&command::parse("clear"), &mut env);
+        assert_eq!(
+            state.prompt(),
+            "aurox> ",
+            "clear returns to the plain prompt"
         );
     }
 
