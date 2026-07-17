@@ -25,7 +25,7 @@ fn main() {
     dwell(3000);
 
     // The AUR rebuild needs review like any AUR change; approve it.
-    pty.expect("review gate", |s| s.contains("need review"));
+    pty.expect("review gate", |s| s.contains("needs review"));
     pty.send_human("approve test-hello");
     pty.expect("approved", |s| s.contains("approved test-hello"));
     dwell(1500);
