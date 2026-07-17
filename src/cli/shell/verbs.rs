@@ -578,6 +578,16 @@ struct RepoRow {
     repo: Option<RepoName>,
 }
 
+impl RepoRow {
+    /// Whether this row belongs to the repo named by `word`
+    /// (case-insensitive) — the predicate a repo-name selector filters on.
+    fn matches_repo(&self, word: &str) -> bool {
+        self.repo
+            .as_ref()
+            .is_some_and(|repo| repo.as_str().eq_ignore_ascii_case(word))
+    }
+}
+
 // The three row sources a repo filter runs over. Each conversion owns its
 // clones once, at a named seam, instead of per-field `.clone()`s at the call
 // sites (the shell-layer clone policy: clone freely, but at one place).
@@ -633,11 +643,7 @@ fn expand_repo_tokens(args: &[String], rows: &[RepoRow]) -> Vec<String> {
         .flat_map(|a| {
             let matched: Vec<String> = rows
                 .iter()
-                .filter(|r| {
-                    r.repo
-                        .as_ref()
-                        .is_some_and(|repo| repo.as_str().eq_ignore_ascii_case(a))
-                })
+                .filter(|r| r.matches_repo(a))
                 .map(|r| r.target.as_str().to_owned())
                 .collect();
             if matched.is_empty() {
