@@ -416,9 +416,20 @@ impl State {
             ));
             return;
         }
-        match env.apply(&self.cart) {
-            Ok(ApplyOutcome::Declined) => env.print("apply cancelled — cart kept"),
-            Ok(ApplyOutcome::Succeeded) => {
+        let run = match env.apply(&self.cart) {
+            Ok(run) => run,
+            Err(e) => {
+                env.print(&format!("apply: {e}"));
+                return;
+            }
+        };
+        // Fold the run's review knowledge back FIRST, whatever the outcome: a
+        // pulled-in dep's diff approved during a failed run must not re-prompt
+        // on the retry (and stays known for later re-adds after a success).
+        self.cart.absorb_reviewed(run.reviewed);
+        match run.outcome {
+            ApplyOutcome::Declined => env.print("apply cancelled — cart kept"),
+            ApplyOutcome::Succeeded => {
                 self.cart.clear_applied();
                 // The transaction ran: the cart is a new epoch, so pre-apply
                 // undo snapshots (which would re-stage now-installed packages)
@@ -426,7 +437,7 @@ impl State {
                 self.clear_undo_history();
                 env.print("done");
             }
-            Ok(ApplyOutcome::Failed { installed }) => {
+            ApplyOutcome::Failed { installed } => {
                 // Drop the rows that actually landed so a retry doesn't reinstall
                 // them; keep the offenders (and any staged removals, which don't
                 // run once a build fails) staged for `drop`/fix + `apply` again.
@@ -448,7 +459,6 @@ impl State {
                 // Reprint what's left so the failures are on screen to act on.
                 self.show(env);
             }
-            Err(e) => env.print(&format!("apply: {e}")),
         }
     }
 
@@ -677,6 +687,7 @@ mod tests {
     use crate::cli::shell::testenv::{
         FakeEnv, cart_specs, dispatch_one, env_with, li, li_repo, state_showing, up,
     };
+    use crate::names::PkgBase;
     use crate::units::ByteSize;
 
     #[test]
@@ -990,6 +1001,26 @@ mod tests {
         state.dispatch(&command::parse("add glibc"), &mut env);
         state.dispatch(&command::parse("apply"), &mut env);
         assert_eq!(state.cart.items().len(), 1, "declined apply keeps the cart");
+    }
+
+    #[test]
+    fn apply_folds_mid_run_reviews_back_whatever_the_outcome() {
+        // The reviewed-set loss: a pulled-in dep's PKGBUILD approved *during*
+        // a failed apply must not re-prompt on the retry — the run's review
+        // knowledge is folded into the cart on every outcome.
+        let mut env = env_with(&[("a", Source::Aur)]);
+        env.apply_outcome = Some(ApplyOutcome::Failed {
+            installed: Vec::new(),
+        });
+        env.apply_reviewed = std::iter::once(PkgBase::from("some-dep")).collect();
+        let mut state = State::default();
+        state.dispatch(&command::parse("add a"), &mut env);
+        state.dispatch(&command::parse("approve a"), &mut env);
+        state.dispatch(&command::parse("apply"), &mut env);
+        assert!(
+            state.cart.reviewed().contains(&PkgBase::from("some-dep")),
+            "the mid-run approval must survive the failed run"
+        );
     }
 
     #[test]

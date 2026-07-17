@@ -32,7 +32,7 @@ use crate::pacman::invoke::PkgUpgrade;
 use crate::system;
 use crate::ui;
 use crate::units::ByteSize;
-use cart::{ApplyOutcome, AurApproval, Cart, ReviewOutcome, StageClass};
+use cart::{ApplyRun, AurApproval, Cart, ReviewOutcome, StageClass};
 
 pub mod cart;
 pub mod command;
@@ -207,8 +207,10 @@ pub trait ShellEnv {
     /// width math, wall-clock age) that belongs behind the env seam.
     fn render_cart(&mut self, cart: &Cart);
     /// Run the staged transaction: resolve + preview + confirm + build/install +
-    /// removals. Reads the cart; the dispatch core updates it from the outcome.
-    fn apply(&mut self, cart: &Cart) -> Result<ApplyOutcome>;
+    /// removals. Reads the cart; the dispatch core updates it from the returned
+    /// [`ApplyRun`] — the outcome plus the run's review knowledge, which the
+    /// core folds back so mid-run approvals survive a failed run's retry.
+    fn apply(&mut self, cart: &Cart) -> Result<ApplyRun>;
     /// Measure aurox's on-disk state per category, for `system show`.
     /// Infallible: missing/unreadable paths report as zero.
     fn system_usage(&mut self) -> system::Report;

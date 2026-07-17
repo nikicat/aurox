@@ -5,7 +5,7 @@
 //! `pub(super)` so each sibling's `tests` mod can drive [`State::dispatch`]
 //! against [`FakeEnv`] without re-implementing the 15-method trait.
 
-use super::cart::{ApplyOutcome, AurApproval, Cart, ReviewOutcome, Source, StageClass};
+use super::cart::{ApplyOutcome, ApplyRun, AurApproval, Cart, ReviewOutcome, Source, StageClass};
 use super::command;
 use super::{Flow, ListItem, ListSource, NumberedList, ShellEnv, State};
 use crate::error::Result;
@@ -92,6 +92,9 @@ pub(super) struct FakeEnv {
     pub(super) review_calls: Vec<String>,
     /// What `apply` returns; absent ⇒ `Succeeded`.
     pub(super) apply_outcome: Option<ApplyOutcome>,
+    /// Pkgbases the scripted `apply` reports as reviewed mid-run (pulled-in
+    /// dep diffs the user approved during the build) — drained per call.
+    pub(super) apply_reviewed: std::collections::HashSet<PkgBase>,
     pub(super) apply_calls: CallCount,
     /// Rows `system_usage` reports (under a fixed `/state` root).
     pub(super) usage_rows: Vec<system::Usage>,
@@ -168,9 +171,12 @@ impl ShellEnv for FakeEnv {
         // The call count is the tests' proof of which verbs draw the table.
         self.render_calls.bump();
     }
-    fn apply(&mut self, _cart: &Cart) -> Result<ApplyOutcome> {
+    fn apply(&mut self, _cart: &Cart) -> Result<ApplyRun> {
         self.apply_calls.bump();
-        Ok(self.apply_outcome.take().unwrap_or(ApplyOutcome::Succeeded))
+        Ok(ApplyRun {
+            outcome: self.apply_outcome.take().unwrap_or(ApplyOutcome::Succeeded),
+            reviewed: std::mem::take(&mut self.apply_reviewed),
+        })
     }
     fn system_usage(&mut self) -> system::Report {
         system::Report {

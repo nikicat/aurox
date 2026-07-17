@@ -213,6 +213,21 @@ impl CartItem {
     }
 }
 
+/// What one `apply` run reports back to the dispatch core.
+///
+/// The outcome, plus the review set as the run left it — the cart's set
+/// extended by any PKGBUILD the user approved *during* the run (pulled-in
+/// AUR dependencies prompt mid-build). The env reads the cart; the core owns
+/// folding this knowledge back in ([`Cart::absorb_reviewed`]), on **every**
+/// outcome, so a diff approved before a failure isn't re-prompted on the
+/// retry. (An `Err` abort carries no data and still loses mid-run approvals
+/// — the accepted limit of the seam.)
+#[derive(Debug)]
+pub struct ApplyRun {
+    pub outcome: ApplyOutcome,
+    pub reviewed: HashSet<PkgBase>,
+}
+
 /// The outcome the dispatch core uses to update the cart after `env.apply`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
@@ -397,6 +412,12 @@ impl Cart {
             .collect();
         self.items.retain(|i| keep.contains(i.spec()));
         KeepResult::Kept { dropped }
+    }
+
+    /// Fold an [`ApplyRun`]'s review knowledge back in — a set union, so the
+    /// incoming set's iteration order is irrelevant.
+    pub fn absorb_reviewed(&mut self, reviewed: HashSet<PkgBase>) {
+        self.reviewed.extend(reviewed);
     }
 
     /// Stage a removal (uninstall). [`StageResult::AlreadyStaged`] when it was

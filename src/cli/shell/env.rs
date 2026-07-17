@@ -3,7 +3,8 @@
 //! transaction view that `show` and `apply` share.
 
 use super::cart::{
-    ApplyOutcome, Approval, AurApproval, Cart, CartItem, ReviewOutcome, Source, StageClass,
+    ApplyOutcome, ApplyRun, Approval, AurApproval, Cart, CartItem, ReviewOutcome, Source,
+    StageClass,
 };
 use super::upgrade;
 use super::{ListItem, ShellEnv, State};
@@ -370,11 +371,16 @@ impl ShellEnv for RealEnv<'_> {
         }
     }
 
-    fn apply(&mut self, cart: &Cart) -> Result<ApplyOutcome> {
+    fn apply(&mut self, cart: &Cart) -> Result<ApplyRun> {
         // The build/install (and any removals) may change the installed set, so
         // the cached resolution is stale once apply runs whatever its outcome;
         // drop it so the next `show` re-resolves against the new system state.
         self.view = None;
+        // The run's review scratch: seeded from the cart, extended by any
+        // PKGBUILD reviewed mid-run (pulled-in AUR deps), and carried back to
+        // the dispatch core in the ApplyRun — on every outcome, so those
+        // approvals survive a failed run's retry.
+        let mut reviewed = cart.reviewed().clone();
         let aur_data = &self.aur_data;
         let pac = upgrade::system_pac()?;
 
@@ -393,7 +399,12 @@ impl ShellEnv for RealEnv<'_> {
         } else {
             match sysupgrade_gate(aur_data, cart, &repo_sel)? {
                 Some(blockers) => blockers,
-                None => return Ok(ApplyOutcome::Declined),
+                None => {
+                    return Ok(ApplyRun {
+                        outcome: ApplyOutcome::Declined,
+                        reviewed,
+                    });
+                }
             }
         };
 
@@ -430,7 +441,6 @@ impl ShellEnv for RealEnv<'_> {
             .summary(),
         );
 
-        let mut reviewed = cart.reviewed().clone();
         let opts = InstallOpts {
             noconfirm: false,
             asdeps: false,
@@ -452,7 +462,10 @@ impl ShellEnv for RealEnv<'_> {
                 // The blocker didn't land, so the repo lane would fail exactly
                 // as preflighted — stop before it runs. The repo rows haven't
                 // run either, so they stay staged (`repo_landed = false`).
-                return Ok(cart_apply_outcome(&report, cart, aur_data, false));
+                return Ok(ApplyRun {
+                    outcome: cart_apply_outcome(&report, cart, aur_data, false),
+                    reviewed,
+                });
             }
         }
 
@@ -471,7 +484,7 @@ impl ShellEnv for RealEnv<'_> {
         }
         let outcome = cart_apply_outcome(&report, cart, aur_data, true);
         if !matches!(outcome, ApplyOutcome::Succeeded) {
-            return Ok(outcome);
+            return Ok(ApplyRun { outcome, reviewed });
         }
 
         // Remove half: `pacman -R`, filtered to packages actually installed so a
@@ -493,10 +506,16 @@ impl ShellEnv for RealEnv<'_> {
                 // success gate above); only the removal failed, so drop every
                 // install row and keep the removals staged for a retry.
                 let installed = cart.items().iter().map(|it| it.spec().clone()).collect();
-                return Ok(ApplyOutcome::Failed { installed });
+                return Ok(ApplyRun {
+                    outcome: ApplyOutcome::Failed { installed },
+                    reviewed,
+                });
             }
         }
-        Ok(ApplyOutcome::Succeeded)
+        Ok(ApplyRun {
+            outcome: ApplyOutcome::Succeeded,
+            reviewed,
+        })
     }
 
     fn system_usage(&mut self) -> system::Report {
