@@ -148,7 +148,7 @@ impl CartItem {
         aur: AurApproval,
     ) -> Self {
         Self {
-            target: Target::bare(target.into_inner()),
+            target: Target::bare(target),
             source,
             approval: Approval::default_for(source, aur),
             repo,
@@ -167,8 +167,8 @@ impl CartItem {
             Source::Repo
         };
         let target = match source {
-            Source::Aur => Target::with_hint(u.name.as_str().to_owned(), u.name.clone()),
-            Source::Repo => Target::bare(u.name.as_str().to_owned()),
+            Source::Aur => Target::with_hint(&u.name, u.name.clone()),
+            Source::Repo => Target::bare(&u.name),
         };
         // AUR rows label as `aur` from the source; a repo row carries its
         // concrete sync-DB so the table shows `core`/`extra`/… not just `repo`.
@@ -182,8 +182,9 @@ impl CartItem {
         }
     }
 
-    /// The freeform user-typed spec this item stages.
-    pub fn spec(&self) -> &str {
+    /// The freeform user-typed spec this item stages — the item's identity
+    /// within the cart.
+    pub const fn spec(&self) -> &PkgTarget {
         &self.target.spec
     }
 
@@ -382,10 +383,8 @@ impl Cart {
     /// Relative order of the kept rows is preserved, so the sorted-cart
     /// invariant holds without a re-sort.
     pub fn keep<'a>(&mut self, keep: impl IntoIterator<Item = &'a PkgTarget>) -> KeepResult {
-        // A typed set: the `i.spec()` probes below go through the wrappers'
-        // `Borrow<str>` — the one sanctioned map-key interop — because an
-        // item's identity is its freeform spec (`build::Target.spec`), which
-        // is not yet a typed target.
+        // Fully typed: an item's identity (`spec()`) is a `PkgTarget`, so
+        // the membership probes below never leave target space.
         let keep: HashSet<PkgTarget> = keep.into_iter().cloned().collect();
         if !self.items.iter().any(|i| keep.contains(i.spec())) {
             return KeepResult::NoMatch;
@@ -394,7 +393,7 @@ impl Cart {
             .items
             .iter()
             .filter(|i| !keep.contains(i.spec()))
-            .map(|i| PkgTarget::new(i.spec()))
+            .map(|i| i.spec().clone())
             .collect();
         self.items.retain(|i| keep.contains(i.spec()));
         KeepResult::Kept { dropped }
@@ -597,7 +596,7 @@ mod tests {
                 dropped: vec![PkgTarget::new("baz"), PkgTarget::new("foo")]
             }
         );
-        let specs: Vec<&str> = cart.items().iter().map(CartItem::spec).collect();
+        let specs: Vec<&str> = cart.items().iter().map(|i| i.spec().as_str()).collect();
         assert_eq!(specs, vec!["bar"]);
     }
 
@@ -742,7 +741,7 @@ mod tests {
             AurApproval::Review,
         ));
         // core (alphabetical within repo) → extra → aur last.
-        let order: Vec<&str> = cart.items().iter().map(CartItem::spec).collect();
+        let order: Vec<&str> = cart.items().iter().map(|i| i.spec().as_str()).collect();
         assert_eq!(order, vec!["glibc", "zlib", "vim", "yay-bin"]);
     }
 
@@ -810,7 +809,7 @@ mod tests {
         );
         // Sorted-cart invariant: firefox (repo, ranks before AUR) precedes
         // yay-bin (aur, sorts last).
-        let install: Vec<String> = cart.install_targets().into_iter().map(|t| t.spec).collect();
+        let install: Vec<PkgTarget> = cart.install_targets().into_iter().map(|t| t.spec).collect();
         assert_eq!(install, vec!["firefox", "yay-bin"]);
     }
 }

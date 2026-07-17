@@ -408,7 +408,7 @@ impl State {
         }
         let pending = self.cart.pending_review();
         if !pending.is_empty() {
-            let names: Vec<&str> = pending.iter().map(|i| i.spec()).collect();
+            let names: Vec<&str> = pending.iter().map(|i| i.spec().as_str()).collect();
             env.print(&format!(
                 "needs review: {} — run `review <sel>` or `approve <sel>`",
                 names.join(", ")
@@ -474,7 +474,7 @@ impl State {
             .items()
             .iter()
             .map(|it| RepoRow {
-                target: PkgTarget::new(it.spec()),
+                target: it.spec().clone(),
                 repo: Some(it.repo_label()),
             })
             .collect();
@@ -514,7 +514,7 @@ impl State {
             .items()
             .iter()
             .map(|it| ListItem {
-                target: PkgTarget::new(it.spec()),
+                target: it.spec().clone(),
                 repo: Some(it.repo_label()),
             })
             .collect()
@@ -710,7 +710,12 @@ mod tests {
         };
         let mut state = State::default();
         state.dispatch(&command::parse("upgrade yay-bin"), &mut env);
-        let specs: Vec<&str> = state.cart.items().iter().map(CartItem::spec).collect();
+        let specs: Vec<&str> = state
+            .cart
+            .items()
+            .iter()
+            .map(|i| i.spec().as_str())
+            .collect();
         assert_eq!(specs, vec!["yay-bin"]);
     }
 

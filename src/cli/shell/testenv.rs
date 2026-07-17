@@ -244,6 +244,6 @@ pub(super) fn cart_specs(state: &State) -> Vec<PkgTarget> {
         .cart
         .items()
         .iter()
-        .map(|i| PkgTarget::new(i.spec()))
+        .map(|i| i.spec().clone())
         .collect()
 }

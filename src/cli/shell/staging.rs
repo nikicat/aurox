@@ -305,7 +305,7 @@ impl State {
                 .pending_review()
                 .iter()
                 .map(|i| Resolved {
-                    target: PkgTarget::new(i.spec()),
+                    target: i.spec().clone(),
                     row: None,
                 })
                 .collect();
@@ -496,7 +496,12 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("add foo bar"), &mut env);
         state.dispatch(&command::parse("drop foo"), &mut env);
-        let specs: Vec<&str> = state.cart.items().iter().map(CartItem::spec).collect();
+        let specs: Vec<&str> = state
+            .cart
+            .items()
+            .iter()
+            .map(|i| i.spec().as_str())
+            .collect();
         assert_eq!(specs, vec!["bar"]);
     }
 

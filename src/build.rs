@@ -68,7 +68,7 @@ struct BuiltPkg {
 
 /// One install target paired with the user's intent for counterpart resolution.
 ///
-/// `spec` is the freeform user-typed string (pkgname / pkgbase / virtual /
+/// `spec` is the freeform user-typed target (pkgname / pkgbase / virtual /
 /// `name>=ver`); `hint` is the pkgname the user thinks they have installed —
 /// the one [`PacmanIndex::counterpart_with_hint`] should bias the lookup
 /// toward. Two callers populate it:
@@ -87,14 +87,14 @@ struct BuiltPkg {
 /// so `prepare_one` can look one up regardless of which input path produced it.
 #[derive(Debug, Clone)]
 pub struct Target {
-    pub spec: String,
+    pub spec: PkgTarget,
     pub hint: Option<PkgName>,
 }
 
 impl Target {
     /// Construct a target with no explicit hint — the resolver may infer one
     /// from `spec` when rewriting.
-    pub fn bare(spec: impl Into<String>) -> Self {
+    pub fn bare(spec: impl Into<PkgTarget>) -> Self {
         Self {
             spec: spec.into(),
             hint: None,
@@ -103,7 +103,7 @@ impl Target {
 
     /// Construct a target with an explicit hint — used by `-Syu` where the
     /// picker already knows which installed pkgname triggered the upgrade.
-    pub fn with_hint(spec: impl Into<String>, hint: PkgName) -> Self {
+    pub fn with_hint(spec: impl Into<PkgTarget>, hint: PkgName) -> Self {
         Self {
             spec: spec.into(),
             hint: Some(hint),
