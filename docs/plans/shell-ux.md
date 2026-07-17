@@ -96,12 +96,18 @@ been staged, `drop`/`approve` would have silently hit the wrong package —
   staged".
 - **Fill in hints**: singular pending review names the package and the exact
   command; real plurals everywhere ("1 upgrade staged", not "1 upgrade(s)").
-- **Unknown first word**: fuzzy-match verbs+aliases (edit distance ≤ 2) —
-  "did you mean `approve`?" — else suggest `search <word>`. Requires lifting
-  the alias table out of `parse`'s match into data (one site, reused by the
+- **Unknown first word**: fuzzy-match verbs+aliases (edit distance scaled to
+  word length) — "did you mean `approve`?"; an all-digit word gets the
+  row-selection hint; else suggest `search <word>`. Requires lifting the
+  alias table out of `parse`'s match into data (one site, reused by the
   suggester).
-- **`?` cells**: unknown values render `—`; an all-unknown column is dropped;
-  the total line says what's unknown once instead of `📥 ?`.
+- **`?` cells**: partial-unknown keeps the `?` glyph — it deliberately means
+  "missing measurement" (see `TimeEst`'s docs), and swapping in `—` would
+  reopen ambiguous-width territory for zero information gain. The fix targets
+  the *walls*: a figure column that is entirely unknown for the current rows
+  collapses (render its cells empty), and the total line drops its `📥` term
+  when the size total is all-unknown — the same precedent the `🔨` term
+  already set — dropping the total line entirely when neither figure exists.
 
 ## Rejected alternatives
 
@@ -123,8 +129,10 @@ been staged, `drop`/`approve` would have silently hit the wrong package —
    expected post-mutation tables.
 2. **Status prompt** — additive visibility layer (`State::prompt()` carrying
    the cart counts into the readline prompt).
-3. **Polish** — row provenance in acks/misses, plurals, unknown-verb
-   suggestions, `cart` alias, `?`-cell handling.
+3. **Language polish** — row provenance in acks/misses (`selector::Resolved`),
+   fill-in review hints, plurals, unknown-verb suggestions, `cart` alias.
+4. **Figure-column polish (ui/)** — the `?`-cell handling above, scoped to
+   `ui/change_set.rs` + `ui/cost.rs`.
 
 ## Testing
 

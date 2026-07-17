@@ -18,18 +18,63 @@ use super::NumberedList;
 use crate::names::PkgTarget;
 use regex::Regex;
 use std::collections::HashSet;
+use std::fmt;
+use std::num::NonZeroUsize;
+
+/// A 1-based row number of a numbered table — the number the user reads off
+/// the screen and types.
+///
+/// Wraps `NonZeroUsize`, so "row 0" is unrepresentable by construction (the
+/// parser's 1-based check *is* the constructor) and `Option<RowNumber>` (see
+/// [`Resolved`]) costs nothing. The 0-based vector index exists only inside
+/// [`Self::index`], so the ±1 conversion has exactly one site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct RowNumber(NonZeroUsize);
+
+impl RowNumber {
+    /// `None` for 0 — row numbers are 1-based.
+    fn new(n: usize) -> Option<Self> {
+        NonZeroUsize::new(n).map(Self)
+    }
+
+    /// The 0-based vector index — the one place 1-based becomes 0-based.
+    const fn index(self) -> usize {
+        self.0.get() - 1
+    }
+
+    /// The inclusive run of rows `self..=end` (empty when `end < self`).
+    fn through(self, end: Self) -> impl Iterator<Item = Self> {
+        (self.0.get()..=end.0.get()).filter_map(Self::new)
+    }
+}
+
+impl fmt::Display for RowNumber {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
 
 /// One parsed selector argument.
 #[derive(Debug)]
 enum Selector {
-    /// 1-based row in the current list.
-    Index(usize),
-    /// Inclusive 1-based range over the current list.
-    Range(usize, usize),
+    /// A row of the current list.
+    Index(RowNumber),
+    /// An inclusive row range over the current list.
+    Range(RowNumber, RowNumber),
     /// Literal package name, passed through unresolved.
     Name(String),
     /// Wildcard, compiled to an anchored regex over the name universe.
     Glob(Regex),
+}
+
+/// One resolved target and how the user named it: `row` carries the row
+/// number when the target came from a number/range selector — provenance
+/// the cart verbs use to word acks ("dropped foo (row 2)") and misses ("row 2
+/// of the search list …") — and is `None` for name/glob selectors.
+#[derive(Debug)]
+pub(super) struct Resolved {
+    pub(super) target: PkgTarget,
+    pub(super) row: Option<RowNumber>,
 }
 
 /// Resolve `args` against the numbered `list` snapshot and the `universe` of
@@ -44,21 +89,36 @@ pub(super) fn resolve(
     args: &[String],
     list: Option<&NumberedList>,
     universe: &[PkgTarget],
-) -> Result<Vec<PkgTarget>, String> {
-    let mut raw: Vec<PkgTarget> = Vec::new();
+) -> Result<Vec<Resolved>, String> {
+    let mut raw: Vec<Resolved> = Vec::new();
     for tok in args {
         match parse_one(tok)? {
             Selector::Index(n) => raw.push(row(list, n)?),
             Selector::Range(a, b) => raw.extend(rows(list, a, b)?),
-            Selector::Name(s) => raw.push(PkgTarget::new(s)),
+            Selector::Name(s) => raw.push(Resolved {
+                target: PkgTarget::new(s),
+                row: None,
+            }),
             Selector::Glob(re) => {
-                raw.extend(universe.iter().filter(|t| re.is_match(t.as_str())).cloned());
+                raw.extend(
+                    universe
+                        .iter()
+                        .filter(|t| re.is_match(t.as_str()))
+                        .map(|t| Resolved {
+                            target: t.clone(),
+                            row: None,
+                        }),
+                );
             }
         }
     }
-    // Order-preserving de-dup: the first mention of a target wins its position.
+    // Order-preserving de-dup: the first mention of a target wins its position
+    // (and its provenance).
     let mut seen = HashSet::new();
-    Ok(raw.into_iter().filter(|t| seen.insert(t.clone())).collect())
+    Ok(raw
+        .into_iter()
+        .filter(|r| seen.insert(r.target.clone()))
+        .collect())
 }
 
 /// Classify one token. Order matters: globs first (a `*`/`?` token is never a
@@ -101,13 +161,11 @@ fn parse_range(tok: &str) -> Result<Option<Selector>, String> {
     Ok(Some(Selector::Range(a, b)))
 }
 
-/// Parse a 1-based index, rejecting `0`.
-fn parse_index(s: &str) -> Result<usize, String> {
+/// Parse a row number, rejecting `0` (the [`RowNumber`] constructor's
+/// invariant, worded here where the user's token is at hand).
+fn parse_index(s: &str) -> Result<RowNumber, String> {
     let n: usize = s.parse().map_err(|e| format!("not a number `{s}`: {e}"))?;
-    if n == 0 {
-        return Err("indices are 1-based; 0 is out of range".into());
-    }
-    Ok(n)
+    RowNumber::new(n).ok_or_else(|| "indices are 1-based; 0 is out of range".into())
 }
 
 fn is_glob(tok: &str) -> bool {
@@ -131,9 +189,9 @@ fn glob_to_regex(glob: &str) -> Result<Regex, String> {
     Regex::new(&pat).map_err(|e| format!("bad pattern `{glob}`: {e}"))
 }
 
-/// One row by 1-based index, or a descriptive error naming the list the
-/// number was resolved against.
-fn row(list: Option<&NumberedList>, n: usize) -> Result<PkgTarget, String> {
+/// One row by number (carrying it as provenance), or a descriptive error
+/// naming the list the number was resolved against.
+fn row(list: Option<&NumberedList>, n: RowNumber) -> Result<Resolved, String> {
     // Numbers name rows of the last numbered table printed; when none was (or
     // it had no rows), point at both ways to print one rather than assuming a
     // `search` context.
@@ -141,8 +199,11 @@ fn row(list: Option<&NumberedList>, n: usize) -> Result<PkgTarget, String> {
         return Err("no numbered list is up — run `search` or `show` first".into());
     };
     list.rows
-        .get(n - 1)
-        .map(|it| it.target.clone())
+        .get(n.index())
+        .map(|it| Resolved {
+            target: it.target.clone(),
+            row: Some(n),
+        })
         .ok_or_else(|| {
             let count = list.rows.len();
             let noun = if count == 1 { "row" } else { "rows" };
@@ -153,9 +214,9 @@ fn row(list: Option<&NumberedList>, n: usize) -> Result<PkgTarget, String> {
         })
 }
 
-/// A 1-based inclusive range of rows.
-fn rows(list: Option<&NumberedList>, a: usize, b: usize) -> Result<Vec<PkgTarget>, String> {
-    (a..=b).map(|n| row(list, n)).collect()
+/// An inclusive range of rows.
+fn rows(list: Option<&NumberedList>, a: RowNumber, b: RowNumber) -> Result<Vec<Resolved>, String> {
+    a.through(b).map(|n| row(list, n)).collect()
 }
 
 #[cfg(test)]
@@ -184,8 +245,8 @@ mod tests {
         parts.iter().map(|s| PkgTarget::new(*s)).collect()
     }
 
-    fn targets(v: &[PkgTarget]) -> Vec<String> {
-        v.iter().map(|t| t.clone().into_inner()).collect()
+    fn targets(v: &[Resolved]) -> Vec<String> {
+        v.iter().map(|r| r.target.clone().into_inner()).collect()
     }
 
     #[test]
@@ -244,6 +305,18 @@ mod tests {
         // foo+bar already seen, so only baz is new.
         let got = resolve(&args(&["1", "bar", "*"]), Some(&l), &universe).unwrap();
         assert_eq!(targets(&got), vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn numbers_carry_row_provenance_names_do_not() {
+        let l = list(&["foo", "bar"]);
+        let got = resolve(&args(&["2", "baz", "1", "foo"]), Some(&l), &[]).unwrap();
+        assert_eq!(got[0].row, RowNumber::new(2), "number-picked rows remember");
+        assert_eq!(got[1].row, None, "name-picked targets carry no row");
+        // `1` = foo, re-mentioned by name later: the first mention (and its
+        // provenance) wins the dedup.
+        assert_eq!(got[2].row, RowNumber::new(1));
+        assert_eq!(got.len(), 3, "the literal `foo` deduped into row 1's entry");
     }
 
     #[test]

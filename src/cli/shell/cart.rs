@@ -381,7 +381,12 @@ impl Cart {
     /// install matches, returns [`KeepResult::NoMatch`] and changes nothing.
     /// Relative order of the kept rows is preserved, so the sorted-cart
     /// invariant holds without a re-sort.
-    pub fn keep(&mut self, keep: &HashSet<&str>) -> KeepResult {
+    pub fn keep<'a>(&mut self, keep: impl IntoIterator<Item = &'a PkgTarget>) -> KeepResult {
+        // A typed set: the `i.spec()` probes below go through the wrappers'
+        // `Borrow<str>` — the one sanctioned map-key interop — because an
+        // item's identity is its freeform spec (`build::Target.spec`), which
+        // is not yet a typed target.
+        let keep: HashSet<PkgTarget> = keep.into_iter().cloned().collect();
         if !self.items.iter().any(|i| keep.contains(i.spec())) {
             return KeepResult::NoMatch;
         }
@@ -575,8 +580,8 @@ mod tests {
         assert_eq!(cart.items()[0].spec(), "bar");
     }
 
-    fn keep_set<'a>(specs: &'a [&str]) -> HashSet<&'a str> {
-        specs.iter().copied().collect()
+    fn keep_targets(specs: &[&str]) -> Vec<PkgTarget> {
+        specs.iter().map(|s| PkgTarget::new(*s)).collect()
     }
 
     #[test]
@@ -587,7 +592,7 @@ mod tests {
         cart.add(item("baz", Source::Aur));
         // Keep only `bar` — the two AUR rows drop, reported in cart order.
         assert_eq!(
-            cart.keep(&keep_set(&["bar"])),
+            cart.keep(&keep_targets(&["bar"])),
             KeepResult::Kept {
                 dropped: vec![PkgTarget::new("baz"), PkgTarget::new("foo")]
             }
@@ -602,7 +607,7 @@ mod tests {
         let mut cart = Cart::default();
         cart.add(item("foo", Source::Aur));
         cart.add(item("bar", Source::Repo));
-        assert_eq!(cart.keep(&keep_set(&["absent"])), KeepResult::NoMatch);
+        assert_eq!(cart.keep(&keep_targets(&["absent"])), KeepResult::NoMatch);
         assert_eq!(cart.items().len(), 2, "nothing dropped on no match");
     }
 
@@ -613,7 +618,7 @@ mod tests {
         cart.add(item("bar", Source::Repo));
         // Every staged row is kept → a no-op, with an empty dropped list.
         assert_eq!(
-            cart.keep(&keep_set(&["foo", "bar"])),
+            cart.keep(&keep_targets(&["foo", "bar"])),
             KeepResult::Kept {
                 dropped: Vec::new()
             }
@@ -628,7 +633,7 @@ mod tests {
         cart.add(item("foo", Source::Aur));
         cart.stage_remove(PkgName::from("old"));
         assert!(matches!(
-            cart.keep(&keep_set(&["foo"])),
+            cart.keep(&keep_targets(&["foo"])),
             KeepResult::Kept { .. }
         ));
         assert_eq!(cart.removals(), &[PkgName::from("old")]);

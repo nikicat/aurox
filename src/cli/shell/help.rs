@@ -91,7 +91,7 @@ const TOPICS: &[(Verb, &str)] = &[
     ),
     (
         Verb::Show,
-        "show   (aliases: status, ls)\n  \
+        "show   (aliases: status, ls, cart)\n  \
          Preview the staged transaction: the change-set table with download sizes,\n  \
          build time, and totals. Its row numbers become what a bare number\n  \
          (`drop 2`) addresses, until the next numbered table prints.",

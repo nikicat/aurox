@@ -4,7 +4,7 @@
 //! cart-editing verbs live in [`super::staging`].
 
 use super::cart::{ApplyOutcome, Cart, CartItem, StageResult};
-use super::command::{Command, SystemAction};
+use super::command::{Command, SystemAction, unknown_note};
 use super::help::{HELP_TEXT, help_topic};
 use super::{Flow, ListItem, ListSource, NumberedList, ShellEnv, State, UNDO_DEPTH, selector};
 use crate::mirror;
@@ -126,9 +126,7 @@ impl State {
                 Flow::Continue
             }
             Command::Unknown(verb) => {
-                env.print(&format!(
-                    "unknown command `{verb}` — type `help` for the command list"
-                ));
+                env.print(&unknown_note(verb));
                 Flow::Continue
             }
             Command::Help(topic) => {
@@ -252,8 +250,8 @@ impl State {
             env.print("usage: info <pkg|number|range|glob>…");
             return;
         }
-        let targets = match self.resolve_against_list(args, env) {
-            Ok(t) => t,
+        let targets: Vec<PkgTarget> = match self.resolve_against_list(args, env) {
+            Ok(t) => t.into_iter().map(|r| r.target).collect(),
             Err(e) => {
                 env.print(&format!("info: {e}"));
                 return;
@@ -306,7 +304,8 @@ impl State {
         if staged > 0 {
             self.push_undo(before);
         }
-        env.print(&format!("{staged} upgrade(s) staged"));
+        let noun = if staged == 1 { "upgrade" } else { "upgrades" };
+        env.print(&format!("{staged} {noun} staged"));
         // `show` prints the seeded transaction and re-arms the referent.
         self.show(env);
     }
@@ -379,13 +378,22 @@ impl State {
     }
 
     /// The approval standing + next step, shared by `show` and
-    /// [`Self::summarize`].
+    /// [`Self::summarize`]. A single pending package is named with its exact
+    /// command filled in — the shell knows the name, so the user shouldn't
+    /// have to substitute a `<sel>` placeholder; the plural points at bare
+    /// `review`, which walks every pending item.
     fn approval_status(&self) -> String {
-        let pending = self.cart.pending_review().len();
-        if pending == 0 {
-            "all approved — run `apply`".to_owned()
-        } else {
-            format!("{pending} package(s) need review — run `review <sel>` or `approve <sel>`")
+        let pending = self.cart.pending_review();
+        match *pending.as_slice() {
+            [] => "all approved — run `apply`".to_owned(),
+            [one] => {
+                let name = one.spec();
+                format!("{name} needs review — run `review {name}` (or `approve {name}`)")
+            }
+            ref many => format!(
+                "{} packages need review — run `review` to walk them (or `approve <sel>`)",
+                many.len()
+            ),
         }
     }
 
@@ -457,7 +465,10 @@ impl State {
     /// Numbers, though, name rows of the last numbered table printed (see
     /// [`NumberedList`]), so a bare `3` means the same row it would for any
     /// other verb — the one the user can see.
-    pub(super) fn resolve_against_cart(&self, args: &[String]) -> Result<Vec<PkgTarget>, String> {
+    pub(super) fn resolve_against_cart(
+        &self,
+        args: &[String],
+    ) -> Result<Vec<selector::Resolved>, String> {
         let rows: Vec<RepoRow> = self
             .cart
             .items()
@@ -481,7 +492,7 @@ impl State {
         &self,
         args: &[String],
         env: &E,
-    ) -> Result<Vec<PkgTarget>, String> {
+    ) -> Result<Vec<selector::Resolved>, String> {
         let rows: Vec<RepoRow> = self
             .referent_rows()
             .iter()
@@ -623,10 +634,13 @@ fn select_from_candidates(
     };
     let universe: Vec<PkgTarget> = rows.iter().map(|r| r.target.clone()).collect();
     let picked = selector::resolve(&args, Some(&list), &universe)?;
-    let names: HashSet<&str> = picked.iter().map(PkgTarget::as_str).collect();
+    // Join back to the candidates in target space: each candidate's name
+    // lifts through the declared `PkgName → PkgTarget` conversion, so the
+    // match never drops to raw strings.
+    let picked: HashSet<PkgTarget> = picked.into_iter().map(|r| r.target).collect();
     Ok(candidates
         .iter()
-        .filter(|u| names.contains(u.name.as_str()))
+        .filter(|u| picked.contains(&PkgTarget::from(&u.name)))
         .cloned()
         .collect())
 }
@@ -997,7 +1011,7 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("add yay-bin"), &mut env);
         state.dispatch(&command::parse("show"), &mut env);
-        assert!(env.lines.contains("need review"));
+        assert!(env.lines.contains("yay-bin needs review"));
         state.dispatch(&command::parse("approve yay-bin"), &mut env);
         env.lines.clear();
         state.dispatch(&command::parse("show"), &mut env);
@@ -1219,7 +1233,7 @@ mod tests {
         env.lines.clear();
         state.dispatch(&command::parse("drop 1"), &mut env);
         assert!(
-            env.lines.contains("bar wasn't staged"),
+            env.lines.contains("row 1 (bar) is no longer staged"),
             "the stale row misses as bar, the package printed there: {:?}",
             env.lines
         );

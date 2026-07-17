@@ -8,11 +8,20 @@ use super::cart::{
     Approval, ApproveResult, CartItem, KeepResult, ReviewOutcome, Source, StageClass, StageResult,
     UnstageResult,
 };
-use super::{ShellEnv, State};
+use super::selector::Resolved;
+use super::{ListSource, ShellEnv, State};
 use crate::build::review;
 use crate::index;
 use crate::names::{PkgName, PkgTarget, RepoName};
-use std::collections::HashSet;
+
+/// The ack for one unstaged row: number-picked targets echo their row, so the
+/// binding the user just used ("2 = 3dslicer-bin") is confirmed in passing.
+fn drop_ack(r: &Resolved) -> String {
+    match r.row {
+        Some(n) => format!("dropped {} (row {n})", r.target.as_str()),
+        None => format!("dropped {}", r.target.as_str()),
+    }
+}
 
 // One deliberate extra inherent block: `State`'s verb handlers are split by
 // concern — the cart-editing verbs here, the dispatch core + session verbs in
@@ -45,7 +54,7 @@ impl State {
         let before = self.cart.clone();
         let mut changed = false;
         let mut any_unknown = false;
-        for t in targets {
+        for t in targets.into_iter().map(|r| r.target) {
             let Some(StageClass { source, repo }) = env.classify(&t) else {
                 env.print(&format!("unknown package `{}` — not staged", t.as_str()));
                 any_unknown = true;
@@ -106,13 +115,13 @@ impl State {
         }
         let before = self.cart.clone();
         let mut changed = false;
-        for t in targets {
-            match self.cart.unstage(&t) {
+        for r in targets {
+            match self.cart.unstage(&r.target) {
                 UnstageResult::Unstaged => {
-                    env.print(&format!("dropped {}", t.as_str()));
+                    env.print(&drop_ack(&r));
                     changed = true;
                 }
-                UnstageResult::NotStaged => env.print(&format!("{} wasn't staged", t.as_str())),
+                UnstageResult::NotStaged => env.print(&self.miss_note(&r)),
             }
         }
         // One status line (or "cart is empty" once the last row goes) — see
@@ -140,9 +149,8 @@ impl State {
                 return;
             }
         };
-        let keep: HashSet<&str> = targets.iter().map(PkgTarget::as_str).collect();
         let before = self.cart.clone();
-        match self.cart.keep(&keep) {
+        match self.cart.keep(targets.iter().map(|r| &r.target)) {
             KeepResult::NoMatch => {
                 env.print("keep: nothing in the cart matched — cart unchanged");
             }
@@ -188,7 +196,7 @@ impl State {
         }
         let before = self.cart.clone();
         let mut changed = false;
-        for t in targets {
+        for t in targets.into_iter().map(|r| r.target) {
             // `Some(is_upgrade)` when the target is a staged install row.
             match self.cart.item(&t).map(|i| i.upgrade.is_some()) {
                 // A fresh-install row isn't installed — you can't uninstall
@@ -259,10 +267,11 @@ impl State {
         }
         let before = self.cart.clone();
         let mut changed = false;
-        for t in targets {
-            match self.cart.approve(&t) {
+        for r in targets {
+            let t = &r.target;
+            match self.cart.approve(t) {
                 ApproveResult::Approved => {
-                    if let Some(pb) = env.pkgbase_of(&t) {
+                    if let Some(pb) = env.pkgbase_of(t) {
                         self.cart.mark_reviewed(pb);
                     }
                     env.print(&format!("approved {}", t.as_str()));
@@ -271,9 +280,7 @@ impl State {
                 ApproveResult::AlreadyApproved => {
                     env.print(&format!("{} is already approved", t.as_str()));
                 }
-                ApproveResult::NotStaged => {
-                    env.print(&format!("{} isn't staged", t.as_str()));
-                }
+                ApproveResult::NotStaged => env.print(&self.miss_note(&r)),
             }
         }
         // The status line surfaces the "all approved — run `apply`" moment the
@@ -293,11 +300,14 @@ impl State {
         let targets = if args.is_empty() {
             // Collect owned targets so the `self.cart` borrow from
             // `pending_review` is released before the loop mutates it.
-            let pending: Vec<PkgTarget> = self
+            let pending: Vec<Resolved> = self
                 .cart
                 .pending_review()
                 .iter()
-                .map(|i| PkgTarget::new(i.spec()))
+                .map(|i| Resolved {
+                    target: PkgTarget::new(i.spec()),
+                    row: None,
+                })
                 .collect();
             if pending.is_empty() {
                 env.print("nothing to review — all staged packages are approved");
@@ -322,11 +332,15 @@ impl State {
         // Flips to `Auto` once the user picks "approve all": the remaining AUR
         // items clear without opening another diff.
         let mut prompting = review::Prompting::default();
-        for t in targets {
+        for r in targets {
+            let t = &r.target;
             // Copy out (source, approval) so the cart isn't borrowed across the
             // `env.review` call (which then mutates the cart on approval).
-            match self.cart.item(&t).map(|i| (i.source, i.approval)) {
-                None => {}
+            match self.cart.item(t).map(|i| (i.source, i.approval)) {
+                // A selector that resolved to something unstaged is worth a
+                // note (it was silently skipped before) — with row provenance
+                // when a number picked it.
+                None => env.print(&self.miss_note(&r)),
                 Some((Source::Repo, _)) => {
                     env.print(&format!(
                         "{} is a repo package — nothing to review",
@@ -339,17 +353,17 @@ impl State {
                 Some((Source::Aur, Approval::NeedsReview)) => {
                     if prompting == review::Prompting::Auto {
                         // "approve all" was chosen earlier — no more diffs.
-                        self.approve_reviewed(&t, env);
+                        self.approve_reviewed(t, env);
                         approved_any = true;
                         continue;
                     }
-                    match env.review(&t) {
+                    match env.review(t) {
                         Ok(ReviewOutcome::Approved) => {
-                            self.approve_reviewed(&t, env);
+                            self.approve_reviewed(t, env);
                             approved_any = true;
                         }
                         Ok(ReviewOutcome::ApprovedAll) => {
-                            self.approve_reviewed(&t, env);
+                            self.approve_reviewed(t, env);
                             approved_any = true;
                             prompting = review::Prompting::Auto;
                         }
@@ -373,6 +387,26 @@ impl State {
         if approved_any {
             self.push_undo(before);
             self.summarize(env);
+        }
+    }
+
+    /// Word a cart-verb miss for one resolved selector: name-picked targets
+    /// read as before ("foo isn't staged"), row-picked ones name their row —
+    /// distinguishing the stale-snapshot case (the transaction row's package
+    /// has since left the cart) from numbers that never referred to the cart
+    /// at all (search rows), which get the `show` pointer. This is the message
+    /// that teaches what a number means when the guess was wrong.
+    fn miss_note(&self, r: &Resolved) -> String {
+        let t = r.target.as_str();
+        match (r.row, self.referent.as_ref().map(|l| l.source)) {
+            (Some(n), Some(ListSource::Transaction)) => {
+                format!("row {n} ({t}) is no longer staged")
+            }
+            (Some(n), Some(source)) => format!(
+                "row {n} of the {} ({t}) isn't staged — `show` numbers the cart",
+                source.label()
+            ),
+            _ => format!("{t} isn't staged"),
         }
     }
 
@@ -635,7 +669,7 @@ mod tests {
             env.lines
         );
         assert!(
-            env.lines.contains("need review"),
+            env.lines.contains("needs review"),
             "the status line carries the approval standing: {:?}",
             env.lines
         );
@@ -704,8 +738,9 @@ mod tests {
         env.lines.clear();
         state.dispatch(&command::parse("approve a"), &mut env);
         assert!(
-            env.lines.contains("1 package(s) need review"),
-            "one gate still pending: {:?}",
+            env.lines
+                .contains("b needs review — run `review b` (or `approve b`)"),
+            "a single pending package is named with its command filled in: {:?}",
             env.lines
         );
         env.lines.clear();
@@ -713,6 +748,63 @@ mod tests {
         assert!(
             env.lines.contains("all approved — run `apply`"),
             "the last approval announces readiness: {:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn miss_by_search_number_teaches_where_cart_numbers_come_from() {
+        // `drop 2` while the search list is the referent, where row 2 isn't
+        // staged: the miss names the row, the list, and the package — and
+        // points at `show` — instead of a bare "X isn't staged" about a
+        // package the user never typed (the incident's confusing half).
+        let mut env = env_with(&[("3dslicer", Source::Aur)]);
+        env.search_result = vec![
+            li_repo("aur", "3dslicer"),     // row 1
+            li_repo("aur", "3dslicer-git"), // row 2
+        ];
+        let mut state = State::default();
+        state.dispatch(&command::parse("search 3dslicer"), &mut env);
+        state.dispatch(&command::parse("add 1"), &mut env);
+        env.lines.clear();
+        state.dispatch(&command::parse("drop 2"), &mut env);
+        assert!(
+            env.lines.contains(
+                "row 2 of the search list (3dslicer-git) isn't staged — `show` numbers the cart"
+            ),
+            "got: {:?}",
+            env.lines
+        );
+        assert_eq!(cart_specs(&state), vec!["3dslicer"], "nothing was dropped");
+    }
+
+    #[test]
+    fn drop_by_number_acks_with_the_row() {
+        let mut env = FakeEnv {
+            upgrade_candidates: vec![up("aur", "bar"), up("aur", "foo")],
+            ..FakeEnv::default()
+        };
+        let mut state = State::default();
+        state.dispatch(&command::parse("upgrade"), &mut env); // shows [bar, foo]
+        env.lines.clear();
+        state.dispatch(&command::parse("drop 2"), &mut env);
+        assert!(
+            env.lines.contains("dropped foo (row 2)"),
+            "the ack confirms the number→package binding: {:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn plural_pending_points_at_bare_review() {
+        let mut env = env_with(&[("a", Source::Aur), ("b", Source::Aur)]);
+        let mut state = State::default();
+        env.lines.clear();
+        state.dispatch(&command::parse("add a b"), &mut env);
+        assert!(
+            env.lines
+                .contains("2 packages need review — run `review` to walk them"),
+            "the plural hint offers the walk-everything command: {:?}",
             env.lines
         );
     }
