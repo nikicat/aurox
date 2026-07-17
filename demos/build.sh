@@ -35,7 +35,21 @@ demos=("$@")
 "$CONTAINER" build -t "$IMAGE" -f "$REPO_ROOT/tests/container/Dockerfile" \
     "$REPO_ROOT/tests/container"
 
-( cd "$REPO_ROOT" && cargo build --bin aurox --examples )
+# Build aurox + the demo drivers INSIDE the test image, not on the host: the
+# host (a CI runner especially) may lack libalpm, which alpm-sys must link, so
+# the build has to happen where the Arch userspace lives. A dedicated target
+# dir keeps these container-built artifacts from mixing with a dev's host
+# `target/debug` (different sysroot paths would force churn). `--user 0:0`:
+# rootless podman maps container root to the host user, so the artifacts come
+# back writable and correctly owned (coverage.sh uses the same trick).
+"$CONTAINER" run --rm --user 0:0 \
+    -v "$REPO_ROOT:/work:rw" \
+    -e CARGO_HOME=/work/target/demo-cargo \
+    -e CARGO_TARGET_DIR=/work/target/demo-build \
+    -w /work \
+    "$IMAGE" \
+    cargo build --bin aurox --examples
+AUROX="/work/target/demo-build/debug/aurox"
 
 # Same flat/777 layout as run.sh --record, same rootless-podman reasoning.
 casts_dir="$REPO_ROOT/target/demo-casts"
@@ -58,6 +72,7 @@ for name in "${demos[@]}"; do
         -e "PTY_CAST_DIR=/casts" \
         -e "PTY_CAST_NAME=$name" \
         -e "SOURCE_DATE_EPOCH=$SDE" \
+        -e "AUROX=$AUROX" \
         "$IMAGE" \
         bash -c "set -e; source /work/tests/container/lib.sh; bootstrap; reset_state; \
                  sudo sed -i 's/^#Color/Color/' /etc/pacman.conf; \

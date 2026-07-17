@@ -48,17 +48,17 @@ jobs:
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
-      - name: Cache cargo registry and target
+      - name: Cache the container-built demo artifacts
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          # Deliberately the exact key the `ci` job uses — a hit restores its
-          # warm build for free; and exact-key only, no restore-keys (see the
-          # cache-growth rationale in ci.yml).
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          # demos/build.sh builds inside the test image with CARGO_HOME and
+          # CARGO_TARGET_DIR under target/ (demo-cargo + demo-build), so the
+          # whole registry+build state caches in one entry. Own key — sharing
+          # the `ci` job's would collide on save (only one job per key wins),
+          # leaving this job to cold-build every run. Exact-key only, no
+          # restore-keys (the cache-growth rationale in ci.yml).
+          path: target
+          key: ${{ runner.os }}-demos-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Record and render the demo set
         # Builds the test image (fonts + pinned agg baked in), cargo-builds
