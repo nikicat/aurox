@@ -1,0 +1,36 @@
+# Maintainer: Demo Upkeep <demo@example.org>
+# README-demo fixture (docs/plans/screencasts.md): the hero screencast's
+# install target. build() streams a fake compile log with real delays so the
+# recording shows makepkg output arriving progressively — test-trivial builds
+# in ~50ms, which collapses the whole build into a single GIF frame. The
+# sleeps cost nothing at image bake (repo=aur fixtures are indexed, not
+# built) and ~2.5s in the one extended test that applies it.
+pkgname=test-hello
+pkgver=1.4
+pkgrel=1
+pkgdesc='aurox demo fixture: a small hello-world app with a visible build'
+url='https://example.org/test-hello'
+arch=('any')
+license=('MIT')
+install=test-hello.install
+
+build() {
+    local step
+    for step in \
+        'Compiling libgreeting v0.9.2' \
+        'Compiling term-colors v2.1.0' \
+        'Compiling hello-core v1.4.0' \
+        'Compiling hello-cli v1.4.0' \
+        'Finished `release` profile [optimized]'; do
+        echo "   $step"
+        sleep 0.5
+    done
+}
+
+package() {
+    install -Dm644 /dev/null "$pkgdir/usr/share/$pkgname/marker"
+    # ~48 KiB payload: an empty package renders a `0 B` size cell in the
+    # upgrade demo's change-set table, which reads like a bug on camera.
+    install -d "$pkgdir/usr/share/$pkgname"
+    head -c 49152 /dev/zero > "$pkgdir/usr/share/$pkgname/data"
+}

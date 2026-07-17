@@ -16,11 +16,14 @@
 //! that `use pty_harness::Pty;` and scripts its own flow — adding one is a new
 //! file, not a branch in a growing dispatch.
 
+use cast::CastRecorder;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::io::{Read, Write};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use vt100::Parser;
+
+mod cast;
 
 const ROWS: u16 = 40;
 const COLS: u16 = 100;
@@ -35,6 +38,9 @@ pub struct Pty {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send + Sync>,
     _master: Box<dyn MasterPty + Send>,
+    /// Typing-jitter RNG for [`Self::send_human`] — fixed seed, so a demo's
+    /// keystroke rhythm is the same on every run.
+    rng: fastrand::Rng,
 }
 
 impl Pty {
@@ -49,11 +55,48 @@ impl Pty {
     /// bare-term launch (`aurox <term>…`), which opens the shell *seeded* with
     /// that `search` instead of the plain upgrade-loop prompt.
     pub fn spawn_aurox_args(args: &[&str]) -> Self {
-        let aurox = std::env::args()
-            .nth(1)
-            .or_else(|| std::env::var("AUROX").ok())
-            .unwrap_or_else(|| "/work/target/debug/aurox".to_owned());
+        let aurox = resolve_aurox();
+        let mut cmd = CommandBuilder::new(&aurox);
+        for a in args {
+            cmd.arg(a);
+        }
+        let title = if args.is_empty() {
+            "aurox".to_owned()
+        } else {
+            format!("aurox {}", args.join(" "))
+        };
+        Self::spawn(cmd, &[], &title)
+    }
 
+    /// An interactive bash under the PTY, for demo drivers that showcase a
+    /// CLI invocation — typing `aurox -S …` at a shell prompt is then part of
+    /// the recording, not off-screen argv. `--norc` keeps the session
+    /// hermetic; `PS1` is a minimal colored `❯`, and the resolved aurox
+    /// binary's directory is prepended to `PATH` so the typed command is a
+    /// bare `aurox`.
+    pub fn spawn_demo_shell() -> Self {
+        let aurox = resolve_aurox();
+        let bin_dir = std::path::Path::new(&aurox)
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let path = format!("{bin_dir}:{}", std::env::var("PATH").unwrap_or_default());
+        let mut cmd = CommandBuilder::new("bash");
+        cmd.arg("--norc");
+        cmd.arg("-i");
+        let overrides = [
+            // \[…\] wraps the color codes as zero-width for readline.
+            ("PS1", "\\[\\e[1;36m\\]\u{276F}\\[\\e[0m\\] ".to_owned()),
+            ("PATH", path),
+        ];
+        Self::spawn(cmd, &overrides, "demo shell")
+    }
+
+    /// Common spawn tail: inherit the container env (so aurox finds its
+    /// config, the mock mirror, pacman, sudo, and makepkg), pin `TERM`, apply
+    /// caller `overrides` last so inheritance can't clobber them, and wire up
+    /// the PTY, reader thread, and (env-gated) cast recorder.
+    fn spawn(mut cmd: CommandBuilder, overrides: &[(&str, String)], title: &str) -> Self {
         let pty = NativePtySystem::default()
             .openpty(PtySize {
                 rows: ROWS,
@@ -63,10 +106,6 @@ impl Pty {
             })
             .expect("openpty");
 
-        let mut cmd = CommandBuilder::new(&aurox);
-        for a in args {
-            cmd.arg(a);
-        }
         for (k, v) in std::env::vars() {
             cmd.env(k, v);
         }
@@ -75,18 +114,22 @@ impl Pty {
         // tracing layer doesn't share this PTY with the UI we assert on (a
         // stray WARN floods the screen). All assertable output comes from
         // `ui::*` eprintlns, which run regardless of the tracing filter.
+        for (k, v) in overrides {
+            cmd.env(k, v);
+        }
 
-        let child = pty.slave.spawn_command(cmd).expect("spawn aurox");
+        let child = pty.slave.spawn_command(cmd).expect("spawn under pty");
         drop(pty.slave);
 
         let reader = pty.master.try_clone_reader().expect("clone reader");
         let writer = pty.master.take_writer().expect("take writer");
         Self {
             parser: Parser::new(ROWS, COLS, 0),
-            rx: spawn_reader(reader),
+            rx: spawn_reader(reader, CastRecorder::from_env(title)),
             writer,
             child,
             _master: pty.master,
+            rng: fastrand::Rng::with_seed(0x5EED),
         }
     }
 
@@ -132,6 +175,22 @@ impl Pty {
         self.writer.flush().ok();
     }
 
+    /// Demo pacing: type `line` character by character with a human-ish,
+    /// *deterministic* rhythm, then Enter after a beat. rustyline echoes each
+    /// keystroke, so in a cast recording this reads as live typing. Only call
+    /// at a prompt (same ack rule as [`Self::send`] — buffered input sent
+    /// before rustyline reads is dropped); the per-char trickle itself is
+    /// what a terminal delivers anyway.
+    pub fn send_human(&mut self, line: &str) {
+        let mut buf = [0u8; 4];
+        for c in line.chars() {
+            self.send(c.encode_utf8(&mut buf).as_bytes());
+            std::thread::sleep(Duration::from_millis(self.rng.u64(35..80)));
+        }
+        std::thread::sleep(Duration::from_millis(180));
+        self.send(b"\r");
+    }
+
     /// Close the input, drain remaining output, and assert `aurox` exited 0.
     /// Consumes the harness — the scenario is over.
     pub fn finish_clean(self) {
@@ -141,6 +200,7 @@ impl Pty {
             writer,
             mut child,
             _master,
+            rng: _,
         } = self;
         drop(writer);
         pump_for(&mut parser, &rx, Duration::from_secs(5));
@@ -158,6 +218,32 @@ impl Pty {
         self.child.kill().ok();
         self.child.wait().ok();
     }
+}
+
+/// The aurox binary under test: argv[1] → `$AUROX` → the default debug path.
+fn resolve_aurox() -> String {
+    std::env::args()
+        .nth(1)
+        .or_else(|| std::env::var("AUROX").ok())
+        .unwrap_or_else(|| "/work/target/debug/aurox".to_owned())
+}
+
+/// Demo pacing: hold the current screen so a viewer can read it. Output that
+/// arrives meanwhile is still pumped into the cast by the reader thread with
+/// true timing; only the driver waits.
+pub fn dwell(ms: u64) {
+    std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// True when the [`Pty::spawn_demo_shell`] prompt is the last non-blank line
+/// — the foreground command finished and bash is reading again. Counting `❯`
+/// occurrences breaks once earlier prompt lines scroll off the vt100 grid.
+pub fn back_at_prompt(screen: &str) -> bool {
+    screen
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| l.trim() == "\u{276F}")
 }
 
 /// Whitespace-insensitive containment: table columns pad to the widest staged
@@ -183,7 +269,10 @@ fn pump_for(parser: &mut Parser, rx: &mpsc::Receiver<Vec<u8>>, dur: Duration) {
     }
 }
 
-fn spawn_reader(mut reader: Box<dyn Read + Send>) -> mpsc::Receiver<Vec<u8>> {
+fn spawn_reader(
+    mut reader: Box<dyn Read + Send>,
+    mut recorder: Option<CastRecorder>,
+) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     // pty-harness is a standalone dev crate with no aurox thread-locals to
     // propagate, so the `context::spawn` rule (src/context.rs) doesn't apply.
@@ -191,9 +280,25 @@ fn spawn_reader(mut reader: Box<dyn Read + Send>) -> mpsc::Receiver<Vec<u8>> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
         while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
+            if n == 0 {
                 break;
             }
+            // Tee into the cast here, at read time, so event timing reflects
+            // when output appeared — not when `expect` got around to recv it.
+            if let Some(rec) = recorder.as_mut()
+                && let Err(err) = rec.record(&buf[..n])
+            {
+                eprintln!("pty-harness: cast recording stopped: {err}");
+                recorder = None;
+            }
+            if tx.send(buf[..n].to_vec()).is_err() {
+                // Receiver gone (scenario killed) — stop pumping, but still
+                // fall through to flush the cast's carried bytes below.
+                break;
+            }
+        }
+        if let Some(rec) = recorder.as_mut() {
+            rec.finish().ok();
         }
     });
     rx
