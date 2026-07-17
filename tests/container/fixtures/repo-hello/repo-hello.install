@@ -1,0 +1,11 @@
+# Paced post-install output — see test-hello.install for the reasoning.
+post_install() {
+    echo 'updating hello caches...'
+    sleep 0.7
+    echo 'repo-hello ready'
+    sleep 0.4
+}
+
+post_upgrade() {
+    post_install
+}

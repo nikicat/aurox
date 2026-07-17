@@ -1,0 +1,21 @@
+# Maintainer: Demo Upkeep <demo@example.org>
+# README-demo fixture for the repo-install screencast (docs/plans/
+# screencasts.md): lives in the local sync repo like repo-base, but carries a
+# ~5 MiB incompressible payload so pacman's table shows real Download/Net
+# Change figures instead of `0.00 MiB`, plus a paced .install scriptlet.
+# The payload is a deterministic AES-CTR keystream — incompressible like
+# real binaries, yet byte-identical on every bake (reproducible builds).
+pkgname=repo-hello
+pkgver=1.0
+pkgrel=1
+pkgdesc='aurox demo fixture: a repo package with a real-sized payload'
+url='https://example.org/repo-hello'
+arch=('any')
+license=('MIT')
+install=repo-hello.install
+
+package() {
+    install -d "$pkgdir/usr/share/$pkgname"
+    openssl enc -aes-256-ctr -pass pass:aurox-demo -nosalt </dev/zero 2>/dev/null \
+        | head -c 5242880 > "$pkgdir/usr/share/$pkgname/data"
+}

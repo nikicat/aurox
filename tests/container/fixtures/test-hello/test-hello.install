@@ -1,0 +1,13 @@
+# Paced post-install output, same reasoning as the PKGBUILD's streamed
+# build(): an instant, silent install reads as a glitch on camera. Sleeps
+# only run when the package is actually installed (demos + extended tests).
+post_install() {
+    echo 'compiling greeting database...'
+    sleep 0.7
+    echo 'hello, world — ready'
+    sleep 0.4
+}
+
+post_upgrade() {
+    post_install
+}

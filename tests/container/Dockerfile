@@ -59,6 +59,21 @@ RUN printf '\n[local-repo]\nSigLevel = Optional TrustAll\nServer = file:///srv/l
         >> /etc/pacman.conf \
     && pacman -Sy --noconfirm
 
+# Screencast toolchain (docs/plans/screencasts.md): agg renders the casts that
+# pty-harness records, with the fonts the README GIFs are typeset in
+# (JetBrains Mono + color emoji for the change-set total line's 📥/🔨).
+# asciinema renders each cast to a plain-text transcript (`convert -f txt`)
+# for the base-vs-PR diff view. Baked here so demos/build.sh output is pinned
+# to image tooling, never host tool versions. agg has no repo package; pin
+# the release binary by hash.
+RUN pacman -S --noconfirm --needed ttf-jetbrains-mono noto-fonts-emoji asciinema \
+    && pacman -Scc --noconfirm \
+    && curl -fsSL -o /usr/local/bin/agg \
+        https://github.com/asciinema/agg/releases/download/v1.9.0/agg-x86_64-unknown-linux-musl \
+    && echo 'ddcbf6ca044c8ac3a434dcb9ee89fb9e3be87209982b7c2adb55f782e8f0f390  /usr/local/bin/agg' \
+        | sha256sum -c \
+    && chmod +x /usr/local/bin/agg
+
 USER builder
 WORKDIR /work
 # `RUST_LOG=off` mutes the console tracing layer by default — the suite's shell

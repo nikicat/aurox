@@ -2465,7 +2465,10 @@ dependencies = [
 name = "pty-harness"
 version = "0.1.0"
 dependencies = [
+ "fastrand",
  "portable-pty",
+ "serde_json",
+ "tempfile",
  "vt100",
 ]
 

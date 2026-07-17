@@ -179,8 +179,10 @@ impl ChangeSet<'_> {
     ///
     /// `show` is where the user looks; `apply` no longer redraws the table. E.g.
     /// `3 install, +2 deps, 1 remove · 3.07 GiB · 22m build`. The deps / remove /
-    /// build terms are omitted when their count is zero. A total that under-counts
-    /// because some row's figure is unknown is a lower bound, prefixed `>`.
+    /// build terms are omitted when their count is zero, and the size / build
+    /// terms when nothing was measured (per-row `?` cells carry the unknown; a
+    /// `?` term here is noise). A total that under-counts because some row's
+    /// figure is unknown is a lower bound, prefixed `>`.
     pub fn summary(&self) -> String {
         let fig = self.figures();
         let size = fig.size_total();
@@ -195,7 +197,9 @@ impl ChangeSet<'_> {
             parts.push(format!("{} remove", self.removals.len()));
         }
         let mut line = parts.join(", ");
-        write!(line, " · {}", size.render()).ok();
+        if let Some(size) = size.term() {
+            write!(line, " · {size}").ok();
+        }
         if let Some(build) = build_term(time) {
             write!(line, " · {build}").ok();
         }
@@ -306,15 +310,15 @@ fn removal_lines(removals: &[PkgName], paint: Paint) -> Table {
 }
 
 /// The trailing ` build` term for the one-line [`ChangeSet::summary`], or
-/// `None` for a pure-repo batch that carries no build-time term. An
-/// all-unknown total renders `? build` — never a bogus `0s build`, the
-/// never-built case; a total that under-counts because an unknown row is in
-/// the mix is a lower bound (`>22m build`). The table's [`total_line`] renders
-/// its own 🔨 term and drops the all-unknown case entirely.
+/// `None` when there is nothing to show: a pure-repo batch carries no
+/// build-time term, and an all-unknown total drops it too — never a bogus
+/// `0s build` for the never-built case, and no noisy `? build` either (the
+/// per-row `?` cells carry the unknown). A total that under-counts because
+/// an unknown row is in the mix is a lower bound (`>22m build`). The table's
+/// [`total_line`] renders its own 🔨 term under the same rule.
 fn build_term(time: TimeTotal) -> Option<String> {
     match time {
-        TimeTotal::None => None,
-        TimeTotal::Unknown => Some("? build".to_owned()),
+        TimeTotal::None | TimeTotal::Unknown => None,
         TimeTotal::Measured { total, bound } => {
             Some(format!("{}{} build", bound.marker(), human_duration(total)))
         }
@@ -386,12 +390,11 @@ impl Figures {
 /// an all-unknown one shows nothing rather than a noisy `🔨 ?`), and the 📥
 /// size term now follows the same rule — an all-unknown size total says
 /// nothing instead of `📥 ?`. With both terms gone the line itself goes; the
-/// one-line [`ChangeSet::summary`] keeps its explicit `?` wording.
+/// one-line [`ChangeSet::summary`] drops its unknown terms the same way.
 fn total_line(fig: &Figures) -> Option<String> {
     let mut terms = Vec::new();
-    let size = fig.size_total();
-    if matches!(size, SizeTotal::Known { .. }) {
-        terms.push(format!("📥 {}", size.render()));
+    if let Some(size) = fig.size_total().term() {
+        terms.push(format!("📥 {size}"));
     }
     if let TimeTotal::Measured { total, bound } = fig.time_total() {
         terms.push(format!("🔨 {}{}", bound.marker(), human_duration(total)));
@@ -521,10 +524,13 @@ enum SizeTotal {
 }
 
 impl SizeTotal {
-    fn render(self) -> String {
+    /// The rendered size term, or `None` for an all-unknown total — dropped
+    /// everywhere (table total and one-line summary alike) rather than shown
+    /// as a noisy `?`: the per-row `?` cells already carry the unknown.
+    fn term(self) -> Option<String> {
         match self {
-            Self::Unknown => "?".to_owned(),
-            Self::Known { total, bound } => format!("{}{}", bound.marker(), total.render()),
+            Self::Unknown => None,
+            Self::Known { total, bound } => Some(format!("{}{}", bound.marker(), total.render())),
         }
     }
 }
@@ -822,16 +828,27 @@ mod tests {
     }
 
     /// Regression (docs/TODO.md): a single never-built AUR package has an
-    /// `Unknown` build time, so the summary must read `? build`, not the
-    /// misleading `0s build` that summed an unmeasured 0.
+    /// `Unknown` build time. The summary must never fake a summed `0s build`;
+    /// since the screencast review (docs/plans/screencasts.md) the unknown
+    /// term is dropped outright — `? build` was noise on top of the per-row
+    /// `?` cells. The known size term still renders.
     #[test]
-    fn cost_summary_never_built_shows_unknown_not_zero() {
+    fn cost_summary_never_built_drops_build_term() {
         let mut pac = PacmanIndex::default();
         pac.installed_size.insert("newthing".into(), mib(85));
         let roots = vec![root("aur", "newthing", None, Some("1.0-1"))];
         let s = cs(&roots, &[], &[], &[], &pac, &PreviewMetrics::empty()).summary();
-        assert_contains!(s, "? build", "never-built build time is unknown");
-        assert_not_contains!(s, "0s build", "must not fake a summed figure");
+        assert_eq!(s, "1 install · 85.00 MiB", "no build term, no faked figure");
+    }
+
+    /// An all-unknown batch (fresh AUR install, nothing measured) reduces the
+    /// summary to its counts — no `?` size or build terms.
+    #[test]
+    fn cost_summary_all_unknown_is_counts_only() {
+        let pac = PacmanIndex::default();
+        let roots = vec![root("aur", "newthing", None, Some("1.0-1"))];
+        let s = cs(&roots, &[], &[], &[], &pac, &PreviewMetrics::empty()).summary();
+        assert_eq!(s, "1 install", "unknown size and build terms are dropped");
     }
 
     /// One numbered row per root, in the given order; a fresh install (no `old`)
