@@ -19,7 +19,9 @@ use crate::pacman::invoke;
 use crate::paths;
 use crate::resolver::{self, PkgbasePlan, Plan};
 use crate::ui;
-use crate::version::Version;
+use crate::version::{Ver, Version};
+use gix::ObjectId;
+use reviews::ReviewStore;
 use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::ops::ControlFlow;
@@ -32,6 +34,7 @@ pub mod makepkg;
 pub mod metrics;
 pub mod print;
 pub mod review;
+pub mod reviews;
 pub mod upgrade;
 
 pub use upgrade::{DevelPolicy, cmd_query_upgrades, collect_upgrade_plan};
@@ -305,6 +308,70 @@ pub(crate) struct InstallCtx<'a> {
     pub pac: &'a PacmanIndex,
 }
 
+/// The review state one AUR pipeline pass threads across its
+/// [`InstallCtx::prepare_one`] calls: the session's reviewed pkgbases (seeded
+/// by the caller, handed back through it), the pass-level prompt-vs-auto
+/// mode, and the persistent cross-session approvals ([`reviews`]).
+///
+/// The store records only decisions the user made with the diff on screen —
+/// never the auto-approved remainder of an "approve all" or a `--noconfirm`
+/// run, which would silently suppress future *interactive* reviews of
+/// content nobody looked at. A store that fails to open degrades to a
+/// warning and an all-miss pass: a broken sidecar DB must never block a
+/// build.
+struct ReviewPass<'a> {
+    /// Pkgbases approved this session (the shell cart's set, or `-S`'s fresh
+    /// one). The mirror is frozen for the whole session, so within a pass a
+    /// pkgbase maps to a single PKGBUILD commit.
+    reviewed: &'a mut HashSet<PkgBase>,
+    /// `Auto` on a non-interactive run, else `Prompt` until a mid-pass
+    /// "approve all" flips it.
+    prompting: review::Prompting,
+    store: Option<ReviewStore>,
+}
+
+impl<'a> ReviewPass<'a> {
+    /// Seed a pass: prompting from the run's non-interactive flag, the store
+    /// opened warn-and-degrade.
+    fn start(reviewed: &'a mut HashSet<PkgBase>, noconfirm: bool) -> Self {
+        let store = match ReviewStore::open(&paths::reviews_db_path()) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                ui::warn(&format!("review approvals unavailable: {e}"));
+                None
+            }
+        };
+        Self {
+            reviewed,
+            prompting: review::Prompting::from_noconfirm(noconfirm),
+            store,
+        }
+    }
+
+    /// Whether a prior session approved `pkgbase` at exactly `commit`. A
+    /// store read error counts as a miss — worst case is one extra prompt.
+    fn approved_previously(&self, pkgbase: &PkgBase, commit: &ObjectId) -> bool {
+        let Some(store) = &self.store else {
+            return false;
+        };
+        store.approved(pkgbase, commit).unwrap_or_else(|e| {
+            warn!(%pkgbase, error = %e, "review store read failed; prompting");
+            false
+        })
+    }
+
+    /// Persist a prompt-won approval; a write failure costs one future
+    /// re-prompt, never the build.
+    fn persist(&self, pkgbase: &PkgBase, commit: &ObjectId, version: &Ver) {
+        let Some(store) = &self.store else {
+            return;
+        };
+        if let Err(e) = store.record_approval(pkgbase, commit, version) {
+            warn!(%pkgbase, error = %e, "could not save review approval");
+        }
+    }
+}
+
 impl InstallCtx<'_> {
     /// Resolve `targets` against this context, then drive the repo and AUR
     /// install phases, returning the per-pkgbase [`RunReport`].
@@ -433,10 +500,10 @@ impl InstallCtx<'_> {
         // makepkg runs in this phase, so the user can walk through every diff
         // before any build kicks off.
         let mut prep_strata: Vec<Vec<Prep<'_>>> = Vec::with_capacity(plan.aur_strata.len());
-        // Threaded across every `prepare_one`: seeded from the run's non-interactive
-        // flag, then flipped to `Auto` by a mid-pass "approve all" so the remaining
-        // pkgbases skip their diff prompt.
-        let mut prompting = review::Prompting::from_noconfirm(opts.noconfirm);
+        // Threaded across every `prepare_one`: the session's reviewed set, the
+        // prompting mode (flipped to `Auto` by a mid-pass "approve all"), and
+        // the persistent approvals store.
+        let mut pass = ReviewPass::start(reviewed, opts.noconfirm);
         for stratum in &plan.aur_strata {
             let mut row = Vec::with_capacity(stratum.len());
             for pkgbase in stratum {
@@ -445,12 +512,7 @@ impl InstallCtx<'_> {
                 // split (no `--pkg=` flag); we filter the produced files down
                 // to the selection so `install_stratum`'s `pacman -U` skips
                 // the rest.
-                row.push(self.prepare_one(
-                    &mirror,
-                    &plan.pkgbase_plan(pkgbase),
-                    reviewed,
-                    &mut prompting,
-                )?);
+                row.push(self.prepare_one(&mirror, &plan.pkgbase_plan(pkgbase), &mut pass)?);
             }
             prep_strata.push(row);
         }
@@ -585,13 +647,12 @@ impl InstallCtx<'_> {
         ControlFlow::Continue(())
     }
 
-    #[instrument(skip(self, mirror, target, reviewed), fields(pkgbase = %target.pkgbase))]
+    #[instrument(skip(self, mirror, target, pass), fields(pkgbase = %target.pkgbase))]
     fn prepare_one<'p>(
         &self,
         mirror: &MirrorRepo,
         target: &PkgbasePlan<'p>,
-        reviewed: &mut HashSet<PkgBase>,
-        prompting: &mut review::Prompting,
+        pass: &mut ReviewPass<'_>,
     ) -> Result<Prep<'p>> {
         let (idx, pac, history_scan_max) =
             (self.aur.index(), self.pac, self.cfg.review_history_scan_max);
@@ -650,8 +711,24 @@ impl InstallCtx<'_> {
         // commit and re-reviewing it is pure friction. Auto-approve — this is what
         // makes the loop's retry-after-failure painless (a pkgbase approved in one
         // iteration and rebuilt in the next isn't re-prompted).
-        if reviewed.contains(pkgbase) {
+        if pass.reviewed.contains(pkgbase) {
             debug!(%pkgbase, "PKGBUILD already reviewed this session; skipping prompt");
+            return Ok(Prep {
+                pkgbase,
+                wt,
+                new_ver,
+                required,
+                disposition: Disposition::Build,
+            });
+        }
+
+        // Approved in a prior session at exactly this mirror commit: identical
+        // content, same verdict — clear it without re-prompting, and seed the
+        // session set so the rest of the run (and the shell cart, via
+        // `ApplyRun`) treats it like any other approval.
+        if pass.approved_previously(pkgbase, &wt.head_oid) {
+            ui::note(&format!("{pkgbase}: {new_ver} already reviewed"));
+            pass.reviewed.insert(pkgbase.clone());
             return Ok(Prep {
                 pkgbase,
                 wt,
@@ -676,19 +753,28 @@ impl InstallCtx<'_> {
             wt: &wt,
             history_scan_max,
         };
-        let disposition = match request.review(*prompting)? {
+        // Whether the diff actually rendered: only a prompt-won decision is a
+        // review worth persisting — an `Auto` pass-through (`--noconfirm`, or
+        // the tail of an earlier "approve all") had no eyes on it.
+        let prompted = pass.prompting == review::Prompting::Prompt;
+        let disposition = match request.review(pass.prompting)? {
             review::Outcome::Approved => {
                 // Remember the approval so a later batch in the same session
-                // doesn't re-prompt the same diff.
-                reviewed.insert(pkgbase.clone());
+                // doesn't re-prompt the same diff — and, when the user actually
+                // saw it, so later *sessions* don't either.
+                pass.reviewed.insert(pkgbase.clone());
+                if prompted {
+                    pass.persist(pkgbase, &wt.head_oid, &new_ver);
+                }
                 Disposition::Build
             }
             review::Outcome::ApprovedAll => {
-                // Approve this one and auto-approve every remaining pkgbase in the
-                // pass — flip the shared state the caller threads across
-                // `prepare_one` calls.
-                *prompting = review::Prompting::Auto;
-                reviewed.insert(pkgbase.clone());
+                // Approve this one and auto-approve every remaining pkgbase in
+                // the pass. Only this trigger item's diff was on screen, so
+                // only it persists.
+                pass.prompting = review::Prompting::Auto;
+                pass.reviewed.insert(pkgbase.clone());
+                pass.persist(pkgbase, &wt.head_oid, &new_ver);
                 Disposition::Build
             }
             review::Outcome::Skipped => Disposition::Skipped,

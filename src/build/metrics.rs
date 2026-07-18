@@ -28,9 +28,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, instrument};
 
 /// Bind a `PkgBase` as a SQL TEXT parameter. Lives here (not in `names.rs`) so
-/// the rusqlite coupling stays in the one module that talks to SQL — `names.rs`
-/// keeps its general-purpose trait impls only. Borrowed output: no allocation,
-/// just an `&str` view through the wrapper's `Borrow<str>` impl.
+/// the rusqlite coupling stays with the modules that talk to SQL (this one and
+/// [`super::reviews`]) — `names.rs` keeps its general-purpose trait impls
+/// only. Borrowed output: no allocation, just an `&str` view through the
+/// wrapper's `Borrow<str>` impl.
 impl ToSql for PkgBase {
     fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
         Ok(ToSqlOutput::Borrowed(ValueRef::Text(

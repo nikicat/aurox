@@ -3,9 +3,10 @@
 //! `undo` / `redo`) and the selector-resolution glue every verb shares. The
 //! cart-editing verbs live in [`super::staging`].
 
-use super::cart::{ApplyOutcome, Cart, CartItem, StageResult};
+use super::cart::{ApplyOutcome, Approval, Cart, CartItem, StageResult};
 use super::command::{Command, SystemAction, unknown_note};
 use super::help::{HELP_TEXT, help_topic};
+use super::staging::prior_approval;
 use super::{Flow, ListItem, ListSource, NumberedList, ShellEnv, State, UNDO_DEPTH, selector};
 use crate::mirror;
 use crate::names::{PkgTarget, RepoName, SearchTerm};
@@ -299,7 +300,17 @@ impl State {
         let mut staged = 0;
         self.edit_cart(|s| {
             for u in to_seed {
-                if s.cart.add(CartItem::from_upgrade(u, policy)) == StageResult::Staged {
+                let mut item = CartItem::from_upgrade(u, policy);
+                // A prior session's approval covering this exact PKGBUILD
+                // commit seeds the row pre-approved — see `prior_approval`.
+                let prior = prior_approval(env, item.source, item.spec());
+                if prior.is_some() {
+                    item.approval = Approval::Approved;
+                }
+                if s.cart.add(item) == StageResult::Staged {
+                    if let Some(pb) = prior {
+                        s.cart.mark_reviewed(pb);
+                    }
                     staged += 1;
                 }
             }
@@ -739,6 +750,24 @@ mod tests {
         // Repo upgrade auto-approves; AUR upgrade needs review.
         assert_eq!(state.cart.pending_review().len(), 1);
         assert_eq!(state.cart.pending_review()[0].spec(), "yay-bin");
+    }
+
+    /// An AUR upgrade row whose exact PKGBUILD commit a prior session already
+    /// approved seeds pre-approved (the persistent reviewed set restored),
+    /// with its pkgbase in the session set so `apply` won't re-prompt; rows
+    /// the store doesn't cover still gate.
+    #[test]
+    fn upgrade_seeds_previously_approved_aur_rows_pre_approved() {
+        let mut env = FakeEnv {
+            upgrade_candidates: vec![up("aur", "yay-bin"), up("aur", "paru-bin")],
+            ..FakeEnv::default()
+        };
+        env.prior_approvals.insert("yay-bin".into());
+        let mut state = State::default();
+        state.dispatch(&command::parse("upgrade"), &mut env);
+        assert_eq!(state.cart.pending_review().len(), 1);
+        assert_eq!(state.cart.pending_review()[0].spec(), "paru-bin");
+        assert!(state.cart.reviewed().contains(&PkgBase::from("yay-bin")));
     }
 
     #[test]

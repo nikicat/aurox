@@ -12,7 +12,7 @@ use super::selector::Resolved;
 use super::{ListSource, ShellEnv, State};
 use crate::build::review;
 use crate::index;
-use crate::names::{PkgName, PkgTarget, RepoName};
+use crate::names::{PkgBase, PkgName, PkgTarget, RepoName};
 
 /// The ack for one unstaged row: number-picked targets echo their row, so the
 /// binding the user just used ("2 = 3dslicer-bin") is confirmed in passing.
@@ -21,6 +21,22 @@ fn drop_ack(r: &Resolved) -> String {
         Some(n) => format!("dropped {} (row {n})", r.target.as_str()),
         None => format!("dropped {}", r.target.as_str()),
     }
+}
+
+/// A freshly-staged AUR item's prior-session approval: `Some(pkgbase)` when
+/// the persistent review store covers `t` at the PKGBUILD commit the index
+/// currently points at. The item then stages pre-approved (the reviewed set
+/// restored, not a policy bypass — any new AUR push re-gates) and the caller
+/// records the pkgbase as session-reviewed so `apply` won't re-prompt.
+/// `None` for repo items and unknown/never-approved targets.
+pub(super) fn prior_approval<E: ShellEnv>(
+    env: &E,
+    source: Source,
+    t: &PkgTarget,
+) -> Option<PkgBase> {
+    (source == Source::Aur && env.previously_approved(t))
+        .then(|| env.pkgbase_of(t))
+        .flatten()
 }
 
 // One deliberate extra inherent block: `State`'s verb handlers are split by
@@ -85,9 +101,19 @@ impl State {
             let label = repo
                 .clone()
                 .map_or_else(|| source.label().to_owned(), RepoName::into_inner);
-            match self.cart.add(CartItem::new(t, source, repo, policy)) {
+            let prior = prior_approval(env, source, &t);
+            let mut item = CartItem::new(t, source, repo, policy);
+            if prior.is_some() {
+                item.approval = Approval::Approved;
+            }
+            match self.cart.add(item) {
                 StageResult::Staged => {
-                    env.print(&format!("staged {name} ({label})"));
+                    if let Some(pb) = prior {
+                        self.cart.mark_reviewed(pb);
+                        env.print(&format!("staged {name} ({label}, approved previously)"));
+                    } else {
+                        env.print(&format!("staged {name} ({label})"));
+                    }
                     changed = true;
                 }
                 StageResult::AlreadyStaged => {
@@ -320,6 +346,10 @@ impl State {
                     if let Some(pb) = env.pkgbase_of(t) {
                         self.cart.mark_reviewed(pb);
                     }
+                    // An explicit `approve <sel>` is consent at a decision
+                    // point — persist it like a prompt-won review, so this
+                    // exact version never re-gates.
+                    env.record_approval(t);
                     env.print(&format!("approved {}", t.as_str()));
                     changed = true;
                 }
@@ -415,10 +445,16 @@ impl State {
             }
             match env.review(t) {
                 Ok(ReviewOutcome::Approved) => {
+                    // Prompt-won: the diff was on screen, so the approval
+                    // persists. The "approve all" tail above deliberately
+                    // doesn't — nobody looked at those diffs.
+                    env.record_approval(t);
                     self.approve_reviewed(t, env);
                     approved_any = true;
                 }
                 Ok(ReviewOutcome::ApprovedAll) => {
+                    // The trigger item's diff was on screen — it persists.
+                    env.record_approval(t);
                     self.approve_reviewed(t, env);
                     approved_any = true;
                     prompting = review::Prompting::Auto;
@@ -673,6 +709,62 @@ mod tests {
             "approve-all opens only the first diff, then auto-approves the rest"
         );
         assert!(state.cart.all_approved(), "every staged item is cleared");
+    }
+
+    /// A persistent approval from a prior session (same pkgbase, same
+    /// PKGBUILD commit) restores the reviewed set at `add`: the item stages
+    /// pre-approved, the pkgbase lands in the session set so `apply` won't
+    /// re-prompt, and the ack says why no gate appeared.
+    #[test]
+    fn add_restores_a_prior_sessions_approval() {
+        let mut env = env_with(&[("yay-bin", Source::Aur)]);
+        env.prior_approvals.insert("yay-bin".into());
+        let mut state = State::default();
+        state.dispatch(&command::parse("add yay-bin"), &mut env);
+        assert!(state.cart.all_approved(), "stored approval clears the gate");
+        assert!(state.cart.reviewed().contains(&PkgBase::from("yay-bin")));
+        assert!(
+            env.lines
+                .contains("staged yay-bin (aur, approved previously)")
+        );
+    }
+
+    /// An explicit `approve <sel>` persists — the command is the consent, so
+    /// this exact version never re-gates in a later session.
+    #[test]
+    fn approve_persists_the_approval() {
+        let mut env = env_with(&[("yay-bin", Source::Aur)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add yay-bin"), &mut env);
+        state.dispatch(&command::parse("approve yay-bin"), &mut env);
+        assert_eq!(env.recorded_approvals, vec!["yay-bin"]);
+    }
+
+    /// Only prompt-won review decisions persist: the "approve all" trigger
+    /// item had its diff on screen, the auto-approved tail did not — and a
+    /// skip records nothing at all.
+    #[test]
+    fn review_persists_only_prompt_won_approvals() {
+        let mut env = env_with(&[("a", Source::Aur), ("b", Source::Aur), ("c", Source::Aur)]);
+        env.review_outcomes
+            .insert("a".into(), ReviewOutcome::ApprovedAll);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add a b c"), &mut env);
+        state.dispatch(&command::parse("review"), &mut env);
+        assert!(state.cart.all_approved());
+        assert_eq!(
+            env.recorded_approvals,
+            vec!["a"],
+            "only the on-screen trigger diff persists; the unseen tail must not"
+        );
+
+        let mut env = env_with(&[("d", Source::Aur)]);
+        env.review_outcomes
+            .insert("d".into(), ReviewOutcome::Skipped);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add d"), &mut env);
+        state.dispatch(&command::parse("review d"), &mut env);
+        assert!(env.recorded_approvals.is_empty(), "a skip persists nothing");
     }
 
     #[test]

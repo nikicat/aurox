@@ -43,11 +43,14 @@
 ## AUR
 
 - account for already downloaded sources when printing download sizes in tables
-- save review approvals for concrete versions persistently (the shell's
-  reviewed set — including mid-apply approvals since `ApplyRun` — is
-  session-only today)
 
 <!-- Done:
+- save review approvals for concrete versions persistently: consented
+  approvals (diff answered at the prompt, explicit `approve`) land in
+  `reviews.db` keyed by (pkgbase, PKGBUILD commit) — src/build/reviews.rs.
+  The pipeline skips re-review at the same commit; the shell stages
+  previously-approved versions pre-approved. `--noconfirm` and the unseen
+  tail of an "approve all" never persist.
 - Ctrl-C during a shell repo/AUR *refresh* now bails back to the prompt instead
   of taking aurox down: `mirror::cancel_on_sigint` wraps the gix fetch/clone in
   a SIGINT guard (the build path's `signal_hook` pattern), and a new

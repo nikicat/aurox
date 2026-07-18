@@ -90,6 +90,11 @@ pub(super) struct FakeEnv {
     /// spec → review verdict; absent ⇒ `Approved`.
     pub(super) review_outcomes: HashMap<String, ReviewOutcome>,
     pub(super) review_calls: Vec<String>,
+    /// Specs the persistent review store already covers (a prior session's
+    /// consent) — what `previously_approved` answers.
+    pub(super) prior_approvals: std::collections::HashSet<String>,
+    /// Specs `record_approval` persisted, in call order.
+    pub(super) recorded_approvals: Vec<String>,
     /// What `apply` returns; absent ⇒ `Succeeded`.
     pub(super) apply_outcome: Option<ApplyOutcome>,
     /// Pkgbases the scripted `apply` reports as reviewed mid-run (pulled-in
@@ -157,6 +162,12 @@ impl ShellEnv for FakeEnv {
     }
     fn pkgbase_of(&self, target: &PkgTarget) -> Option<PkgBase> {
         Some(PkgBase::from(target.as_str()))
+    }
+    fn previously_approved(&self, target: &PkgTarget) -> bool {
+        self.prior_approvals.contains(target.as_str())
+    }
+    fn record_approval(&mut self, target: &PkgTarget) {
+        self.recorded_approvals.push(target.as_str().to_owned());
     }
     fn review(&mut self, target: &PkgTarget) -> Result<ReviewOutcome> {
         self.review_calls.push(target.as_str().to_owned());
