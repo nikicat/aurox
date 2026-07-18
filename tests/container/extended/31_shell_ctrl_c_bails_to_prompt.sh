@@ -17,12 +17,26 @@ assert_exit 0
 driver="$EXAMPLES_DIR/shell_ctrl_c_e2e"
 [[ -x "$driver" ]] || { echo "missing driver example: $driver (run.sh must build it)" >&2; exit 1; }
 out="$(mktemp)"
+
+# On a driver failure, append the tail of aurox's debug log to the captured
+# output: it records the interrupt path's preconditions (stdin ISIG at build
+# start, the killpg forward's warnings) that issue #59's first failures died
+# without. The dump runs only after the failure — it cannot perturb timing.
+dump_shell_log() {
+    for log in "$STATE_DIR"/logs/*.log; do
+        [[ -f "$log" ]] || continue
+        echo "--- aurox log tail: $log ---" >&2
+        tail -n 120 "$log" >&2
+    done
+}
+
 if ! AUROX="$AUROX" "$driver" >"$out" 2>&1; then
     echo "shell ctrl-c driver failed" >&2
     cat "$out" >&2
+    dump_shell_log
     exit 1
 fi
-grep -qF 'SHELL_CTRL_C_E2E_OK' "$out" || { echo "driver did not report success" >&2; cat "$out" >&2; exit 1; }
+grep -qF 'SHELL_CTRL_C_E2E_OK' "$out" || { echo "driver did not report success" >&2; cat "$out" >&2; dump_shell_log; exit 1; }
 
 # Nothing installed, and the interrupted build's sleeping child didn't
 # survive as an orphan (the SIGINT forward reached makepkg's process group).

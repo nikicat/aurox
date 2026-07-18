@@ -120,7 +120,10 @@ run_one() {
     local script="$1"
     local rel="${script#$REPO_ROOT/}"
     local slug="${rel//\//_}"
-    local out="$results_dir/$slug.out"
+    # `$$` differs per xargs-spawned bash, so listing the same test several
+    # times (a flake hunt) keeps one capture per instance instead of all of
+    # them clobbering a single `$slug.out`.
+    local out="$results_dir/$slug.$$.out"
 
     # Coverage args, built from scalar env vars exported below (bash arrays
     # don't survive the xargs/bash -c bounce).

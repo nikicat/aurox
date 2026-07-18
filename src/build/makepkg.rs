@@ -21,6 +21,7 @@ use crate::context;
 use crate::error::{Error, Result};
 use console::Term;
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::termios::{LocalFlags, tcgetattr};
 use nix::unistd::Pid;
 use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use signal_hook::consts::SIGINT;
@@ -91,13 +92,38 @@ pub fn run(cfg: &Config, worktree: &Path, extra_args: &[&str], fresh_log: bool) 
         .try_clone_reader()
         .map_err(|e| Error::Build(format!("pty reader: {e}")))?;
 
+    // The interrupt path's preconditions, recorded because issue #59's
+    // failing runs were undiagnosable without them: a terminal `^C` raises
+    // SIGINT only while stdin's ISIG is set — with ISIG off, ECHOCTL still
+    // paints a misleading `^C` on screen while the byte just sits in the
+    // input queue. One debug line per build makes the next captured failure
+    // self-explaining.
+    match tcgetattr(std::io::stdin()) {
+        Ok(t) => {
+            let l = t.local_flags;
+            debug!(
+                isig = l.contains(LocalFlags::ISIG),
+                icanon = l.contains(LocalFlags::ICANON),
+                echo = l.contains(LocalFlags::ECHO),
+                "terminal state at build start"
+            );
+        }
+        Err(e) => debug!(error = %e, "no stdin termios at build start"),
+    }
+
     // Catch SIGINT for the duration of this build. `Signals` installs an
     // async-signal-safe handler that suppresses the default action (which would
     // kill aurox) and feeds a blocking iterator instead — so a Ctrl+C mid-build
     // unwinds as `Error::Interrupted` and the no-arg loop bails back to the
-    // table rather than the whole program dying. Dropping `Signals` at the end
-    // of the function restores the previous disposition (RAII), so Ctrl+C on the
-    // picker/table still exits.
+    // table rather than the whole program dying. Dropping `Signals` only
+    // unregisters *this action*: signal-hook's process-wide handler stays
+    // installed for the life of the process (signal-hook-registry's
+    // `unregister` never restores the OS disposition, and its dispatcher
+    // chains to the pre-existing handler only when that was a custom one —
+    // SIG_DFL is skipped). So after the first build, a SIGINT arriving while
+    // no guard is live is *swallowed*, not fatal — every post-build Ctrl+C
+    // surface needs its own handling (the shell reads ^C as a byte in
+    // rustyline's raw mode; the `-S` path runs to completion and exits).
     let mut signals = Signals::new([SIGINT])?;
     let handle = signals.handle();
     let interrupted = AtomicBool::new(false);
@@ -108,12 +134,17 @@ pub fn run(cfg: &Config, worktree: &Path, extra_args: &[&str], fresh_log: bool) 
         // Watcher: blocks on the signal pipe (no polling). On Ctrl+C it notes
         // the interrupt and forwards SIGINT to makepkg's process group, then
         // loops back to block again; `handle.close()` below ends it once
-        // makepkg has exited.
+        // makepkg has exited. The debug lines complete issue #59's loss-point
+        // discrimination: a captured failure now shows whether the terminal
+        // could raise the signal (the build-start termios line), whether the
+        // watcher woke, and what the forward returned.
         s.spawn(|| {
-            for _ in &mut signals {
+            for sig in &mut signals {
                 interrupted.store(true, Ordering::SeqCst);
+                debug!(sig, "interrupt watcher woke; forwarding");
                 forward_sigint(pid);
             }
+            debug!("interrupt watcher closed");
         });
         let status = child
             .wait()
@@ -193,8 +224,11 @@ fn forward_sigint(pid: Option<u32>) {
         warn!("no makepkg pid to forward SIGINT to");
         return;
     };
-    if let Err(e) = killpg(Pid::from_raw(pid), Signal::SIGINT) {
-        warn!(error = %e, "failed to forward SIGINT to makepkg process group");
+    match killpg(Pid::from_raw(pid), Signal::SIGINT) {
+        Ok(()) => debug!(pgid = pid, "forwarded SIGINT to makepkg process group"),
+        Err(e) => {
+            warn!(error = %e, pgid = pid, "failed to forward SIGINT to makepkg process group");
+        }
     }
 }
 
