@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::mirror::{MirrorRepo, boxed_http_options};
+use crate::mirror::{MirrorRepo, boxed_http_options, cancel_on_sigint};
 use crate::ui::{GixProgress, Operation};
 use gix::ObjectId;
 use gix::bstr::ByteSlice;
@@ -14,7 +14,7 @@ use gix::remote::fetch::refs::update::{Mode, Outcome as UpdateOutcome};
 use gix::remote::fetch::{Status, refmap::Mapping};
 use gix::remote::{Direction, ref_map::Options as RefMapOptions};
 use indicatif::MultiProgress;
-use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, info_span, instrument};
 
@@ -41,9 +41,11 @@ pub fn incremental_fetch(
 ) -> Result<Vec<RefUpdate>> {
     let mut progress = GixProgress::with_multi(Operation::Fetch, mp.clone());
     let net_counter = progress.net_counter();
-    let interrupt = AtomicBool::new(false);
 
-    let outcome = {
+    // A Ctrl+C anywhere in the network phase below (handshake, negotiate,
+    // receive) unwinds as `Error::Interrupted` instead of killing aurox — the
+    // shell stays alive and returns to its prompt. See `cancel_on_sigint`.
+    let outcome = cancel_on_sigint(|interrupt| {
         let remote = mirror
             .repo
             .find_default_remote(Direction::Fetch)
@@ -56,6 +58,7 @@ pub fn incremental_fetch(
         connection.set_transport_options(boxed_http_options(
             cfg.mirror_idle_timeout_secs,
             net_counter,
+            Arc::clone(interrupt),
         ));
 
         let prepared = {
@@ -92,14 +95,14 @@ pub fn incremental_fetch(
         debug!("entering receive: build have-set, negotiate, fetch pack, update refs");
         let t_receive = Instant::now();
         let outcome = prepared
-            .receive(&mut progress, &interrupt)
+            .receive(&mut progress, interrupt)
             .map_err(|e| Error::gix("receive", e))?;
         debug!(
             elapsed_ms = u64::try_from(t_receive.elapsed().as_millis()).unwrap_or(u64::MAX),
             "receive returned (pack written, refs negotiated)"
         );
-        outcome
-    };
+        Ok(outcome)
+    })?;
 
     progress.finish();
 

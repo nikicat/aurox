@@ -163,6 +163,13 @@ but the diff *view* above needs no such determinism.
    seeds the outdated installs and strips core/extra from pacman.conf, so
    "all pending updates" truthfully is the two fixtures. Mixed repo + AUR
    change set, real 📥 total, two elevation gates (`-Syu` lane, then `-U`).
+5. **ctrlc-refresh**: shell `refresh` against a mirror that hangs mid-fetch,
+   interrupted with `^C` — the fetch bails back to a live prompt instead of
+   taking aurox down. The driver (`demo_ctrlc_refresh`, shared with
+   extended/37) repoints the bootstrapped mirror at `examples/hung_mirror.rs`
+   (answers the HTTP headers then stalls); the prompt-then-`quit` afterward is
+   the proof the shell survived. Exercises the gix `should_interrupt` transport
+   patch that aborts a fetch parked on a silent socket.
 
 Possible later: `-R` removal preflight; the three-way first-launch consent;
 initial mirror clone (time-compressed cast) and incremental `-Sy` refresh —

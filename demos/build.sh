@@ -24,7 +24,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # name → examples/demo_<name//-/_>.rs; a demos/seed-<name>.sh, if present, is
 # sourced in the record container before the driver (outdated installs etc.).
-ALL_DEMOS=(search-install cli-install repo-install upgrade)
+ALL_DEMOS=(search-install cli-install repo-install upgrade ctrlc-refresh)
 
 demos=("$@")
 [[ ${#demos[@]} -gt 0 ]] || demos=("${ALL_DEMOS[@]}")
