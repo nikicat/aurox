@@ -21,16 +21,18 @@ use crate::context;
 use crate::error::{Error, Result};
 use console::Term;
 use nix::sys::signal::{Signal, killpg};
+use nix::sys::termios::{LocalFlags, tcgetattr};
 use nix::unistd::Pid;
-use portable_pty::{CommandBuilder, ExitStatus, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, ExitStatus, PtySize, native_pty_system};
 use signal_hook::consts::SIGINT;
 use signal_hook::iterator::Signals;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, mpsc};
+use std::time::Duration;
 use tracing::{debug, info, instrument, warn};
 
 /// Run `makepkg` in `worktree` with the configured args + env, plus any
@@ -42,24 +44,121 @@ use tracing::{debug, info, instrument, warn};
 /// (`build::filter_by_selection`) decides which of the resulting
 /// `.pkg.tar.zst` files end up in the `pacman -U` transaction.
 ///
-/// `fresh_log` truncates `build.log` (the first makepkg pass of a run);
-/// passing `false` appends, so a multi-pass sequence (VCS `--nobuild` then
-/// `--noextract`) lands in a single contiguous log.
-///
 /// Returns the path to the captured `build.log` on success; on failure the
 /// same path is embedded in the [`Error::Build`] message.
 #[instrument(skip(cfg))]
-pub fn run(cfg: &Config, worktree: &Path, extra_args: &[&str], fresh_log: bool) -> Result<PathBuf> {
+pub fn run(
+    cfg: &Config,
+    worktree: &Path,
+    extra_args: &[&str],
+    log_mode: LogMode,
+) -> Result<PathBuf> {
     let log_path = worktree.join("build.log");
-    let log_file = if fresh_log {
-        File::create(&log_path)?
-    } else {
-        OpenOptions::new()
+    let log_file = open_log(&log_path, log_mode)?;
+    let SpawnedBuild {
+        mut child,
+        reader,
+        group,
+    } = spawn_under_pty(cfg, worktree, extra_args, &log_path)?;
+    trace_terminal_state();
+
+    // Catch SIGINT for the duration of this build. `Signals` installs an
+    // async-signal-safe handler that suppresses the default action (which would
+    // kill aurox) and feeds a blocking iterator instead — so a Ctrl+C mid-build
+    // unwinds as `Error::Interrupted` and the no-arg loop bails back to the
+    // table rather than the whole program dying. Dropping `Signals` only
+    // unregisters *this action*: signal-hook's process-wide handler stays
+    // installed for the life of the process (signal-hook-registry's
+    // `unregister` never restores the OS disposition, and its dispatcher
+    // chains to the pre-existing handler only when that was a custom one —
+    // SIG_DFL is skipped). So after the first build, a SIGINT arriving while
+    // no guard is live is *swallowed*, not fatal — every post-build Ctrl+C
+    // surface needs its own handling (the shell reads ^C as a byte in
+    // rustyline's raw mode; the `-S` path runs to completion and exits).
+    let mut signals = Signals::new([SIGINT])?;
+    let handle = signals.handle();
+    let interrupted = AtomicBool::new(false);
+    // Closed (by dropping the sender) the moment `child.wait()` returns —
+    // [`forward_until_exit`]'s verify loop blocks on it, not on a poll.
+    let (exited_tx, exited_rx) = mpsc::channel::<()>();
+
+    let log = Mutex::new(log_file);
+    let status = context::scope(|s| -> Result<ExitStatus> {
+        s.spawn(|| tee(reader, std::io::stdout(), &log));
+        // `exited_rx` is `!Sync`, so the watcher takes it by move; the
+        // signals iterator and flag ride along as pre-made borrows.
+        let signals_iter = &mut signals;
+        let interrupted_ref = &interrupted;
+        s.spawn(move || forward_until_exit(signals_iter, interrupted_ref, exited_rx, group));
+        // No `?` before the drop: the sender must fall (unblocking the
+        // watcher's verify loop) and the handle must close on the error path
+        // too, or the scope's join would hang on a live watcher.
+        let status = child
+            .wait()
+            .map_err(|e| Error::Build(format!("wait makepkg: {e}")));
+        drop(exited_tx);
+        handle.close();
+        status
+    });
+    let status = status?;
+
+    if interrupted.load(Ordering::SeqCst) {
+        warn!(log = %log_path.display(), "makepkg interrupted by SIGINT");
+        return Err(Error::Interrupted);
+    }
+    if !status.success() {
+        let code = status.exit_code();
+        return Err(Error::Build(format!(
+            "makepkg exited with status {code} (log: {})",
+            log_path.display(),
+        )));
+    }
+    info!(log = %log_path.display(), "makepkg succeeded");
+    Ok(log_path)
+}
+
+/// How a makepkg pass treats the worktree's `build.log` — named so a call
+/// site reads as intent, not as an opaque bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMode {
+    /// Truncate: this is the run's first makepkg pass.
+    Fresh,
+    /// Append: a later pass of the same run (the VCS `--nobuild` then
+    /// `--noextract` sequence), so a multi-pass build lands in one
+    /// contiguous log.
+    Append,
+}
+
+/// Open `build.log` in the worktree per [`LogMode`].
+fn open_log(log_path: &Path, log_mode: LogMode) -> Result<File> {
+    Ok(match log_mode {
+        LogMode::Fresh => File::create(log_path)?,
+        LogMode::Append => OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&log_path)?
-    };
+            .open(log_path)?,
+    })
+}
 
+/// A makepkg child freshly spawned under its own pty — the handles [`run`]
+/// needs: the child to wait on, the master-side reader the tee pumps, and
+/// the process group the interrupt watcher forwards to.
+struct SpawnedBuild {
+    child: Box<dyn Child + Send + Sync>,
+    reader: Box<dyn Read + Send>,
+    group: BuildGroup,
+}
+
+/// Open the pty, assemble the makepkg command (worktree-pinned build dirs,
+/// configured + extra args), and spawn. The slave side is dropped here so
+/// master reads see EOF the instant the child (the only other holder of the
+/// slave fds) exits.
+fn spawn_under_pty(
+    cfg: &Config,
+    worktree: &Path,
+    extra_args: &[&str],
+    log_path: &Path,
+) -> Result<SpawnedBuild> {
     let pty = native_pty_system()
         .openpty(pty_size())
         .map_err(|e| Error::Build(format!("openpty: {e}")))?;
@@ -77,65 +176,89 @@ pub fn run(cfg: &Config, worktree: &Path, extra_args: &[&str], fresh_log: bool) 
     }
     debug!(args = ?cfg.makepkg_args, extra = ?extra_args, cwd = %worktree.display(), log = %log_path.display(), "spawning makepkg under pty");
 
-    let mut child = pty
+    let child = pty
         .slave
         .spawn_command(cmd)
         .map_err(|e| Error::Build(format!("spawn makepkg: {e}")))?;
-    // Drop our slave handle so master reads see EOF the instant the child
-    // (the only other holder of the slave fds) exits.
     drop(pty.slave);
-    let pid = child.process_id();
-
+    let group = BuildGroup::new(child.process_id());
     let reader = pty
         .master
         .try_clone_reader()
         .map_err(|e| Error::Build(format!("pty reader: {e}")))?;
+    Ok(SpawnedBuild {
+        child,
+        reader,
+        group,
+    })
+}
 
-    // Catch SIGINT for the duration of this build. `Signals` installs an
-    // async-signal-safe handler that suppresses the default action (which would
-    // kill aurox) and feeds a blocking iterator instead — so a Ctrl+C mid-build
-    // unwinds as `Error::Interrupted` and the no-arg loop bails back to the
-    // table rather than the whole program dying. Dropping `Signals` at the end
-    // of the function restores the previous disposition (RAII), so Ctrl+C on the
-    // picker/table still exits.
-    let mut signals = Signals::new([SIGINT])?;
-    let handle = signals.handle();
-    let interrupted = AtomicBool::new(false);
-
-    let log = Mutex::new(log_file);
-    let status = context::scope(|s| -> Result<ExitStatus> {
-        s.spawn(|| tee(reader, std::io::stdout(), &log));
-        // Watcher: blocks on the signal pipe (no polling). On Ctrl+C it notes
-        // the interrupt and forwards SIGINT to makepkg's process group, then
-        // loops back to block again; `handle.close()` below ends it once
-        // makepkg has exited.
-        s.spawn(|| {
-            for _ in &mut signals {
-                interrupted.store(true, Ordering::SeqCst);
-                forward_sigint(pid);
-            }
-        });
-        let status = child
-            .wait()
-            .map_err(|e| Error::Build(format!("wait makepkg: {e}")))?;
-        handle.close();
-        Ok(status)
-    });
-    let status = status?;
-
-    if interrupted.load(Ordering::SeqCst) {
-        warn!(log = %log_path.display(), "makepkg interrupted by SIGINT");
-        return Err(Error::Interrupted);
+/// The interrupt path's preconditions, recorded because issue #59's failing
+/// runs were undiagnosable without them: a terminal `^C` raises SIGINT only
+/// while stdin's ISIG is set — with ISIG off, ECHOCTL still paints a
+/// misleading `^C` on screen while the byte just sits in the input queue.
+/// One debug line per build makes a captured failure self-explaining.
+fn trace_terminal_state() {
+    match tcgetattr(std::io::stdin()) {
+        Ok(t) => {
+            let l = t.local_flags;
+            debug!(
+                isig = l.contains(LocalFlags::ISIG),
+                icanon = l.contains(LocalFlags::ICANON),
+                echo = l.contains(LocalFlags::ECHO),
+                "terminal state at build start"
+            );
+        }
+        Err(e) => debug!(error = %e, "no stdin termios at build start"),
     }
-    if !status.success() {
-        let code = status.exit_code();
-        return Err(Error::Build(format!(
-            "makepkg exited with status {code} (log: {})",
-            log_path.display(),
-        )));
+}
+
+/// The interrupt watcher: block on the signal pipe (no polling); on Ctrl+C
+/// note the interrupt and forward SIGINT to makepkg's process group — then
+/// *verify delivery*. A group-directed SIGINT can be consumed with no
+/// effect when it lands inside the fork→exec window of a child that
+/// makepkg (bash, INT-trapped) is just spawning: the pre-exec child holds
+/// the parent's trap disposition, whose handler flag `execve` then
+/// discards, so e.g. `sleep` starts unsignalled and bash defers its trap
+/// until that child exits — never. Proven by
+/// `examples/sigint_forward_stress --trap` (~5% of rounds hang on an idle
+/// host; `--verified`, this exact loop, 0/1000); issue #59's captured
+/// failure showed one successful killpg with a live build 20 s later.
+/// Re-forwarding until makepkg actually exits (`exited`'s sender drops)
+/// turns a swallowed forward into a one-beat delay; the group is already
+/// condemned, so repeats are harmless.
+///
+/// A single blocking take: the first Ctrl+C is handled to completion, so
+/// there is never a second pass — further Ctrl+Cs would only re-signal an
+/// already-condemned group. The caller ends a signal-less watch via
+/// [`signal_hook::iterator::Handle::close`], and must drop `exited`'s
+/// sender once the child is reaped — on error paths too — or the scope's
+/// join would hang on the verify loop.
+// The receiver is deliberately owned: `mpsc::Receiver` is `!Sync`, so the
+// spawned watcher thread cannot borrow it from the spawning scope.
+#[expect(clippy::needless_pass_by_value)]
+fn forward_until_exit(
+    signals: &mut Signals,
+    interrupted: &AtomicBool,
+    exited: mpsc::Receiver<()>,
+    group: BuildGroup,
+) {
+    if let Some(sig) = signals.forever().next() {
+        interrupted.store(true, Ordering::SeqCst);
+        debug!(sig, "interrupt watcher woke; forwarding");
+        group.forward_sigint();
+        // Each timeout means the build is still alive past the grace window
+        // — the forward was eaten by the fork-window race, so do it again.
+        // Anything else is the sender dropping: `child.wait()` returned,
+        // delivery verified.
+        while exited.recv_timeout(Duration::from_millis(300))
+            == Err(mpsc::RecvTimeoutError::Timeout)
+        {
+            debug!("build alive after SIGINT forward; re-forwarding");
+            group.forward_sigint();
+        }
     }
-    info!(log = %log_path.display(), "makepkg succeeded");
-    Ok(log_path)
+    debug!("interrupt watcher closed");
 }
 
 /// Resolve the exact package filenames `makepkg` will produce in `worktree`,
@@ -185,16 +308,40 @@ fn parse_package_list(stdout: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Forward SIGINT to makepkg's whole process group so its build children
-/// (make, cc, …) stop too, not just makepkg itself. makepkg runs under the pty
-/// in its own session (`setsid`), so its pgid equals its pid.
-fn forward_sigint(pid: Option<u32>) {
-    let Some(pid) = pid.and_then(|p| i32::try_from(p).ok()) else {
-        warn!("no makepkg pid to forward SIGINT to");
-        return;
-    };
-    if let Err(e) = killpg(Pid::from_raw(pid), Signal::SIGINT) {
-        warn!(error = %e, "failed to forward SIGINT to makepkg process group");
+/// The interrupt-forward target: makepkg's process group. portable-pty
+/// `setsid`s the child, so its pid *is* its pgid — that fact and the raw-pid
+/// conversion are captured once here at spawn, instead of an `Option<u32>`
+/// caravan re-deriving them at every forward site. Empty when the backend
+/// reported no pid (a forward then warns instead of guessing).
+#[derive(Debug, Clone, Copy)]
+struct BuildGroup(Option<Pid>);
+
+impl BuildGroup {
+    /// From portable-pty's `process_id` answer.
+    fn new(pid: Option<u32>) -> Self {
+        Self(pid.and_then(|p| i32::try_from(p).ok()).map(Pid::from_raw))
+    }
+
+    /// Forward SIGINT to the whole group so makepkg's build children (make,
+    /// cc, …) stop too, not just makepkg itself. Failures are warnings — a
+    /// lost forward must never turn an interrupt into a crash (and the
+    /// verify loop retries it anyway).
+    fn forward_sigint(self) {
+        let Some(pgid) = self.0 else {
+            warn!("no makepkg pid to forward SIGINT to");
+            return;
+        };
+        match killpg(pgid, Signal::SIGINT) {
+            Ok(()) => {
+                debug!(
+                    pgid = pgid.as_raw(),
+                    "forwarded SIGINT to makepkg process group"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, pgid = pgid.as_raw(), "failed to forward SIGINT to makepkg process group");
+            }
+        }
     }
 }
 

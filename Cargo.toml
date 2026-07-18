@@ -169,8 +169,11 @@ signal-hook = "0.3"
 
 # `nix::sys::signal::killpg` forwards the interrupt to the makepkg process group
 # (its own session under the pty). `resource` is also used by the rusage
-# integration test, so both features live on this one entry.
-nix = { version = "0.31", features = ["resource", "signal"] }
+# integration test; `process` gives the sigint_forward_stress repro example
+# `setpgid`/`getpgrp` so its group-directed SIGINT can't leak to the invoker;
+# `term` reads stdin's termios for the build-start interrupt-precondition
+# trace (issue #59 — `^C` only raises SIGINT while ISIG is set).
+nix = { version = "0.31", features = ["process", "resource", "signal", "term"] }
 
 # Per-pkgbase build-time store backing the change-set preview's build-time
 # column. `bundled` vendors SQLite so the dep doesn't reach for a system libsqlite
