@@ -2,17 +2,13 @@
 
 ## Shell
 
-- Ctrl-C during *any* long-running shell operation should bail out to the
-  prompt, never stop aurox. Builds already behave (extended/31 pins the
-  apply-build ^C, extended/02 the `-S` forward-to-makepkg half); the
-  repo/AUR *refresh* does not — ^C mid-fetch currently takes the whole
-  shell down.
 - `upgrade` runs the AUR refresh unconditionally whenever the AUR is
   enabled in config: there is no way to upgrade just pacman packages
   without sitting through the AUR fetch first — bad UX on a slow-mirror
-  day. The repo half should be reachable without (or before) the AUR half;
-  with the item above, ^C during the refresh could also degrade that
-  upgrade to repo-only instead of aborting it.
+  day. The repo half should be reachable without (or before) the AUR half.
+  (A ^C mid-refresh now aborts cleanly back to the prompt — see the Done
+  note below — so one option is to let it degrade the upgrade to repo-only
+  rather than abandoning it entirely.)
 - search results should be colored — the shell's numbered list renders as a
   dim monochrome table (`src/ui/search_table.rs`) while `-Ss` styles
   repo/name/version. Whatever palette lands, the installed flag must stay
@@ -52,6 +48,13 @@
   session-only today)
 
 <!-- Done:
+- Ctrl-C during a shell repo/AUR *refresh* now bails back to the prompt instead
+  of taking aurox down: `mirror::cancel_on_sigint` wraps the gix fetch/clone in
+  a SIGINT guard (the build path's `signal_hook` pattern), and a new
+  gix-transport `http::Options::should_interrupt` lets the curl backend abort a
+  fetch parked on an idle/slow socket that the cooperative check can't reach.
+  Demoed by examples/demo_ctrlc_refresh.rs against examples/hung_mirror.rs (a
+  server that answers headers then stalls); pinned by extended/37.
 - show time since last commit for AUR packages: the transaction table renders
   a dimmed `(Xd ago)` age cell per AUR row (from the pkgbase's branch-tip
   commit time), and search ranks AUR ties freshest-first.
