@@ -93,7 +93,9 @@ These were settled before the design was finalized:
   badged — no shuffling to the top or bottom.
 - **A session-only `reviewed` flag** records PKGBUILDs the user inspected and
   approved this session; reviewed packages are not prompted for review again.
-  Not persisted to disk.
+  (Since then: consented approvals also persist across sessions in
+  `reviews.db`, keyed by the exact PKGBUILD commit — see
+  `src/build/reviews.rs`; the session set remains the in-run fast path.)
 - **Phasing:** the loop is the core feature; cost metrics are auxiliary. Size
   comes first (free, from the DBs); build time follows (needs the store).
 
@@ -277,7 +279,9 @@ Review already happens today: phase 1 of `run_aur_pipeline` calls
 (`prompt` / `skip` / `always-show`). The session adds a `reviewed` set so the
 user approves a given PKGBUILD at most once per session:
 
-- `session.reviewed: HashSet<PkgBase>` — session-only, never written to disk.
+- `session.reviewed: HashSet<PkgBase>` — session-only. (Prompt-won approvals
+  additionally persist to `reviews.db` keyed by the mirror commit, so an
+  identical PKGBUILD isn't re-reviewed next session — `src/build/reviews.rs`.)
 - Before prompting, `prepare_one` checks the set; a hit is auto-`Approved`
   with no prompt. A genuine review that ends in approval inserts the pkgbase.
 - Within a session the mirror is fixed (no re-fetch), so a pkgbase maps to one

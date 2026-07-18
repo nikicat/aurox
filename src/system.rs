@@ -32,6 +32,9 @@ pub enum StateKind {
     Traces,
     /// Cross-session build-time metrics (`metrics.db`) — not re-derivable.
     Metrics,
+    /// Cross-session PKGBUILD review approvals (`reviews.db`) — not
+    /// re-derivable (recorded user consent).
+    Reviews,
     /// Shell command history (`shell_history`) — not re-derivable.
     History,
 }
@@ -45,6 +48,7 @@ pub const ALL_KINDS: &[StateKind] = &[
     StateKind::Logs,
     StateKind::Traces,
     StateKind::Metrics,
+    StateKind::Reviews,
     StateKind::History,
 ];
 
@@ -59,6 +63,7 @@ impl StateKind {
             Self::Logs => "logs",
             Self::Traces => "traces",
             Self::Metrics => "metrics",
+            Self::Reviews => "reviews",
             Self::History => "history",
         }
     }
@@ -73,6 +78,7 @@ impl StateKind {
             Self::Logs => "run logs (rotated)",
             Self::Traces => "run traces (rotated)",
             Self::Metrics => "build-time history",
+            Self::Reviews => "PKGBUILD review approvals",
             Self::History => "shell command history",
         }
     }
@@ -99,6 +105,7 @@ impl StateKind {
             Self::Logs => vec![paths::logs_dir()],
             Self::Traces => vec![paths::traces_dir()],
             Self::Metrics => vec![paths::metrics_db_path()],
+            Self::Reviews => vec![paths::reviews_db_path()],
             Self::History => vec![paths::shell_history_path()],
         }
     }
@@ -255,6 +262,7 @@ mod tests {
         fs::write(root.join("logs/aurox-1.log"), [0u8; 10]).unwrap();
         fs::write(root.join("traces/aurox-1.json"), [0u8; 20]).unwrap();
         fs::write(root.join("metrics.db"), [0u8; 30]).unwrap();
+        fs::write(root.join("reviews.db"), [0u8; 25]).unwrap();
         fs::write(root.join("shell_history"), [0u8; 40]).unwrap();
 
         // The stand-in system localdb, outside the state root.
@@ -296,6 +304,7 @@ mod tests {
         );
         assert_eq!(size_of(&report, StateKind::Builds), 50);
         assert_eq!(size_of(&report, StateKind::Metrics), 30);
+        assert_eq!(size_of(&report, StateKind::Reviews), 25);
         assert_eq!(size_of(&report, StateKind::History), 40);
         assert_eq!(
             report.prunable_total().bytes(),
@@ -324,7 +333,13 @@ mod tests {
             assert!(!root.join(gone).exists(), "{gone} should be pruned");
         }
         // …observational data + diagnostics kept…
-        for kept in ["metrics.db", "shell_history", "logs", "traces"] {
+        for kept in [
+            "metrics.db",
+            "reviews.db",
+            "shell_history",
+            "logs",
+            "traces",
+        ] {
             assert!(root.join(kept).exists(), "{kept} should survive a prune");
         }
         // …the symlink target untouched, and the skeleton recreated for the

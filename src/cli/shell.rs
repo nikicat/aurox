@@ -198,6 +198,16 @@ pub trait ShellEnv {
     /// The pkgbase a staged AUR target resolves to, for the reviewed set fed
     /// into the build pipeline. `None` when it isn't a known AUR package.
     fn pkgbase_of(&self, target: &PkgTarget) -> Option<PkgBase>;
+    /// Whether a persistent review approval (a prior session's consent) covers
+    /// `target` at the PKGBUILD commit the index currently points at — the
+    /// staging-time consult that lets an already-reviewed version stage
+    /// pre-approved. `false` for unknown/non-AUR targets and when the store
+    /// can't answer.
+    fn previously_approved(&self, target: &PkgTarget) -> bool;
+    /// Persist `target`'s approval at the index's current PKGBUILD commit —
+    /// the durable half of the reviewed set. Infallible at this seam: the env
+    /// degrades a store failure to a warning (one future re-prompt at worst).
+    fn record_approval(&mut self, target: &PkgTarget);
     /// Run the PKGBUILD review (diff-or-full) for one staged AUR target.
     fn review(&mut self, target: &PkgTarget) -> Result<ReviewOutcome>;
     /// Render the staged transaction table — the numbered install rows + the

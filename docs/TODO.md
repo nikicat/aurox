@@ -47,11 +47,14 @@
 ## AUR
 
 - account for already downloaded sources when printing download sizes in tables
-- save review approvals for concrete versions persistently (the shell's
-  reviewed set — including mid-apply approvals since `ApplyRun` — is
-  session-only today)
 
 <!-- Done:
+- save review approvals for concrete versions persistently: consented
+  approvals (diff answered at the prompt, explicit `approve`) land in
+  `reviews.db` keyed by (pkgbase, PKGBUILD commit) — src/build/reviews.rs.
+  The pipeline skips re-review at the same commit; the shell stages
+  previously-approved versions pre-approved. `--noconfirm` and the unseen
+  tail of an "approve all" never persist.
 - show time since last commit for AUR packages: the transaction table renders
   a dimmed `(Xd ago)` age cell per AUR row (from the pkgbase's branch-tip
   commit time), and search ranks AUR ties freshest-first.

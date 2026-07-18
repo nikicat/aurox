@@ -8,6 +8,7 @@ use super::cart::{
 };
 use super::upgrade;
 use super::{ListItem, ShellEnv, State};
+use crate::build::reviews::ReviewStore;
 use crate::build::{self, ConfirmGate, DevelPolicy, InstallOpts, review};
 use crate::cli::dispatch;
 use crate::cli::search::{Row, rank_rows};
@@ -298,6 +299,43 @@ impl ShellEnv for RealEnv<'_> {
 
     fn pkgbase_of(&self, target: &PkgTarget) -> Option<PkgBase> {
         self.aur_data.entry(target).map(|e| e.pkgbase.clone())
+    }
+
+    fn previously_approved(&self, target: &PkgTarget) -> bool {
+        let Some(entry) = self.aur_data.entry(target) else {
+            return false;
+        };
+        // The index entry carries the mirror commit it was built from — the
+        // same identity `prepare_one` gates on — so no mirror open is needed.
+        // Any store trouble is a miss: the worst case is one extra review.
+        match ReviewStore::open(&paths::reviews_db_path()) {
+            Ok(store) => store
+                .approved(&entry.pkgbase, &gix::ObjectId::from(entry.commit_oid))
+                .unwrap_or_else(|e| {
+                    debug!(pkgbase = %entry.pkgbase, error = %e, "review store read failed");
+                    false
+                }),
+            Err(e) => {
+                debug!(error = %e, "review store unavailable");
+                false
+            }
+        }
+    }
+
+    fn record_approval(&mut self, target: &PkgTarget) {
+        let Some(entry) = self.aur_data.entry(target) else {
+            return;
+        };
+        let saved = ReviewStore::open(&paths::reviews_db_path()).and_then(|store| {
+            store.record_approval(
+                &entry.pkgbase,
+                &gix::ObjectId::from(entry.commit_oid),
+                &entry.version(),
+            )
+        });
+        if let Err(e) = saved {
+            ui::warn(&format!("could not save review approval: {e}"));
+        }
     }
 
     fn review(&mut self, target: &PkgTarget) -> Result<ReviewOutcome> {

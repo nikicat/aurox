@@ -71,7 +71,8 @@ src/
 │   ├── review.rs       PKGBUILD diff review prompt
 │   ├── print.rs        review-table + install-summary rendering
 │   ├── upgrade.rs      collect_upgrade_plan: foreign-localdb × AUR index walk
-│   └── metrics.rs      per-pkgbase build-duration history (rusqlite, metrics.db)
+│   ├── metrics.rs      per-pkgbase build-duration history (rusqlite, metrics.db)
+│   └── reviews.rs      cross-session review approvals keyed by PKGBUILD commit (rusqlite, reviews.db)
 │
 ├── pacman.rs        interop with system pacman (passthrough exec, alpm DB reads)
 ├── pacman/
@@ -679,10 +680,18 @@ from on-disk artifacts rather than a stored `last_built_commit` follows
 the "minimize persisted state" rule: nothing is recorded that the
 artifacts themselves don't already say.
 
-The one thing that genuinely *can't* be derived from a pacman DB or an
-artifact — per-pkgbase **build duration** — is the sole persisted build
-metric, in `metrics.db` (`src/build/metrics.rs`, `rusqlite`). It is a
-cost-visibility hint for the change-set preview, never a gate on what gets built.
+Two things genuinely *can't* be derived from a pacman DB or an artifact
+and are therefore persisted. Per-pkgbase **build duration** lives in
+`metrics.db` (`src/build/metrics.rs`, `rusqlite`) — a cost-visibility
+hint for the change-set preview, never a gate on what gets built. The
+user's **review approvals** live in `reviews.db`
+(`src/build/reviews.rs`), keyed by `(pkgbase, mirror commit)` so an
+approval covers exactly the PKGBUILD content that was on screen: any new
+AUR push — even one that keeps the same `pkgver` — re-prompts, while
+re-encountering the identical commit never does. Only decisions made at
+a decision point are recorded (a diff answered at the prompt, an
+explicit `approve`); `--noconfirm` runs and the unseen tail of an
+"approve all" are not.
 
 ### Why gix instead of libgit2 / shelling out to `git`?
 
@@ -747,6 +756,7 @@ to plumb it through both.
 | `~/.local/state/aurox/index.bin`             | `index::save`    | rkyv-archived `IndexFile`             |
 | `~/.local/state/aurox/pkgs/<pkgbase>/`       | linked worktrees | per-pkgbase build dir (+ cached `.pkg.tar.*` — the build cache key) |
 | `~/.local/state/aurox/metrics.db`            | rusqlite         | per-pkgbase build duration (cost hint only) |
+| `~/.local/state/aurox/reviews.db`            | rusqlite         | review approvals per (pkgbase, PKGBUILD commit) |
 | `~/.local/state/aurox/logs/`                 | logging          | last 10 invocation logs               |
 | `~/.local/state/aurox/traces/`               | logging          | per-run Chrome/Perfetto span traces   |
 | `~/.config/aurox/config.toml`                | user             | overrides for `config::defaults`      |

@@ -103,6 +103,15 @@ pub fn metrics_db_path() -> PathBuf {
     state_dir().join("metrics.db")
 }
 
+/// `SQLite` store for cross-session PKGBUILD review approvals — see
+/// [`crate::build::reviews`].
+///
+/// Observational consent data (which PKGBUILD commits the user approved), so
+/// like `metrics.db` it is never pruned — nothing can reconstruct it.
+pub fn reviews_db_path() -> PathBuf {
+    state_dir().join("reviews.db")
+}
+
 /// Persistent command history for the interactive shell (`aurox` REPL).
 ///
 /// Lives under the state dir alongside logs/traces so it follows the same
