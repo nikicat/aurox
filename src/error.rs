@@ -67,9 +67,12 @@ pub enum Error {
     #[error("user aborted")]
     UserAbort,
 
-    /// A makepkg build was interrupted by SIGINT (Ctrl+C). Caught by the build
-    /// pipeline and turned into a per-pkgbase "interrupted" outcome rather than
-    /// aborting the whole run — the no-arg loop bails back to the table.
+    /// An operation was interrupted by SIGINT (Ctrl+C). Raised in two places,
+    /// both so an interrupt bails the *operation* rather than killing aurox: a
+    /// makepkg build (caught by the build pipeline as a per-pkgbase "interrupted"
+    /// outcome — the no-arg loop bails back to the table) and a mirror
+    /// fetch/clone (caught by `mirror::cancel_on_sigint` — the shell's
+    /// refresh/upgrade dispatchers return to the prompt).
     #[error("interrupted")]
     Interrupted,
 
