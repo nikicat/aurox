@@ -171,6 +171,15 @@ but the diff *view* above needs no such determinism.
    the proof the shell survived. Exercises the gix `should_interrupt` transport
    patch that aborts a fetch parked on a silent socket.
 
+**Adding a demo** is a one-file edit: a row in `demos/demos.json` — the sole
+registry, `[[name, title], …]` — plus its `examples/demo_<name>.rs` driver.
+`demos/build.sh`, the Screencasts check-run gallery, and the media-repo player
+dropdowns (compare/diff) all derive from that registry — the last two via the
+per-dir `manifest.json` the workflow publishes from it — so no list is kept in
+sync by hand. `tests/demos_registry.rs` fails if a driver and a registry row
+ever disagree, so a forgotten entry surfaces at `cargo test`, not in a silently
+short dropdown.
+
 Possible later: `-R` removal preflight; the three-way first-launch consent;
 initial mirror clone (time-compressed cast) and incremental `-Sy` refresh —
 see docs/TODO.md "Demos".
