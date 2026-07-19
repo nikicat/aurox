@@ -3,7 +3,7 @@
 use crate::cli::shell::cart::AurApproval;
 use crate::error::Result;
 use crate::paths;
-use crate::ui::{AgeThresholds, ColorMode};
+use crate::ui::{AgeThresholds, ColorMode, SearchLayout};
 use optfield::optfield;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -134,6 +134,12 @@ pub struct Config {
     /// See [`AgeConfig`]; resolved into [`crate::ui::AgeThresholds`] by
     /// [`Self::age_thresholds`].
     pub ages: AgeConfig,
+    /// How the interactive/pipe search list lays out each row: `auto` (default,
+    /// width-adaptive — dense single-line when a row fits the terminal, roomy
+    /// two-line when it would wrap), `single`, or `double`. `-Ss` stays two-line
+    /// for pacman parity regardless. A typed enum, not a string (unlike the
+    /// legacy [`Self::color`]); see [`crate::ui::SearchLayout`].
+    pub search_layout: SearchLayout,
 }
 
 impl Default for Config {
@@ -289,6 +295,25 @@ mod tests {
             .expect("`banner = false` parses")
             .resolve();
         assert!(!cfg.banner);
+    }
+
+    /// The `search_layout` knob defaults to `Auto` (existing configs say nothing
+    /// about it), parses the typed spellings, and stays unset in the file when
+    /// unspecified (sparse persistence).
+    #[test]
+    fn search_layout_defaults_auto_and_parses() {
+        let cfg = toml::from_str::<ConfigFile>("")
+            .expect("empty config parses")
+            .resolve();
+        assert_eq!(cfg.search_layout, SearchLayout::Auto);
+        let cfg = toml::from_str::<ConfigFile>("search_layout = \"double\"")
+            .expect("`search_layout` parses")
+            .resolve();
+        assert_eq!(cfg.search_layout, SearchLayout::Double);
+
+        // Unset → does not materialize into the file on a round-trip.
+        let file = toml::from_str::<ConfigFile>("").unwrap();
+        assert!(!toml::to_string(&file).unwrap().contains("search_layout"));
     }
 
     /// The `[ages]` section is sparse: an absent section leaves every band at its

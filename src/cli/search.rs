@@ -3,11 +3,11 @@
 //! Two non-interactive surfaces live here, both wired up from
 //! [`crate::cli::dispatch`]: [`cmd_search`] is `-Ss` (pacman's
 //! `repo/name version` output), and [`cmd_search_install`] is the bare
-//! `aurox <term>...` shortcut in a pipe (the aligned [`ui::search_table`]).
+//! `aurox <term>...` shortcut in a pipe (the [`ui::SearchList`] renderer).
 //! Interactively the bare shortcut launches the shell REPL seeded with the
 //! search instead (see [`crate::cli::shell`]) — there is no picker; the REPL
 //! is the one interactive surface. The [`Row`] model, ranking, and the
-//! [`ui::search_table`] renderer are shared with the shell so every surface
+//! [`ui::SearchList`] renderer are shared with the shell so every surface
 //! ranks and renders matches identically.
 
 use crate::config::Config;
@@ -133,11 +133,11 @@ fn gather(cfg: &Config, terms: &[SearchTerm]) -> Result<(Vec<RepoHit>, AurIndexD
     Ok((repo_res?, aur_res?))
 }
 
-/// Merge repo and AUR hits into one relevance-ranked list (unlike yay's fixed
-/// "repos on top", [`rank_rows`] interleaves both sources by match quality),
-/// ordered best-**last** so the strongest hit lands nearest the prompt — the
-/// same bottom-up convention as the shell's numbered list.
-fn merged_rows<'a>(
+/// Merge repo and AUR hits into one relevance-ranked list, best match **first**
+/// (unlike yay's fixed "repos on top", [`rank_rows`] interleaves both sources by
+/// match quality). The shared order every search surface renders from — the
+/// [`ui::SearchList`] renderer flips it to best-last (bottom-up) for the display.
+fn ranked_best_first<'a>(
     repo_hits: Vec<RepoHit>,
     aur_hits: Vec<&'a IndexEntry>,
     regexes: &[regex::Regex],
@@ -147,9 +147,22 @@ fn merged_rows<'a>(
         .map(Row::Repo)
         .chain(aur_hits.into_iter().map(Row::Aur))
         .collect();
-    let mut ranked = rank_rows(rows, regexes);
-    ranked.reverse();
+    let ranked = rank_rows(rows, regexes);
     info!(rows = ranked.len(), "search results");
+    ranked
+}
+
+/// [`ranked_best_first`] reversed to best-**last** — the `-Ss` print order,
+/// where the renderer emits rows top-down so the strongest hit lands nearest
+/// the prompt. (The [`ui::SearchList`] surfaces reverse internally instead, so
+/// they take the best-first list directly.)
+fn merged_rows<'a>(
+    repo_hits: Vec<RepoHit>,
+    aur_hits: Vec<&'a IndexEntry>,
+    regexes: &[regex::Regex],
+) -> Vec<RankedRow<'a>> {
+    let mut ranked = ranked_best_first(repo_hits, aur_hits, regexes);
+    ranked.reverse();
     ranked
 }
 
@@ -213,7 +226,7 @@ fn write_search_result<W: std::io::Write>(
 pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
     let regexes = compile_terms(terms)?;
     let (repo_hits, aur_data) = gather(cfg, terms)?;
-    let rows = merged_rows(repo_hits, aur_data.search(&regexes), &regexes);
+    let rows = ranked_best_first(repo_hits, aur_data.search(&regexes), &regexes);
 
     if rows.is_empty() {
         ui::info(&format!(
@@ -227,13 +240,20 @@ pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
         return Ok(0);
     }
 
-    // Render the aligned table (installed emphasis + the installed-version and
-    // freshness columns), the same machinery the shell uses. `pac` backs the
-    // installed-state lookup in `search_row`.
+    // Render through the shared [`ui::SearchList`], the same machinery the shell
+    // uses: installed emphasis, the installed-version + freshness signals, and
+    // the configured row layout (`term_width` is `None` in a pipe, so `auto`
+    // stays dense single-line here). `pac` backs the installed-state lookup in
+    // `search_row`; the best-first rows print best-last.
     let pac = PacmanIndex::build(&alpm_db::open()?);
     let scale = ui::AgeScale::now(cfg.age_thresholds());
     let search_rows: Vec<ui::SearchRow> = rows.iter().map(|r| r.search_row(&pac, &scale)).collect();
-    let table = ui::search_table(&search_rows, ui::RowNumbers::Plain, ui::Paint::detect());
+    let table = ui::SearchList {
+        rows: &search_rows,
+        numbers: ui::RowNumbers::Plain,
+        layout: cfg.search_layout,
+    }
+    .render(ui::Paint::detect(), ui::term_width());
     for line in table.lines() {
         println!("{line}");
     }

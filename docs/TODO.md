@@ -25,12 +25,6 @@
   also demoting the too-fresh *caution* band (recency is non-monotonic — see the
   band model). Name-match quality stays primary; freshness is a secondary weight,
   not an override.
-- two-line search/upgrade table rows, pacman-style (`repo/name version` line
-  + indented description line) via a `ui/grid.rs` row mode — long
-  descriptions currently wrap mid-word on narrow terminals (surfaced by the
-  README screencasts; see the finding in docs/plans/screencasts.md).
-  Touches the table-unification seams and the PTY tests that compact-match
-  wrapped lines.
 - renderer-agnostic table model (so a **web-UI table renderer** can attach).
   Today the whole grid stack is a *terminal-string* engine: `ui::Cell` stores
   an already-ANSI-baked `String` (via the `Cell::paint(plain, paint, f)`
@@ -72,6 +66,17 @@
 - account for already downloaded sources when printing download sizes in tables
 
 <!-- Done:
+- config-selectable two-line search rows, pacman-style (`№ repo/name version
+  [installed] [age]` headline + indented description line): a typed
+  `SearchLayout` knob (`auto`/`single`/`double`, default `auto`) resolved by
+  `ui::SearchList`, which renders best-first rows best-last at *row* granularity
+  (a two-line row's headline + desc stay paired, unlike the old flat
+  `Table::reversed`). `auto` measures the single-line layout against the terminal
+  width (`ui::term_width`) and flips to two-line when a row would wrap; a pipe
+  (no width) stays dense single-line. `-Ss` stays two-line for pacman parity.
+  The two-line renderer + the knob live in `ui/search_layout.rs`; the
+  `[installed]`/`[installed: X]` marker text is shared with `-Ss`
+  (`installed_marker_text`) so the two can't drift.
 - save review approvals for concrete versions persistently: consented
   approvals (diff answered at the prompt, explicit `approve`) land in
   `reviews.db` keyed by (pkgbase, PKGBUILD commit) — src/build/reviews.rs.

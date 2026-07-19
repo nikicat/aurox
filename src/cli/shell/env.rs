@@ -228,7 +228,17 @@ impl ShellEnv for RealEnv<'_> {
         let scale = ui::AgeScale::now(self.cfg.age_thresholds());
         let search_rows: Vec<ui::SearchRow> =
             ranked.iter().map(|r| r.search_row(&pac, &scale)).collect();
-        let table = ui::search_table(&search_rows, ui::RowNumbers::Numbered, ui::Paint::detect());
+        // Render best-first rows (row 1 = best) into the configured layout; the
+        // list itself prints best-last (bottom-up), so the strongest matches
+        // land next to the prompt with the low, easy-to-type numbers. Numbers
+        // still key the best-first `items` returned below, so `add 1` is always
+        // the top match regardless of print direction.
+        let table = ui::SearchList {
+            rows: &search_rows,
+            numbers: ui::RowNumbers::Numbered,
+            layout: self.cfg.search_layout,
+        }
+        .render(ui::Paint::detect(), ui::term_width());
         let items = ranked
             .iter()
             .map(|r| ListItem {
@@ -239,13 +249,7 @@ impl ShellEnv for RealEnv<'_> {
         // `ranked` borrows the session's AUR data, so it must be done before
         // printing takes `&mut self`.
         drop(ranked);
-        // The table is best-first (row 1 = best), each row carrying its `№`
-        // cell. Print it worst-first so the strongest matches land at the
-        // bottom, next to the prompt the shell scrolls to — and the low,
-        // easy-to-type numbers are the good ones. The numbers still key the
-        // best-first list returned below, so `add 1` is always the top match
-        // regardless of print direction.
-        self.print_table(&table.reversed());
+        self.print_table(&table);
         Ok(items)
     }
 

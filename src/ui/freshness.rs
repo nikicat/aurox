@@ -168,12 +168,23 @@ pub struct Freshness {
 }
 
 impl Freshness {
-    /// This badge as a search-table [`Cell`]: the coarse age (`3d`), colored by
-    /// risk band. It's its own aligned column, so no brackets delimit it and the
-    /// grid supplies the surrounding gap.
+    /// This badge as a single-line search-table [`Cell`]: the coarse age
+    /// (`3d`), colored by risk band. It's its own aligned column, so no brackets
+    /// delimit it and the grid supplies the surrounding gap.
     pub fn cell(&self, paint: Paint) -> Cell {
         let text = human_age(self.age);
         Cell::paint(&text, paint, |s| self.band.paint(s, paint))
+    }
+
+    /// This badge as an inline **two-line-headline** tag: the coarse age
+    /// bracketed (`[3d]`), band-colored. The two-line layout has no freshness
+    /// *column* to align, so the brackets delimit the age inline (the opposite
+    /// call from [`Self::cell`], whose own column needs none). Whole-tag paint —
+    /// the brackets carry the band color too, so a caution `[1m]` reads as one
+    /// yellow unit.
+    pub fn tag(&self, paint: Paint) -> String {
+        self.band
+            .paint(&format!("[{}]", human_age(self.age)), paint)
     }
 
     /// The band this badge fell in.
@@ -321,5 +332,27 @@ mod tests {
             "3d",
             "maturing is uncolored"
         );
+    }
+
+    /// The two-line headline tag brackets the coarse age and carries the band
+    /// color across the whole `[age]` unit; plain paint is the bare `[age]`.
+    #[test]
+    fn tag_brackets_the_age_and_colors_by_band() {
+        console::set_colors_enabled(true);
+        // 1 day ago against a fixed clock → caution band (bold yellow).
+        let now = SystemTime::UNIX_EPOCH + days(1_000);
+        let scale = AgeScale::at(now, T);
+        let badge = scale
+            .badge(UnixTime::new(999 * 86_400))
+            .expect("known past");
+        assert_eq!(badge.band(), FreshnessBand::Caution);
+
+        assert_eq!(badge.tag(Paint::Plain), "[1d]");
+        let colored = badge.tag(Paint::Colored);
+        assert!(
+            colored.contains('\u{1b}'),
+            "caution tag is colored: {colored:?}"
+        );
+        assert_eq!(console::strip_ansi_codes(&colored), "[1d]");
     }
 }

@@ -41,6 +41,13 @@ impl Width {
         Self(s.chars().count())
     }
 
+    /// A width of `cols` display columns — for a raw column count crossing into
+    /// the type from outside (the terminal's own width, [`super::term_width`]),
+    /// so downstream layout math stays in [`Width`] rather than bare `usize`.
+    pub const fn cols(cols: usize) -> Self {
+        Self(cols)
+    }
+
     /// The widest of a set of cell widths — i.e. the column width. [`Self::ZERO`]
     /// when the iterator is empty.
     pub(super) fn widest(widths: impl Iterator<Item = Self>) -> Self {
@@ -146,16 +153,6 @@ impl Table {
     /// The display lines, top to bottom.
     pub fn lines(&self) -> &[String] {
         &self.0
-    }
-
-    /// The same lines bottom-to-top — for a caller whose presentation order
-    /// reverses the data order (the shell prints search results worst-first
-    /// so the best rows land next to the prompt, while row numbers keep
-    /// keying the best-first list).
-    #[must_use]
-    pub fn reversed(mut self) -> Self {
-        self.0.reverse();
-        self
     }
 
     /// Print the table to stderr framed by blank lines — the flag-path

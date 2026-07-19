@@ -138,13 +138,17 @@ pub enum RowNumbers {
     Plain,
 }
 
-/// Render the ranked rows into an aligned table — one body line per row.
+/// Render the ranked rows into the aligned single-line table — one body line
+/// per row.
 ///
-/// Rows come out in the given order with no header (the shell adds one);
-/// `numbers` says whether the shell's `№` selector column leads each row.
-/// `paint` is passed in (callers use [`Paint::detect`]) rather than re-read
-/// from the environment, so tests pin the plain rendering.
-pub fn search_table(rows: &[SearchRow], numbers: RowNumbers, paint: Paint) -> Table {
+/// The single-line layout behind [`super::SearchList`] (the layout dispatcher
+/// picks it or the two-line form per [`super::SearchLayout`]); not called
+/// directly — surfaces go through `SearchList`. Rows come out in the given
+/// order with no header (the shell adds one); `numbers` says whether the
+/// shell's `№` selector column leads each row. `paint` is passed in (callers
+/// use [`Paint::detect`]) rather than re-read from the environment, so tests
+/// pin the plain rendering.
+pub(super) fn search_table(rows: &[SearchRow], numbers: RowNumbers, paint: Paint) -> Table {
     let mut cols = vec![
         Col::left(), // repo
         Col::left(), // name
@@ -221,18 +225,31 @@ fn headline(row: &SearchRow, paint: Paint) -> String {
     }
 }
 
-/// Pacman's install marker, leading space included: ` [installed]`, or
-/// ` [installed: X]` when the local version X differs from the listed one —
-/// *any* difference, a newer local build included, exactly as `pacman -Ss`
-/// decides it. Empty for a not-installed row.
-fn marker(row: &SearchRow, paint: Paint) -> String {
+/// The pacman install-marker *text* — no color, no leading space:
+/// `[installed]`, or `[installed: X]` when the local version X differs from the
+/// listed one (*any* difference, a newer local build included, exactly as
+/// `pacman -Ss` decides it). `None` for a not-installed row.
+///
+/// The one place the marker's shape is decided, shared by the `-Ss` headline
+/// ([`marker`], bold cyan) and the two-line interactive headline
+/// ([`super::SearchList`], currency-colored) so the two can't drift.
+pub(super) fn installed_marker_text(row: &SearchRow) -> Option<String> {
     let InstallState::Installed(iv) = &row.install else {
-        return String::new();
+        return None;
     };
-    let text = if row.new_ver.as_ref().is_some_and(|nv| nv != iv) {
+    Some(if row.new_ver.as_ref().is_some_and(|nv| nv != iv) {
         format!("[installed: {iv}]")
     } else {
         "[installed]".to_owned()
+    })
+}
+
+/// Pacman's `-Ss` install marker, leading space included: ` [installed]` /
+/// ` [installed: X]` in bold cyan (pacman's palette). Empty for a
+/// not-installed row. The text comes from [`installed_marker_text`].
+fn marker(row: &SearchRow, paint: Paint) -> String {
+    let Some(text) = installed_marker_text(row) else {
+        return String::new();
     };
     if paint.colored() {
         format!(" {}", style(text).bold().cyan())
