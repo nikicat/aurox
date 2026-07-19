@@ -1,6 +1,6 @@
 //! Built-in defaults applied when `config.toml` is absent or a field is missing.
 
-use super::Config;
+use super::{AgeConfig, Config};
 use crate::paths;
 
 /// Construct a freshly-defaulted [`Config`].
@@ -38,5 +38,9 @@ pub fn default_config() -> Config {
         // (~250ms one-shot) is worth always finding the commit when it
         // exists in the AUR repo.
         review_history_scan_max: 256,
+        // The `[ages]` section is unset by default — every threshold follows the
+        // `ui::freshness` defaults via `Config::age_thresholds`, so the numbers
+        // live in exactly one place and upgrades can move them.
+        ages: AgeConfig::default(),
     }
 }

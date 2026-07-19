@@ -84,6 +84,15 @@ impl Row<'_> {
         }
     }
 
+    /// The AUR branch-tip commit time behind this row's freshness badge; repo
+    /// rows have no commit of their own.
+    const fn commit_time(&self) -> Option<UnixTime> {
+        match self {
+            Row::Repo(_) => None,
+            Row::Aur(e) => Some(e.commit_time),
+        }
+    }
+
     /// The row's one-line description, if its source carries one.
     fn desc(&self) -> Option<String> {
         match self {
@@ -218,18 +227,13 @@ pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
         return Ok(0);
     }
 
-    // Render the aligned table (installed emphasis + version diff + size), the
-    // same machinery the shell uses. Build-time is left off the pipe listing
-    // (empty metrics — no store lookups), so installed AUR rows show `~?` there.
+    // Render the aligned table (installed emphasis + the installed-version and
+    // freshness columns), the same machinery the shell uses. `pac` backs the
+    // installed-state lookup in `search_row`.
     let pac = PacmanIndex::build(&alpm_db::open()?);
-    let search_rows: Vec<ui::SearchRow> = rows.iter().map(|r| r.search_row(&pac)).collect();
-    let table = ui::search_table(
-        &search_rows,
-        &pac,
-        &ui::PreviewMetrics::empty(),
-        ui::RowNumbers::Plain,
-        ui::Paint::detect(),
-    );
+    let scale = ui::AgeScale::now(cfg.age_thresholds());
+    let search_rows: Vec<ui::SearchRow> = rows.iter().map(|r| r.search_row(&pac, &scale)).collect();
+    let table = ui::search_table(&search_rows, ui::RowNumbers::Plain, ui::Paint::detect());
     for line in table.lines() {
         println!("{line}");
     }
@@ -259,6 +263,9 @@ pub(crate) fn search_row(row: &Row<'_>, pac: &PacmanIndex) -> ui::SearchRow {
         new_ver: Some(row.version()),
         desc: row.desc(),
         note: None,
+        // The `-Ss` surface renders through this bare form and shows no
+        // freshness tag; the aligned table fills it in `RankedRow::search_row`.
+        freshness: None,
     }
 }
 
@@ -272,11 +279,15 @@ pub(crate) struct RankedRow<'a> {
 }
 
 impl RankedRow<'_> {
-    /// [`search_row`] plus this row's match-site annotation — the aligned
-    /// table's input (the bare-term pipe listing and the shell list).
-    pub(crate) fn search_row(&self, pac: &PacmanIndex) -> ui::SearchRow {
+    /// [`search_row`] plus this row's match-site annotation and freshness badge
+    /// — the aligned table's input (the bare-term pipe listing and the shell
+    /// list). `scale` classifies the AUR commit age against one injected clock.
+    pub(crate) fn search_row(&self, pac: &PacmanIndex, scale: &ui::AgeScale) -> ui::SearchRow {
         ui::SearchRow {
             note: self.class.note.clone(),
+            // AUR rows carry the freshness badge; repo rows have no commit of
+            // their own, so `commit_time` is `None` → no badge.
+            freshness: self.row.commit_time().and_then(|c| scale.badge(c)),
             ..search_row(&self.row, pac)
         }
     }

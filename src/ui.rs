@@ -15,6 +15,7 @@ mod banner;
 mod cells;
 mod change_set;
 mod cost;
+mod freshness;
 mod gix_progress;
 mod grid;
 mod progress;
@@ -25,6 +26,7 @@ mod tables;
 pub use banner::{SPLASH_MIN_COLS, SplashBlink, launch_banner};
 pub use change_set::{ApprovalCell, ChangeSet, TxnRoot};
 pub use cost::PreviewMetrics;
+pub use freshness::{AgeScale, AgeThresholds, Freshness, FreshnessBand};
 pub use gix_progress::{GixProgress, Operation};
 pub use grid::{Cell, Col, Grid, GridRow, Paint, Table, Width};
 pub use progress::{

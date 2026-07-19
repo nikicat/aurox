@@ -276,12 +276,12 @@ fn built_tag(paint: Paint) -> String {
     }
 }
 
-/// The trailing `  built` tag (with its leading gap) for an already-built row,
-/// or empty otherwise. Unaligned — appended after the last aligned column, like
-/// the session badges, so it never perturbs column math.
+/// The `built` tag for an already-built row, or empty otherwise — the content
+/// of an unaligned tail cell (the grid supplies the surrounding gap). Empty
+/// renders as a grid-skipped cell.
 pub(super) fn built_suffix(cost: RowCost, paint: Paint) -> String {
     if cost.built {
-        format!("  {}", built_tag(paint))
+        built_tag(paint)
     } else {
         String::new()
     }
@@ -353,13 +353,14 @@ mod tests {
         );
     }
 
-    /// `built_suffix` is the unaligned trailing tag: present iff the row is
-    /// built, with its leading gap; the plain form is exactly `  built`.
+    /// `built_suffix` is the unaligned trailing tag's content: present iff the
+    /// row is built (the plain form is exactly `built`, the grid adds the gap),
+    /// empty otherwise.
     #[test]
     fn built_suffix_only_when_built() {
         assert_eq!(
             built_suffix(RowCost::aur(TimeEst::Unknown, false, true), Paint::Plain),
-            "  built"
+            "built"
         );
         assert_eq!(
             built_suffix(RowCost::aur(TimeEst::Unknown, false, false), Paint::Plain),

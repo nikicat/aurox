@@ -14,12 +14,39 @@
   repo/name/version. Whatever palette lands, the installed flag must stay
   clearly visible (today it's row emphasis plus the `old → new` version
   cell, which color alone could drown out).
+- search ranking should *weight* freshness, not just tie-break on it. Today the
+  order is match-tier → shorter-name → repo-before-AUR → freshest-commit, where
+  freshness is only the final AUR tie-break (`src/cli/search.rs` `RankKey`). So a
+  stale/abandoned AUR package that matches the name a little better outranks a
+  fresh, maintained one — now glaring since the freshness-age risk band renders the
+  staleness right at the top of the list (bottom-up = nearest the prompt). Fold
+  the freshness *band* (`ui::freshness::FreshnessBand`) into the sort so
+  stale/abandoned rows sink and healthy ones rise *within* a match tier; consider
+  also demoting the too-fresh *caution* band (recency is non-monotonic — see the
+  band model). Name-match quality stays primary; freshness is a secondary weight,
+  not an override.
 - two-line search/upgrade table rows, pacman-style (`repo/name version` line
   + indented description line) via a `ui/grid.rs` row mode — long
   descriptions currently wrap mid-word on narrow terminals (surfaced by the
   README screencasts; see the finding in docs/plans/screencasts.md).
   Touches the table-unification seams and the PTY tests that compact-match
   wrapped lines.
+- renderer-agnostic table model (so a **web-UI table renderer** can attach).
+  Today the whole grid stack is a *terminal-string* engine: `ui::Cell` stores
+  an already-ANSI-baked `String` (via the `Cell::paint(plain, paint, f)`
+  closure), and `Grid::render` emits `Table = Vec<String>`. Nothing structured
+  survives, so a non-terminal renderer (web, GUI) can consume none of it. The
+  fix is **style-as-data**: `Cell { content, style: Style }` where `Style` is a
+  data enum (`Dim`, `Bold`, `RepoHash`, `Band(FreshnessBand)`, `VersionDiff{…}`,
+  …), the grid emits a *structured* `Table` (rows of styled cells with computed
+  widths), and a `TerminalRenderer`/`WebRenderer` each translate `Style` → ANSI
+  / CSS. Cross-cutting: touches `ui/grid.rs` + every table renderer
+  (`search_table`, `change_set`, `tables`, `cost`, `cells`) + the `ShellEnv`
+  print seam. Groundwork already landed: `GridRow.tail` is a structured
+  `Vec<Cell>` the grid composes (call sites hand semantic segments, no
+  `format!("{}{}")` tails) — so the tail is ready for `Style`-carrying cells;
+  the remaining work is making `Cell` itself carry style-as-data instead of a
+  rendered string.
 - noticeable delay on exit: quitting takes a visible beat before the
   terminal prompt returns. Not reproducible at fixture scale — the hero
   demo cast measures quit → bash prompt at ~10 ms — so profile against a

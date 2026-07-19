@@ -2,42 +2,50 @@
 //! non-interactive `aurox <term>` listing), plus the pacman-format `-Ss`
 //! block ([`search_result`]).
 //!
-//! Columns: `repo · name · version · size · build-time · description`, plus a
-//! dimmed trailing [`MatchNote`] annotation when the match site is invisible
-//! on the row (a hidden split member, a `provides=` name, a group). It
-//! renders through the shared [`Grid`] engine and cell vocabulary so the same
-//! bugs are fixed once — [`VersionColumn`] for the `old → new` verdiff,
-//! [`size_of`](super::cost::size_of)/[`cost_of`](super::cost::cost_of) for the
-//! size + build-time cells.
+//! Columns: `repo · name · version · installed · freshness`, then the
+//! description (and a dimmed trailing [`MatchNote`] annotation when the match
+//! site is invisible on the row — a hidden split member, a `provides=` name, a
+//! group) as the unaligned tail. Everything fixed-width is an aligned column so
+//! the descriptions line up across rows; only the free-text description +
+//! match-note ride in the tail. Cost signals (download size, build time) are
+//! deliberately absent — they matter at commit time, so they live in the
+//! `apply` change-set preview, not the search scan. Renders through the shared
+//! [`Grid`] engine and cell vocabulary.
 //!
-//! Installed packages are set apart by emphasis, not a column (the user's call):
-//! an installed row keeps full color with a **bold** name and, when an upgrade
-//! is available, an `old → new` diff plus its estimated build time; a
-//! not-installed row is dimmed so it recedes. Under `--color=never` the emphasis
-//! collapses (there's nothing to dim), but the version/size columns still align.
+//! Color is **additive**, not subtractive: every row carries the baseline —
+//! the repo in its hashed color, a readable name and (available) version — so a
+//! not-installed row (the common search hit) reads clearly instead of receding
+//! into gray. The primary identity cells (repo, name, version) get color; the
+//! trailing description / match-note dim. Installed-ness is a **positive**
+//! accent that survives a colorful table: a **bold** name plus the
+//! **installed-version** column — the local version you have, dimmed when it
+//! matches the available one and **yellow** when it's behind (an upgrade
+//! waits). AUR rows also carry a freshness column — a coarse age (`3d`) colored
+//! by risk band (see [`super::freshness`]); it's its own column, so no brackets
+//! delimit it. Under `--color=never` the accents collapse to their plain forms
+//! (bold name, the bare installed version, the bare age), and every column
+//! still aligns.
 //!
 //! The shell's selector `№` column is part of the row ([`RowNumbers`]), so the
 //! number a user types (`add 3`) and the number printed can't drift; the
 //! best-last print order stays the shell's job ([`crate::cli::shell`]) — this
 //! renders one line per row, in the order given.
 
-use super::cells::VersionColumn;
-use super::cost::{PreviewMetrics, RowCost, SizeEst, cost_of, size_of};
+use super::freshness::Freshness;
 use super::grid::{Cell, Col, Grid, GridRow, Paint, Table, Width};
 use super::{dim, repo as repo_style};
 use crate::names::{GroupName, PkgName, RepoName, VirtualName};
-use crate::pacman::alpm_db::PacmanIndex;
 use crate::version::Version;
 use console::style;
 use std::fmt;
 
 /// Whether a searched package is installed locally — and at which version.
 ///
-/// The domain state behind a row's emphasis (installed rows pop, not-installed
-/// rows recede), the build-time cell, the table's `old → new` verdiff
-/// ([`SearchRow::upgrade_from`]), and the `-Ss` `[installed: X]` marker. The
-/// local version travels *inside* the installed variant instead of a sibling
-/// field a constructor could leave out of sync.
+/// The domain state behind a row's name emphasis (installed rows pop,
+/// not-installed rows recede), the installed-version column
+/// ([`SearchRow::upgrade_from`] decides its "behind" styling), and the `-Ss`
+/// `[installed: X]` marker. The local version travels *inside* the installed
+/// variant instead of a sibling field a constructor could leave out of sync.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InstallState {
     /// Installed at this local version (the pacman localdb's answer).
@@ -79,13 +87,13 @@ impl fmt::Display for MatchNote {
 }
 
 /// One search hit, ready to render. The caller resolves installed state and the
-/// version pair against the pacman DBs; the table derives the size + build-time
-/// cells from `pac`/`metrics`.
+/// available/installed version pair against the pacman DBs.
 pub struct SearchRow {
     pub repo: RepoName,
     pub name: PkgName,
-    /// Installed state, local version included — drives the emphasis, the
-    /// build-time cell, and the version diff/marker.
+    /// Installed state, local version included — drives the name emphasis and
+    /// the installed-version column (its value and its styled-when-behind
+    /// coloring).
     pub install: InstallState,
     /// The available version (repo/AUR); `None` only when it couldn't be looked
     /// up (the version cell then renders blank but aligned).
@@ -96,12 +104,18 @@ pub struct SearchRow {
     /// provides, group); `None` when the visible name/description explains
     /// the match.
     pub note: Option<MatchNote>,
+    /// The AUR freshness band badge (last-change age → risk band), rendered as
+    /// the freshness column (a coarse age like `3d`). `None` for repo rows, the
+    /// `-Ss` surface, and AUR entries with an unknown commit time. See the
+    /// `ui::freshness` module.
+    pub freshness: Option<Freshness>,
 }
 
 impl SearchRow {
     /// The installed version when it's behind the available one — the state
-    /// behind the table's `old → new` verdiff. A same-version or *newer*
-    /// install (e.g. a VCS build ahead of the index) draws no arrow.
+    /// behind the installed-version column's "behind" (yellow) styling. A
+    /// same-version or *newer* install (e.g. a VCS build ahead of the index)
+    /// is up to date, so it styles as current.
     pub fn upgrade_from(&self) -> Option<&Version> {
         let InstallState::Installed(iv) = &self.install else {
             return None;
@@ -128,44 +142,15 @@ pub enum RowNumbers {
 ///
 /// Rows come out in the given order with no header (the shell adds one);
 /// `numbers` says whether the shell's `№` selector column leads each row.
-/// `pac` backs the size cells; `metrics` backs the build-time cells
-/// (empty for the non-interactive listing → installed AUR rows show `?`).
 /// `paint` is passed in (callers use [`Paint::detect`]) rather than re-read
 /// from the environment, so tests pin the plain rendering.
-pub fn search_table(
-    rows: &[SearchRow],
-    pac: &PacmanIndex,
-    metrics: &PreviewMetrics,
-    numbers: RowNumbers,
-    paint: Paint,
-) -> Table {
-    // Per-row size + cost, computed once (also feeds the column widths).
-    let sizes: Vec<SizeEst> = rows
-        .iter()
-        .map(|r| size_of(&r.repo, &r.name, pac))
-        .collect();
-    let costs: Vec<RowCost> = rows
-        .iter()
-        .map(|r| {
-            // Build-time is a property we only show for installed packages (the
-            // store only has data for things we've built); a not-installed row
-            // gets an empty cell rather than a noisy `?`.
-            if r.install.installed() {
-                cost_of(&r.repo, &r.name, metrics)
-            } else {
-                RowCost::none()
-            }
-        })
-        .collect();
-    let versions =
-        VersionColumn::measure(rows.iter().map(|r| (r.upgrade_from(), r.new_ver.as_ref())));
-
+pub fn search_table(rows: &[SearchRow], numbers: RowNumbers, paint: Paint) -> Table {
     let mut cols = vec![
-        Col::left(),  // repo
-        Col::left(),  // name
-        Col::left(),  // version block
-        Col::left(),  // size (historically left-aligned here; change_set right-aligns)
-        Col::right(), // build time
+        Col::left(), // repo
+        Col::left(), // name
+        Col::left(), // version (available)
+        Col::left(), // installed version (local; styled when behind available)
+        Col::left(), // freshness band
     ];
     if numbers == RowNumbers::Numbered {
         // Floored at three digits — the `{:>3}` the shell's second-pass
@@ -173,29 +158,27 @@ pub fn search_table(
         cols.insert(0, Col::right().min(Width::of("999")));
     }
     let mut grid = Grid::new(cols);
-    for (i, ((row, size), cost)) in rows.iter().zip(&sizes).zip(&costs).enumerate() {
+    for (i, row) in rows.iter().enumerate() {
         let em = &row.install;
         let mut cells = vec![
-            repo_cell(&row.repo, em, paint),
+            repo_cell(&row.repo, paint),
             name_cell(&row.name, em, paint),
-            version_cell(
-                &versions,
-                em,
-                row.upgrade_from(),
-                row.new_ver.as_ref(),
-                paint,
-            ),
-            size_cell(*size, em, paint),
-            cost.cell(paint),
+            version_cell(row.new_ver.as_ref()),
+            installed_cell(row, paint),
+            freshness_cell(row.freshness, paint),
         ];
         if numbers == RowNumbers::Numbered {
             cells.insert(0, Cell::plain((i + 1).to_string()));
         }
-        grid.push(GridRow::new(cells).tail(format!(
-            "{}{}",
+        // Only the description and its match-note ride in the tail — every
+        // fixed-width field is an aligned column, so descriptions line up. Cost
+        // signals (download size, build time) are deliberately *not* here: they
+        // matter when you commit a transaction, so they live in the `apply`
+        // change-set preview, not the search scan.
+        grid.push(GridRow::new(cells).tail(vec![
             desc_cell(row.desc.as_deref(), paint),
             note_cell(row.note.as_ref(), paint),
-        )));
+        ]));
     }
     grid.render()
 }
@@ -258,96 +241,84 @@ fn marker(row: &SearchRow, paint: Paint) -> String {
     }
 }
 
-/// The repo cell — repo-colored when installed, dimmed (receding) when not.
-fn repo_cell(repo: &RepoName, em: &InstallState, paint: Paint) -> Cell {
-    Cell::paint(repo.as_str(), paint, |s| {
-        if em.installed() {
-            repo_style(s).to_string()
-        } else {
-            dim(s).to_string()
-        }
-    })
+/// The repo cell — always in the repo's hashed color (provenance is a per-row
+/// baseline signal, shown whether or not the package is installed).
+fn repo_cell(repo: &RepoName, paint: Paint) -> Cell {
+    Cell::paint(repo.as_str(), paint, |s| repo_style(s).to_string())
 }
 
-/// The name cell — **bold** when installed (it pops), dimmed when not.
+/// The name cell — the primary identifier, always readable: **bold** when
+/// installed (it pops), plain terminal foreground otherwise (not dimmed).
 fn name_cell(name: &PkgName, em: &InstallState, paint: Paint) -> Cell {
     Cell::paint(name.as_str(), paint, |s| {
         if em.installed() {
             style(s).bold().to_string()
         } else {
-            dim(s).to_string()
+            s.to_owned()
         }
     })
 }
 
-/// The size cell — plain when installed, dimmed when not.
-fn size_cell(size: SizeEst, em: &InstallState, paint: Paint) -> Cell {
-    Cell::paint(&size.render(), paint, |s| {
-        if em.installed() {
-            s.to_owned()
+/// The installed-version column: the local version when the package is
+/// installed, styled by whether it's current — **dimmed** when up to date (you
+/// already have the available version) and **yellow** when it's behind the
+/// available one (an upgrade waits). Empty (the grid collapses it) when the
+/// package isn't installed. This carries the whole installed signal now: which
+/// version you have, and whether it's the latest.
+fn installed_cell(row: &SearchRow, paint: Paint) -> Cell {
+    let InstallState::Installed(iv) = &row.install else {
+        return Cell::plain("");
+    };
+    let outdated = row.upgrade_from().is_some();
+    Cell::paint(iv.as_str(), paint, |s| {
+        if outdated {
+            style(s).yellow().to_string()
         } else {
             dim(s).to_string()
         }
     })
 }
 
-/// The version cell, always the full `old_w + → + new_w` block width so the
-/// size column lines up across every row:
-/// - **upgrade** (`old` present): `old → new` verdiff via the shared
-///   [`VersionColumn`], so the coloring matches the transaction table exactly.
-/// - **fresh / up-to-date** (`old` is `None`): the available version alone in
-///   the `new` slot — default color when installed, dimmed when not (green is
-///   reserved for the transaction table's "will install").
-fn version_cell(
-    versions: &VersionColumn,
-    em: &InstallState,
-    old: Option<&Version>,
-    new: Option<&Version>,
-    paint: Paint,
-) -> Cell {
-    if old.is_some() {
-        return versions.cell(old, new, paint);
-    }
-    let Some(v) = new else {
-        return Cell::plain("");
-    };
-    // The blank old slot + arrow gap keeps fresh rows aligned with upgrades.
-    let lead = (versions.old_w + paint.arrow()).blanks();
-    let shown = if paint.colored() && !em.installed() {
-        dim(v.as_str()).to_string()
-    } else {
-        v.as_str().to_owned()
-    };
-    Cell::sized(
-        format!("{lead}{shown}"),
-        versions.old_w + paint.arrow() + Width::of(v.as_str()),
-    )
+/// The freshness-band column (a coarse age like `3d`, colored by risk band), or
+/// an empty cell (grid-collapsed) for a repo row / an AUR row with an unknown
+/// commit time.
+fn freshness_cell(freshness: Option<Freshness>, paint: Paint) -> Cell {
+    freshness.map_or_else(|| Cell::plain(""), |f| f.cell(paint))
 }
 
-/// The trailing, unaligned description cell — dimmed, with a leading gap; empty
+/// The available-version column — the version a pick would install, in plain
+/// terminal foreground on every row (green stays reserved for the transaction
+/// table's "will install"; the installed-vs-available comparison lives in the
+/// adjacent [`installed_cell`]). Blank when the version couldn't be looked up.
+fn version_cell(new: Option<&Version>) -> Cell {
+    Cell::plain(new.map_or("", |v| v.as_str()))
+}
+
+/// The trailing description tail cell — dimmed; an empty cell (grid-skipped)
 /// when the package has no description.
-fn desc_cell(desc: Option<&str>, paint: Paint) -> String {
+fn desc_cell(desc: Option<&str>, paint: Paint) -> Cell {
     match desc {
-        Some(d) if !d.is_empty() && paint.colored() => format!("  {}", dim(d)),
-        Some(d) if !d.is_empty() => format!("  {d}"),
-        _ => String::new(),
+        Some(d) if !d.is_empty() => Cell::paint(d, paint, |s| dim(s).to_string()),
+        _ => Cell::plain(""),
     }
 }
 
-/// The trailing match-site annotation — dimmed like the description; empty
-/// when the match is visible on the row itself.
-fn note_cell(note: Option<&MatchNote>, paint: Paint) -> String {
+/// The trailing match-site annotation tail cell — dimmed like the description;
+/// an empty cell when the match is visible on the row itself.
+fn note_cell(note: Option<&MatchNote>, paint: Paint) -> Cell {
     match note {
-        Some(n) if paint.colored() => format!("  {}", dim(n.to_string())),
-        Some(n) => format!("  {n}"),
-        None => String::new(),
+        Some(n) => {
+            let text = n.to_string();
+            Cell::paint(&text, paint, |s| dim(s).to_string())
+        }
+        None => Cell::plain(""),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assert_contains;
+    use crate::{assert_contains, assert_not_contains};
 
     /// Assemble a row from domain-typed parts, deriving a description from the
     /// name so the trailing column has something to show.
@@ -365,18 +336,16 @@ mod tests {
             new_ver: new,
             desc,
             note: None,
+            freshness: None,
         }
     }
 
-    /// The plain (un-colored) table: an upgradable installed row shows the
-    /// `old -> new` diff, a fresh/up-to-date row shows just the version, the size
-    /// cell reaches the table, and descriptions ride along as the trailing column.
+    /// The plain (un-colored) table: the version column shows the available
+    /// version and the installed column shows the local version only when
+    /// installed — separate columns, no inline `->` diff — and descriptions
+    /// ride the tail.
     #[test]
-    fn plain_table_shows_diff_only_for_upgrades() {
-        let mut pac = PacmanIndex::default();
-        pac.sync_download_size.insert("clang".into(), 1024);
-        pac.installed_size.insert("claude-code".into(), 2048);
-
+    fn plain_table_splits_available_and_installed_versions() {
         let rows = vec![
             row(
                 RepoName::from("aur"),
@@ -397,41 +366,21 @@ mod tests {
                 Some(Version::from("18.1.0-1")),
             ),
         ];
-        let table = search_table(
-            &rows,
-            &pac,
-            &PreviewMetrics::empty(),
-            RowNumbers::Plain,
-            Paint::Plain,
-        );
+        let table = search_table(&rows, RowNumbers::Plain, Paint::Plain);
         let lines = table.lines();
         assert_eq!(lines.len(), 3);
 
-        // Upgrade row carries the arrow; the others don't.
-        assert!(
-            lines[0].contains("2.0.1-1 -> 2.1.0-1"),
-            "row 0: {:?}",
-            lines[0]
-        );
-        assert!(
-            !lines[1].contains("->"),
-            "fresh row has no arrow: {:?}",
-            lines[1]
-        );
-        assert!(
-            !lines[2].contains("->"),
-            "up-to-date row has no arrow: {:?}",
-            lines[2]
-        );
-
-        // Size cell: exact for the repo row, estimated (unmarked) for the
-        // installed AUR row.
-        assert!(lines[2].contains("1.00 KiB"), "repo size: {:?}", lines[2]);
-        assert!(
-            lines[0].contains("2.00 KiB"),
-            "aur est size: {:?}",
-            lines[0]
-        );
+        // No inline diff arrow anywhere — the two versions are separate columns.
+        for line in lines {
+            assert!(!line.contains("->"), "no arrow: {line:?}");
+        }
+        // Behind row (installed 2.0.1-1, available 2.1.0-1): both versions show.
+        assert!(lines[0].contains("2.1.0-1"), "available: {:?}", lines[0]);
+        assert!(lines[0].contains("2.0.1-1"), "installed: {:?}", lines[0]);
+        // Not-installed row: the available version, nothing in the installed col.
+        assert!(lines[1].contains("1.5.0-1"), "{:?}", lines[1]);
+        // Current row: available == installed.
+        assert!(lines[2].contains("18.1.0-1"), "{:?}", lines[2]);
 
         assert!(lines[1].contains("claude description"));
     }
@@ -455,13 +404,7 @@ mod tests {
                 Some(Version::from("2-1")),
             ),
         ];
-        let table = search_table(
-            &rows,
-            &PacmanIndex::default(),
-            &PreviewMetrics::empty(),
-            RowNumbers::Numbered,
-            Paint::Plain,
-        );
+        let table = search_table(&rows, RowNumbers::Numbered, Paint::Plain);
         assert!(
             table.lines()[0].starts_with("  1  aur"),
             "row 1: {:?}",
@@ -471,32 +414,6 @@ mod tests {
             table.lines()[1].starts_with("  2  aur"),
             "row 2: {:?}",
             table.lines()[1]
-        );
-    }
-
-    /// A not-installed row shows no build-time cell even when the metrics store
-    /// has a figure for that name (build time is an installed-package property).
-    #[test]
-    fn not_installed_row_omits_build_time() {
-        let mut metrics = PreviewMetrics::empty();
-        metrics.root_build_secs.insert(PkgName::from("claude"), 200);
-        let rows = vec![row(
-            RepoName::from("aur"),
-            PkgName::from("claude"),
-            InstallState::NotInstalled,
-            Some(Version::from("1.5.0-1")),
-        )];
-        let table = search_table(
-            &rows,
-            &PacmanIndex::default(),
-            &metrics,
-            RowNumbers::Plain,
-            Paint::Plain,
-        );
-        assert!(
-            !table.lines()[0].contains("3m"),
-            "not-installed row must not show a build estimate: {:?}",
-            table.lines()[0]
         );
     }
 
@@ -537,13 +454,7 @@ mod tests {
         );
 
         let rows = vec![provides, via, group, plain];
-        let table = search_table(
-            &rows,
-            &PacmanIndex::default(),
-            &PreviewMetrics::empty(),
-            RowNumbers::Plain,
-            Paint::Plain,
-        );
+        let table = search_table(&rows, RowNumbers::Plain, Paint::Plain);
         let lines = table.lines();
         assert!(
             lines[0].ends_with("linux-zz description  [provides VIRTUALBOX-GUEST-MODULES]"),
@@ -584,6 +495,7 @@ mod tests {
             new_ver: Some(Version::from("11.0.2-3")),
             desc: Some("A QEMU setup for desktop environments".into()),
             note: None,
+            freshness: None,
         };
         let plain = search_result(&r, Paint::Plain);
         let colored = search_result(&r, Paint::Colored);
@@ -615,6 +527,7 @@ mod tests {
             new_ver: Some(Version::from("11.0.2-3")),
             desc: None,
             note: None,
+            freshness: None,
         };
         let plain = search_result(&r, Paint::Plain);
         assert_eq!(
@@ -647,6 +560,7 @@ mod tests {
             new_ver: Some(Version::from("9.2.3-1")),
             desc: None,
             note: None,
+            freshness: None,
         };
         for paint in [Paint::Plain, Paint::Colored] {
             let table = search_result(&r, paint);
@@ -658,28 +572,124 @@ mod tests {
         }
     }
 
-    /// An installed AUR row with a recorded build time shows the estimate.
+    /// A freshness badge `days_old` days old, against a fixed clock — for the
+    /// tail-rendering tests.
+    fn badge(days_old: i64) -> Option<Freshness> {
+        use crate::ui::{AgeScale, AgeThresholds};
+        use crate::units::UnixTime;
+        let sec_per_day = 86_400;
+        let now = UnixTime::new(1_000 * sec_per_day).system_time()?;
+        let scale = AgeScale::at(now, AgeThresholds::from_days(2, 180, 730));
+        scale.badge(UnixTime::new((1_000 - days_old) * sec_per_day))
+    }
+
+    /// Additive coloring: a *not-installed* AUR row still carries color — the
+    /// repo in its hashed color, the name in plain foreground (not the dim
+    /// italic the old subtractive scheme applied) — while the secondary
+    /// description dims. Pins that the "dim monochrome" regression is gone.
     #[test]
-    fn installed_aur_row_shows_build_time() {
-        let mut metrics = PreviewMetrics::empty();
-        metrics.root_build_secs.insert(PkgName::from("claude"), 200);
+    fn not_installed_row_is_colored_not_dimmed() {
+        console::set_colors_enabled(true);
         let rows = vec![row(
+            RepoName::from("aur"),
+            PkgName::from("ripgrep-git"),
+            InstallState::NotInstalled,
+            Some(Version::from("14.1.0-1")),
+        )];
+        let table = search_table(&rows, RowNumbers::Plain, Paint::Colored);
+        let line = &table.lines()[0];
+        let (repo_col, dim_name, dim_desc) = (
+            repo_style("aur").to_string(),
+            dim("ripgrep-git").to_string(),
+            dim("ripgrep-git description").to_string(),
+        );
+        // The repo wears its hashed color (baseline provenance), not dimmed away.
+        assert_contains!(line, repo_col.as_str());
+        // The name is NOT wrapped in the dim italic sequence.
+        assert_not_contains!(line, dim_name.as_str());
+        // The description is still dimmed (a secondary cell).
+        assert_contains!(line, dim_desc.as_str());
+    }
+
+    /// An installed, up-to-date row shows its local version in the installed
+    /// column (not a `[installed]` text marker) and, for AUR, its freshness age
+    /// — both aligned columns ahead of the description.
+    #[test]
+    fn installed_up_to_date_row_shows_version_and_freshness() {
+        let mut r = row(
             RepoName::from("aur"),
             PkgName::from("claude"),
             InstallState::Installed(Version::from("1.5.0-1")),
             Some(Version::from("1.5.0-1")),
-        )];
-        let table = search_table(
-            &rows,
-            &PacmanIndex::default(),
-            &metrics,
-            RowNumbers::Plain,
-            Paint::Plain,
         );
+        r.freshness = badge(3);
+        let table = search_table(&[r], RowNumbers::Plain, Paint::Plain);
+        let line = &table.lines()[0];
+        assert_not_contains!(line, "[installed]");
+        assert_contains!(line, "1.5.0-1"); // the installed (and available) version
+        let tag = line.find("3d").expect("has freshness age");
+        let desc = line.find("claude description").expect("has desc");
         assert!(
-            table.lines()[0].contains("3m 20s"),
-            "installed AUR row shows its build estimate: {:?}",
-            table.lines()[0]
+            tag < desc,
+            "freshness column precedes the description: {line:?}"
         );
+    }
+
+    /// An *upgradable* installed row shows the available version and, in the
+    /// installed column, the local version it's behind — no inline `->` diff,
+    /// no `[installed]` text marker.
+    #[test]
+    fn upgradable_row_splits_versions() {
+        let rows = vec![row(
+            RepoName::from("aur"),
+            PkgName::from("claude"),
+            InstallState::Installed(Version::from("1.5.0-1")),
+            Some(Version::from("1.6.0-1")),
+        )];
+        let line = search_table(&rows, RowNumbers::Plain, Paint::Plain).lines()[0].clone();
+        assert_not_contains!(line, "->");
+        assert_not_contains!(line, "[installed]");
+        assert_contains!(line, "1.6.0-1"); // available
+        assert_contains!(line, "1.5.0-1"); // installed, behind
+    }
+
+    /// The installed version is styled by currency: dimmed when it matches the
+    /// available version, yellow when it's behind (an upgrade waits).
+    #[test]
+    fn installed_version_styled_by_currency() {
+        console::set_colors_enabled(true);
+        let render = |installed: &str, available: &str| {
+            let rows = vec![row(
+                RepoName::from("extra"),
+                PkgName::from("clang"),
+                InstallState::Installed(Version::from(installed)),
+                Some(Version::from(available)),
+            )];
+            search_table(&rows, RowNumbers::Plain, Paint::Colored).lines()[0].clone()
+        };
+        let current = render("18.1.0-1", "18.1.0-1");
+        let behind = render("18.0.0-1", "18.1.0-1");
+        let (dim_cur, yellow_behind) = (
+            dim("18.1.0-1").to_string(),
+            style("18.0.0-1").yellow().to_string(),
+        );
+        assert_contains!(current, dim_cur.as_str());
+        assert_contains!(behind, yellow_behind.as_str());
+    }
+
+    /// A not-installed AUR row shows its freshness age but has nothing in the
+    /// installed column.
+    #[test]
+    fn not_installed_row_shows_freshness_without_installed_version() {
+        let mut r = row(
+            RepoName::from("aur"),
+            PkgName::from("some-old-pkg"),
+            InstallState::NotInstalled,
+            Some(Version::from("1.0-1")),
+        );
+        r.freshness = badge(900); // > 730d → stale band
+        let line = search_table(&[r], RowNumbers::Plain, Paint::Plain).lines()[0].clone();
+        assert_contains!(line, "900d");
+        assert_not_contains!(line, "[installed]");
     }
 }

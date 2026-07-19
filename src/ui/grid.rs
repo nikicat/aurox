@@ -268,15 +268,19 @@ impl Col {
     }
 }
 
-/// One grid row: its aligned cells plus an optional verbatim tail appended
+/// One grid row: its aligned cells plus the unaligned tail segments appended
 /// after the last column.
 ///
 /// The tail carries the unaligned appendices (the `built` tag, the
-/// `(3d ago)` age, a description), each with its own leading gap, that
-/// ride behind the aligned block without perturbing column math.
+/// `(3d ago)` age, a description, the search row's `[installed]`/`[Nd]` tags)
+/// as a list of [`Cell`]s. The *grid* composes them — each rides behind the
+/// aligned block with the same two-blank gutter, so no call site hand-spaces a
+/// `format!("{}{}")` tail; a visually-empty ([`Width::ZERO`]) segment
+/// contributes nothing, no stray gap. Tail cells are never measured for column
+/// width (the tail is unaligned by definition).
 pub struct GridRow {
     cells: Vec<Cell>,
-    tail: String,
+    tail: Vec<Cell>,
 }
 
 impl GridRow {
@@ -284,14 +288,16 @@ impl GridRow {
     pub const fn new(cells: Vec<Cell>) -> Self {
         Self {
             cells,
-            tail: String::new(),
+            tail: Vec::new(),
         }
     }
 
-    /// Attach the unaligned tail (must carry its own leading gap).
+    /// Attach the unaligned tail segments. The grid owns their spacing (a
+    /// two-blank gutter before each non-empty one), so callers hand semantic
+    /// [`Cell`]s in order, never a pre-spaced string.
     #[must_use]
-    pub fn tail(mut self, tail: impl Into<String>) -> Self {
-        self.tail = tail.into();
+    pub fn tail(mut self, tail: Vec<Cell>) -> Self {
+        self.tail = tail;
         self
     }
 }
@@ -375,10 +381,18 @@ impl Grid {
                     }
                 }
             }
-            // The tail hugs the aligned block's right edge (its own leading
-            // gap is the spacing); the final trim is the no-trailing-
-            // whitespace rule for tail-less rows and empty last columns.
-            line.push_str(&row.tail);
+            // Unaligned tail: each non-empty segment rides behind the aligned
+            // block with the same two-blank gutter — the grid owns the spacing,
+            // not the call site. A visually-empty segment contributes nothing.
+            for cell in row.tail {
+                if cell.width == Width::ZERO {
+                    continue;
+                }
+                line.push_str("  ");
+                line.push_str(&cell.text);
+            }
+            // The final trim is the no-trailing-whitespace rule for tail-less
+            // rows and empty last columns.
             line.truncate(line.trim_end_matches(' ').len());
             out.push(line);
         }
@@ -446,11 +460,38 @@ mod tests {
     #[test]
     fn tail_follows_the_aligned_block() {
         let mut g = Grid::new(vec![Col::left(), Col::right()]);
-        g.push(GridRow::new(vec![Cell::plain("name"), Cell::plain("9s")]).tail("  built"));
-        g.push(GridRow::new(vec![Cell::plain("longer-name"), Cell::plain("")]).tail("  built"));
+        g.push(
+            GridRow::new(vec![Cell::plain("name"), Cell::plain("9s")])
+                .tail(vec![Cell::plain("built")]),
+        );
+        g.push(
+            GridRow::new(vec![Cell::plain("longer-name"), Cell::plain("")])
+                .tail(vec![Cell::plain("built")]),
+        );
         let lines = g.render().0;
         assert_eq!(lines[0], "name         9s  built");
         assert_eq!(lines[1], "longer-name      built");
+    }
+
+    /// The grid owns tail spacing: it gutters each non-empty segment and skips
+    /// visually-empty ones — no stray gap where a segment is absent.
+    #[test]
+    fn tail_gutters_segments_and_skips_empties() {
+        // Equal-width first cells so the aligned column adds no padding — this
+        // isolates the tail spacing under test.
+        let mut g = Grid::new(vec![Col::left()]);
+        g.push(GridRow::new(vec![Cell::plain("aa")]).tail(vec![
+            Cell::plain("x"),
+            Cell::plain(""),
+            Cell::plain("z"),
+        ]));
+        g.push(GridRow::new(vec![Cell::plain("bb")]).tail(vec![Cell::plain(""), Cell::plain("")]));
+        let lines = g.render().0;
+        assert_eq!(lines[0], "aa  x  z", "empty middle segment leaves no gap");
+        assert_eq!(
+            lines[1], "bb",
+            "all-empty tail adds nothing (and no trailing space)"
+        );
     }
 
     /// No line ever ends in whitespace — a trailing empty right-aligned
