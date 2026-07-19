@@ -84,13 +84,19 @@ fn print_system_report<E: ShellEnv>(report: &system::Report, env: &mut E) {
     env.print(&format!("state under {}:", report.root.display()));
     let mut grid = ui::Grid::new(vec![ui::Col::left(), ui::Col::right()]).indent("  ");
     for row in &report.rows {
-        let tag = if row.kind.prunable() { "  [cache]" } else { "" };
+        // Two tail segments — the description, then the `[cache]` flag on
+        // prunable rows — gutters supplied by the grid.
+        let cache = if row.kind.prunable() {
+            ui::Cell::plain("[cache]")
+        } else {
+            ui::Cell::plain("")
+        };
         grid.push(
             ui::GridRow::new(vec![
                 ui::Cell::plain(row.kind.label()),
                 ui::Cell::plain(row.size.to_string()),
             ])
-            .tail(format!("  {}{tag}", row.kind.description())),
+            .tail(vec![ui::Cell::plain(row.kind.description()), cache]),
         );
     }
     grid.push(
@@ -98,10 +104,10 @@ fn print_system_report<E: ShellEnv>(report: &system::Report, env: &mut E) {
             ui::Cell::plain("total"),
             ui::Cell::plain(report.total().to_string()),
         ])
-        .tail(format!(
-            "  `system prune` frees the [cache] rows ({})",
+        .tail(vec![ui::Cell::plain(format!(
+            "`system prune` frees the [cache] rows ({})",
             report.prunable_total(),
-        )),
+        ))]),
     );
     env.print_table(&grid.render());
 }

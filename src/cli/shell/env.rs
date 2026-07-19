@@ -17,7 +17,7 @@ use crate::error::{Error, Result};
 use crate::index::info::{self, InfoLookup};
 use crate::index::{self, AurIndexData, IndexEntry};
 use crate::mirror::{self, MirrorRepo};
-use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, RepoRank, SearchTerm};
+use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, SearchTerm};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke::{self, PkgUpgrade, REPO_AUR};
 use crate::pacman::preflight;
@@ -219,20 +219,26 @@ impl ShellEnv for RealEnv<'_> {
         let ranked = rank_rows(rows, &regexes);
 
         // Resolve installed state + versions against the live pacman DBs and
-        // render the aligned table (installed rows emphasized, with an `old → new`
-        // diff + build-time estimate). The build-time overlay is filled only for
-        // the installed AUR rows. The match-site annotation renders in the
-        // printed table; the remembered list carries only selector data.
+        // render the aligned table (installed rows emphasized, the installed
+        // version styled when behind, freshness band per AUR row). `pac` backs
+        // the installed-state lookup in `search_row`; the match-site annotation
+        // renders in the printed table; the remembered list carries only
+        // selector data.
         let pac = upgrade::system_pac()?;
-        let search_rows: Vec<ui::SearchRow> = ranked.iter().map(|r| r.search_row(&pac)).collect();
-        let metrics = self.search_metrics(&search_rows);
-        let table = ui::search_table(
-            &search_rows,
-            &pac,
-            &metrics,
-            ui::RowNumbers::Numbered,
-            ui::Paint::detect(),
-        );
+        let scale = ui::AgeScale::now(self.cfg.age_thresholds());
+        let search_rows: Vec<ui::SearchRow> =
+            ranked.iter().map(|r| r.search_row(&pac, &scale)).collect();
+        // Render best-first rows (row 1 = best) into the configured layout; the
+        // list itself prints best-last (bottom-up), so the strongest matches
+        // land next to the prompt with the low, easy-to-type numbers. Numbers
+        // still key the best-first `items` returned below, so `add 1` is always
+        // the top match regardless of print direction.
+        let table = ui::SearchList {
+            rows: &search_rows,
+            numbers: ui::RowNumbers::Numbered,
+            layout: self.cfg.search_layout,
+        }
+        .render(ui::Paint::detect(), ui::term_width());
         let items = ranked
             .iter()
             .map(|r| ListItem {
@@ -243,13 +249,7 @@ impl ShellEnv for RealEnv<'_> {
         // `ranked` borrows the session's AUR data, so it must be done before
         // printing takes `&mut self`.
         drop(ranked);
-        // The table is best-first (row 1 = best), each row carrying its `№`
-        // cell. Print it worst-first so the strongest matches land at the
-        // bottom, next to the prompt the shell scrolls to — and the low,
-        // easy-to-type numbers are the good ones. The numbers still key the
-        // best-first list returned below, so `add 1` is always the top match
-        // regardless of print direction.
-        self.print_table(&table.reversed());
+        self.print_table(&table);
         Ok(items)
     }
 
@@ -578,30 +578,6 @@ impl ShellEnv for RealEnv<'_> {
 }
 
 impl RealEnv<'_> {
-    /// Build the build-time overlay for the search table from the metrics store —
-    /// only the **installed AUR** rows (build time is a property we show for
-    /// installed packages, keyed by pkgname). Empty when there's no session or no
-    /// such rows, in which case the table's build column stays blank.
-    fn search_metrics(&self, rows: &[ui::SearchRow]) -> ui::PreviewMetrics {
-        let aur_data = &self.aur_data;
-        let roots: Vec<ui::TxnRoot> = rows
-            .iter()
-            .filter(|r| r.install.installed() && r.repo.rank() == RepoRank::Aur)
-            .map(|r| ui::TxnRoot {
-                repo: r.repo.clone(),
-                approval: ui::ApprovalCell::Approved,
-                name: r.name.clone(),
-                old_ver: r.upgrade_from().cloned(),
-                new_ver: r.new_ver.clone(),
-                age: None,
-            })
-            .collect();
-        if roots.is_empty() {
-            return ui::PreviewMetrics::empty();
-        }
-        upgrade::preview_metrics(aur_data, &roots, None)
-    }
-
     /// Re-fetch the mirror + index (subject to `policy`'s TTL) and reload the
     /// session in place, rebuilding the name caches so fresh data backs
     /// subsequent `search`/`info`/classification + completion. Shared by
@@ -984,9 +960,11 @@ fn flat_cart_lines(cart: &Cart, err: &Error) -> ui::Table {
         ui::Col::left(),                            // spec
     ]);
     for (i, it) in cart.items().iter().enumerate() {
+        // The `old → new` transition rides as an unaligned tail cell (the grid
+        // supplies the gap); a fresh install has none.
         let ver = it
             .version_transition()
-            .map_or_else(String::new, |t| format!("  {t}"));
+            .map_or_else(|| ui::Cell::plain(""), ui::Cell::plain);
         grid.push(
             ui::GridRow::new(vec![
                 ui::Cell::plain((i + 1).to_string()),
@@ -994,7 +972,7 @@ fn flat_cart_lines(cart: &Cart, err: &Error) -> ui::Table {
                 ui::Cell::plain(it.approval.label()),
                 ui::Cell::plain(it.spec().as_str()),
             ])
-            .tail(ver),
+            .tail(vec![ver]),
         );
     }
     out.append(grid.render());

@@ -15,16 +15,19 @@ mod banner;
 mod cells;
 mod change_set;
 mod cost;
+mod freshness;
 mod gix_progress;
 mod grid;
 mod progress;
 mod prompts;
+mod search_layout;
 mod search_table;
 mod tables;
 
 pub use banner::{SPLASH_MIN_COLS, SplashBlink, launch_banner};
 pub use change_set::{ApprovalCell, ChangeSet, TxnRoot};
 pub use cost::PreviewMetrics;
+pub use freshness::{AgeScale, AgeThresholds, Freshness, FreshnessBand};
 pub use gix_progress::{GixProgress, Operation};
 pub use grid::{Cell, Col, Grid, GridRow, Paint, Table, Width};
 pub use progress::{
@@ -32,9 +35,8 @@ pub use progress::{
     promote_count_bar, spinner, tick,
 };
 pub use prompts::{AurSetupChoice, aur_setup_prompt, confirm, confirm_default_no, select_pkgnames};
-pub use search_table::{
-    InstallState, MatchNote, RowNumbers, SearchRow, search_result, search_table,
-};
+pub use search_layout::{SearchLayout, SearchList};
+pub use search_table::{InstallState, MatchNote, RowNumbers, SearchRow, search_result};
 pub use tables::{UpgradeSelection, install_table, upgrade_table};
 
 use crate::units::ByteSize;
@@ -83,6 +85,21 @@ pub fn color_on() -> bool {
         ColorMode::Never => false,
         ColorMode::Auto => Term::stderr().features().colors_supported(),
     }
+}
+
+/// The terminal [`Width`], or [`None`] when stdout isn't a terminal.
+///
+/// A pipe or file has no meaningful width, so width-adaptive callers
+/// ([`SearchLayout::Auto`]) fall back to their dense default there. Read against
+/// **stdout** (where the list prints), and injected into the renderer rather
+/// than read inside it, so layout stays deterministic and testable.
+pub fn term_width() -> Option<Width> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    let (_, cols) = Term::stdout().size();
+    Some(Width::cols(cols as usize))
 }
 
 /// Print a top-level status line (`:: msg`) in bold blue.

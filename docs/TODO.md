@@ -14,12 +14,33 @@
   repo/name/version. Whatever palette lands, the installed flag must stay
   clearly visible (today it's row emphasis plus the `old → new` version
   cell, which color alone could drown out).
-- two-line search/upgrade table rows, pacman-style (`repo/name version` line
-  + indented description line) via a `ui/grid.rs` row mode — long
-  descriptions currently wrap mid-word on narrow terminals (surfaced by the
-  README screencasts; see the finding in docs/plans/screencasts.md).
-  Touches the table-unification seams and the PTY tests that compact-match
-  wrapped lines.
+- search ranking should *weight* freshness, not just tie-break on it. Today the
+  order is match-tier → shorter-name → repo-before-AUR → freshest-commit, where
+  freshness is only the final AUR tie-break (`src/cli/search.rs` `RankKey`). So a
+  stale/abandoned AUR package that matches the name a little better outranks a
+  fresh, maintained one — now glaring since the freshness-age risk band renders the
+  staleness right at the top of the list (bottom-up = nearest the prompt). Fold
+  the freshness *band* (`ui::freshness::FreshnessBand`) into the sort so
+  stale/abandoned rows sink and healthy ones rise *within* a match tier; consider
+  also demoting the too-fresh *caution* band (recency is non-monotonic — see the
+  band model). Name-match quality stays primary; freshness is a secondary weight,
+  not an override.
+- renderer-agnostic table model (so a **web-UI table renderer** can attach).
+  Today the whole grid stack is a *terminal-string* engine: `ui::Cell` stores
+  an already-ANSI-baked `String` (via the `Cell::paint(plain, paint, f)`
+  closure), and `Grid::render` emits `Table = Vec<String>`. Nothing structured
+  survives, so a non-terminal renderer (web, GUI) can consume none of it. The
+  fix is **style-as-data**: `Cell { content, style: Style }` where `Style` is a
+  data enum (`Dim`, `Bold`, `RepoHash`, `Band(FreshnessBand)`, `VersionDiff{…}`,
+  …), the grid emits a *structured* `Table` (rows of styled cells with computed
+  widths), and a `TerminalRenderer`/`WebRenderer` each translate `Style` → ANSI
+  / CSS. Cross-cutting: touches `ui/grid.rs` + every table renderer
+  (`search_table`, `change_set`, `tables`, `cost`, `cells`) + the `ShellEnv`
+  print seam. Groundwork already landed: `GridRow.tail` is a structured
+  `Vec<Cell>` the grid composes (call sites hand semantic segments, no
+  `format!("{}{}")` tails) — so the tail is ready for `Style`-carrying cells;
+  the remaining work is making `Cell` itself carry style-as-data instead of a
+  rendered string.
 - noticeable delay on exit: quitting takes a visible beat before the
   terminal prompt returns. Not reproducible at fixture scale — the hero
   demo cast measures quit → bash prompt at ~10 ms — so profile against a
@@ -45,6 +66,17 @@
 - account for already downloaded sources when printing download sizes in tables
 
 <!-- Done:
+- config-selectable two-line search rows, pacman-style (`№ repo/name version
+  [installed] [age]` headline + indented description line): a typed
+  `SearchLayout` knob (`auto`/`single`/`double`, default `auto`) resolved by
+  `ui::SearchList`, which renders best-first rows best-last at *row* granularity
+  (a two-line row's headline + desc stay paired, unlike the old flat
+  `Table::reversed`). `auto` measures the single-line layout against the terminal
+  width (`ui::term_width`) and flips to two-line when a row would wrap; a pipe
+  (no width) stays dense single-line. `-Ss` stays two-line for pacman parity.
+  The two-line renderer + the knob live in `ui/search_layout.rs`; the
+  `[installed]`/`[installed: X]` marker text is shared with `-Ss`
+  (`installed_marker_text`) so the two can't drift.
 - Ctrl-C at the *idle* shell prompt exits aurox (130 = 128+SIGINT), like
   Ctrl-D — mid-operation ^C still bails to the prompt, but an idle ^C now
   means "leave the shell" instead of being swallowed. Demoed by

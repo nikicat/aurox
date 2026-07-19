@@ -150,11 +150,10 @@ impl ChangeSet<'_> {
                     layout.size_cell(*size),
                     layout.time_cell(*cost, paint),
                 ])
-                .tail(format!(
-                    "{}{}",
-                    built_suffix(*cost, paint),
-                    age_cell(root.age, paint)
-                )),
+                .tail(vec![
+                    Cell::plain(built_suffix(*cost, paint)),
+                    Cell::plain(age_cell(root.age, paint)),
+                ]),
             );
         }
 
@@ -281,7 +280,7 @@ fn dep_lines(
                 layout.size_cell(*size),
                 layout.time_cell(*cost, paint),
             ])
-            .tail(built_suffix(*cost, paint)),
+            .tail(vec![Cell::plain(built_suffix(*cost, paint))]),
         );
     }
     let mut out = Table::new();
@@ -481,17 +480,17 @@ fn marker(text: &str, paint: Paint) -> String {
     }
 }
 
-/// The trailing `  (Xd ago)` age cell for an AUR row, dimmed when colored; empty
-/// when there's no age.
+/// The `(Xd ago)` age tag content for an AUR row, dimmed when colored — an
+/// unaligned tail cell (the grid supplies the gap); empty when there's no age.
 fn age_cell(age: Option<Duration>, paint: Paint) -> String {
     let Some(age) = age else {
         return String::new();
     };
     let label = format!("({} ago)", human_age(age));
     if paint.colored() {
-        format!("  {}", dim(&label))
+        dim(&label).to_string()
     } else {
-        format!("  {label}")
+        label
     }
 }
 

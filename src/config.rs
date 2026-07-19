@@ -3,12 +3,38 @@
 use crate::cli::shell::cart::AurApproval;
 use crate::error::Result;
 use crate::paths;
-use crate::ui::ColorMode;
+use crate::ui::{AgeThresholds, ColorMode, SearchLayout};
 use optfield::optfield;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod defaults;
+
+/// The `[ages]` config section: freshness-band thresholds for the AUR search
+/// list, in **days**.
+///
+/// Each key is independently optional — an unset key follows the built-in
+/// default ([`Config::age_thresholds`] applies them), so upgrades can move a
+/// default the user never pinned. Same sparse-persistence shape as
+/// [`Config::aur_approval`]: the file stores only what the user set.
+///
+/// A pkgbase's last-change age classifies as *caution* (`< caution_days` — the
+/// supply-chain window, tighter is less noisy on fast-moving `-git`/`-bin`
+/// packages, looser flags more recent pushes as unvetted), *fresh*, *maturing*,
+/// or *stale* (`≥ stale_days`); the row's freshness age colors by band (see the
+/// `ui::freshness` module).
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgeConfig {
+    /// Below this age a change is too recent to be vetted (default 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caution_days: Option<u64>,
+    /// Upper bound of the actively-maintained band (default 180).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh_days: Option<u64>,
+    /// Age past which a pkgbase reads as abandoned (default 730).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_days: Option<u64>,
+}
 
 /// Resolved runtime configuration.
 ///
@@ -104,6 +130,16 @@ pub struct Config {
     /// those. Cost is ~1ms per commit (clone + parse .SRCINFO), so 256
     /// caps at <300ms even for cold caches.
     pub review_history_scan_max: usize,
+    /// The `[ages]` section — freshness-band thresholds for the AUR search list.
+    /// See [`AgeConfig`]; resolved into [`crate::ui::AgeThresholds`] by
+    /// [`Self::age_thresholds`].
+    pub ages: AgeConfig,
+    /// How the interactive/pipe search list lays out each row: `auto` (default,
+    /// width-adaptive — dense single-line when a row fits the terminal, roomy
+    /// two-line when it would wrap), `single`, or `double`. `-Ss` stays two-line
+    /// for pacman parity regardless. A typed enum, not a string (unlike the
+    /// legacy [`Self::color`]); see [`crate::ui::SearchLayout`].
+    pub search_layout: SearchLayout,
 }
 
 impl Default for Config {
@@ -126,6 +162,17 @@ impl Config {
             "never" => ColorMode::Never,
             _ => ColorMode::Auto,
         }
+    }
+
+    /// The freshness-band thresholds for the search list — the `[ages]` section
+    /// resolved against the built-in defaults (an unset key follows the default,
+    /// so upgrades can move one the user never pinned).
+    pub fn age_thresholds(&self) -> AgeThresholds {
+        AgeThresholds::from_day_overrides(
+            self.ages.caution_days,
+            self.ages.fresh_days,
+            self.ages.stale_days,
+        )
     }
 }
 
@@ -248,6 +295,57 @@ mod tests {
             .expect("`banner = false` parses")
             .resolve();
         assert!(!cfg.banner);
+    }
+
+    /// The `search_layout` knob defaults to `Auto` (existing configs say nothing
+    /// about it), parses the typed spellings, and stays unset in the file when
+    /// unspecified (sparse persistence).
+    #[test]
+    fn search_layout_defaults_auto_and_parses() {
+        let cfg = toml::from_str::<ConfigFile>("")
+            .expect("empty config parses")
+            .resolve();
+        assert_eq!(cfg.search_layout, SearchLayout::Auto);
+        let cfg = toml::from_str::<ConfigFile>("search_layout = \"double\"")
+            .expect("`search_layout` parses")
+            .resolve();
+        assert_eq!(cfg.search_layout, SearchLayout::Double);
+
+        // Unset → does not materialize into the file on a round-trip.
+        let file = toml::from_str::<ConfigFile>("").unwrap();
+        assert!(!toml::to_string(&file).unwrap().contains("search_layout"));
+    }
+
+    /// The `[ages]` section is sparse: an absent section leaves every band at its
+    /// default, a partial section overrides just the keys it names, and only
+    /// those keys serialize back (no default materializes into the file).
+    #[test]
+    fn ages_section_is_sparse_and_defaulted() {
+        // No `[ages]` → every threshold at its built-in default.
+        let cfg = toml::from_str::<ConfigFile>("")
+            .expect("empty parses")
+            .resolve();
+        assert_eq!(cfg.age_thresholds(), AgeThresholds::default());
+
+        // A partial section overrides one key; the rest still follow defaults.
+        let file = toml::from_str::<ConfigFile>("[ages]\ncaution_days = 7")
+            .expect("partial [ages] parses");
+        assert_eq!(
+            file.clone().resolve().age_thresholds(),
+            AgeThresholds::from_day_overrides(Some(7), None, None)
+        );
+
+        // Only the set key round-trips — the unset ones do not persist.
+        let text = toml::to_string(&file).unwrap();
+        assert!(text.contains("caution_days = 7"), "{text:?}");
+        assert!(
+            !text.contains("fresh_days"),
+            "unset key must not persist: {text:?}"
+        );
+        assert!(
+            !text.contains("stale_days"),
+            "unset key must not persist: {text:?}"
+        );
     }
 
     /// "Pacman-only from now on" must create a missing config file holding
