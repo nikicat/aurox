@@ -126,7 +126,6 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
         aur_data,
         aur_state,
         caches,
-        view: None,
     };
     let mut state = State::default();
 
