@@ -13,6 +13,7 @@ use super::{ListSource, ShellEnv, State};
 use crate::build::review;
 use crate::index;
 use crate::names::{PkgBase, PkgName, PkgTarget, RepoName};
+use crate::pacman::invoke::REPO_AUR;
 
 /// The ack for one unstaged row: number-picked targets echo their row, so the
 /// binding the user just used ("2 = 3dslicer-bin") is confirmed in passing.
@@ -20,6 +21,25 @@ fn drop_ack(r: &Resolved) -> String {
     match r.row {
         Some(n) => format!("dropped {} (row {n})", r.target.as_str()),
         None => format!("dropped {}", r.target.as_str()),
+    }
+}
+
+/// The staging classification a picked row's own repo dictates — the AUR
+/// sentinel means an AUR pick (no concrete sync-DB), anything else is that
+/// concrete sync repo. Bypasses name classification so an explicit pick isn't
+/// re-derived from the bare name (which a same-named package in the other
+/// source would mis-route).
+fn stage_class_from_pick(repo: &RepoName) -> StageClass {
+    if repo == REPO_AUR {
+        StageClass {
+            source: Source::Aur,
+            repo: None,
+        }
+    } else {
+        StageClass {
+            source: Source::Repo,
+            repo: Some(repo.clone()),
+        }
     }
 }
 
@@ -89,8 +109,19 @@ impl State {
     ) -> bool {
         let mut changed = false;
         let mut any_unknown = false;
-        for t in targets.into_iter().map(|r| r.target) {
-            let Some(StageClass { source, repo }) = env.classify(&t) else {
+        for r in targets {
+            let Resolved { target: t, pin, .. } = r;
+            // An explicit numbered pick speaks for itself: the row already knew
+            // its source, so honor that rather than re-deriving from the bare
+            // name (which a same-named package in the other source would
+            // mis-classify — the `webp-pixbuf-loader` trap). Name/glob targets,
+            // and picks off a cart-derived list (no row source), fall back to
+            // name classification.
+            let class = match pin.as_ref() {
+                Some(repo) => Some(stage_class_from_pick(repo)),
+                None => env.classify(&t),
+            };
+            let Some(StageClass { source, repo }) = class else {
                 env.print(&format!("unknown package `{}` — not staged", t.as_str()));
                 any_unknown = true;
                 continue;
@@ -103,6 +134,11 @@ impl State {
                 .map_or_else(|| source.label().to_owned(), RepoName::into_inner);
             let prior = prior_approval(env, source, &t);
             let mut item = CartItem::new(t, source, repo, policy);
+            // Carry the explicit pick's routing lane through to apply so the
+            // resolver installs the package the user pointed at, not a namesake.
+            if pin.is_some() {
+                item.target = item.target.with_pin(source.into());
+            }
             if prior.is_some() {
                 item.approval = Approval::Approved;
             }
@@ -378,6 +414,9 @@ impl State {
                 .map(|i| Resolved {
                     target: i.spec().clone(),
                     row: None,
+                    // Re-reviewing already-staged items — the source is fixed
+                    // in the cart, so no pick to pin here.
+                    pin: None,
                 })
                 .collect();
             if pending.is_empty() {
@@ -512,7 +551,10 @@ impl State {
 mod tests {
     use super::*;
 
-    use crate::cli::shell::testenv::{FakeEnv, cart_specs, dispatch_one, env_with, li_repo, up};
+    use crate::build::SourcePin;
+    use crate::cli::shell::testenv::{
+        FakeEnv, cart_specs, dispatch_one, env_with, li_repo, state_showing, up,
+    };
     use crate::cli::shell::{Flow, command};
     use crate::names::PkgBase;
 
@@ -526,6 +568,50 @@ mod tests {
         assert!(!state.cart.all_approved());
         assert_eq!(state.cart.pending_review().len(), 1);
         assert_eq!(state.cart.pending_review()[0].spec(), "yay-bin");
+    }
+
+    #[test]
+    fn add_by_number_pins_an_aur_pick_over_a_repo_namesake() {
+        // The picked row is the AUR one, but the bare name *also* classifies as
+        // a repo package (the `webp-pixbuf-loader` collision). The explicit pick
+        // must stage the AUR package and carry an AUR pin to apply — not the
+        // repo namesake that name classification would otherwise choose.
+        let mut env = env_with(&[("webp-pixbuf-loader", Source::Repo)]);
+        let mut state = state_showing(vec![li_repo("aur", "webp-pixbuf-loader")]);
+        state.dispatch(&command::parse("add 1"), &mut env);
+        let item = &state.cart.items()[0];
+        assert_eq!(
+            item.source,
+            Source::Aur,
+            "the AUR row pick must win over the repo namesake"
+        );
+        assert_eq!(item.target.pin, Some(SourcePin::Aur));
+    }
+
+    #[test]
+    fn add_by_number_pins_a_repo_pick_without_reclassifying() {
+        // The picked row is the `extra` one. The pin bypasses classification
+        // entirely (the env classifies nothing here), so the pick alone stages
+        // the concrete repo package and pins the repo lane.
+        let mut env = FakeEnv::default();
+        let mut state = state_showing(vec![li_repo("extra", "webp-pixbuf-loader")]);
+        state.dispatch(&command::parse("add 1"), &mut env);
+        let item = &state.cart.items()[0];
+        assert_eq!(item.source, Source::Repo);
+        assert_eq!(item.repo_label().as_str(), "extra");
+        assert_eq!(item.target.pin, Some(SourcePin::Repo));
+    }
+
+    #[test]
+    fn add_by_name_classifies_and_leaves_no_pin() {
+        // A hand-typed name has no row to speak for it — classification decides
+        // and no pin is set, so the resolver stays free to re-resolve at apply.
+        let mut env = env_with(&[("glibc", Source::Repo)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add glibc"), &mut env);
+        let item = &state.cart.items()[0];
+        assert_eq!(item.source, Source::Repo);
+        assert_eq!(item.target.pin, None);
     }
 
     #[test]

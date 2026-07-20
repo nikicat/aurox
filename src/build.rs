@@ -93,6 +93,35 @@ struct BuiltPkg {
 pub struct Target {
     pub spec: PkgTarget,
     pub hint: Option<PkgName>,
+    /// The source lane an **explicit** selection pinned, or `None` for a
+    /// hand-typed name / upgrade candidate the resolver is free to classify.
+    ///
+    /// When the user picks a numbered search row (`add 1`), that row already
+    /// knew whether it was a repo or AUR package — the pin carries that choice
+    /// through to apply so the resolver honors it instead of re-deriving from
+    /// the bare name (which a same-named package in the other source would
+    /// mis-route). See [`SourcePin`].
+    pub pin: Option<SourcePin>,
+}
+
+/// The install lane an explicit selection pinned onto a [`Target`].
+///
+/// A numbered `add N` is an unambiguous disambiguation — the user pointed at
+/// one row, whose source was already known. Carrying it defeats the
+/// name-collision trap where re-classifying the bare name at apply would pick
+/// the wrong package (the `webp-pixbuf-loader` regression: an installed
+/// `extra` package vs. an unrelated AUR namesake).
+///
+/// [`Repo`](Self::Repo) is honored by resolution's pacman precedence (a repo
+/// pick is never foreign, so the AUR rebuild override can't fire); [`Aur`](Self::Aur)
+/// is the load-bearing one — it forces AUR resolution *over* pacman precedence,
+/// the one routing pacman's own rules can't express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePin {
+    /// Pinned to a sync repo — keep it on the pacman lane, never rebuild from AUR.
+    Repo,
+    /// Pinned to the AUR — resolve as AUR even when a sync repo owns the name.
+    Aur,
 }
 
 impl Target {
@@ -102,6 +131,7 @@ impl Target {
         Self {
             spec: spec.into(),
             hint: None,
+            pin: None,
         }
     }
 
@@ -111,7 +141,16 @@ impl Target {
         Self {
             spec: spec.into(),
             hint: Some(hint),
+            pin: None,
         }
+    }
+
+    /// Pin this target's source lane — the identity an explicit numbered
+    /// selection carries from `add N` through to apply.
+    #[must_use]
+    pub const fn with_pin(mut self, pin: SourcePin) -> Self {
+        self.pin = Some(pin);
+        self
     }
 }
 
@@ -409,7 +448,10 @@ impl InstallCtx<'_> {
             resolver::expand_pkgbase_targets(self.aur, self.pac, targets, &mut |pb, pns| {
                 ui::select_pkgnames(pb, pns, noconfirm).map_err(|e| Error::other(e.to_string()))
             })?;
-        let mut plan = resolver::resolve(self.aur, self.pac, &expanded.targets)?;
+        // Each expanded target carries its `SourcePin`, so an explicit AUR pick
+        // (`add N` on an `aur/…` row) stays on the build path even when a sync
+        // repo owns the name; un-pinned targets resolve by pacman precedence.
+        let mut plan = resolver::resolve_expanded(self.aur, self.pac, &expanded.targets)?;
         plan.pkgname_selections = expanded.selections;
         // For pkgbase/provides hits the resolver received the pkgbase string, so
         // `plan.direct_targets` only contains the pkgbase. Mark the pkgnames the

@@ -10,7 +10,7 @@
 //! need (coarse repo/AUR classification, the PKGBUILD diff, the build+install)
 //! live behind the [`super::ShellEnv`] trait.
 
-use crate::build::Target;
+use crate::build::{SourcePin, Target};
 use crate::names::{PkgBase, PkgName, PkgTarget, RepoName};
 use crate::pacman::invoke::{PkgUpgrade, REPO_AUR};
 use serde::{Deserialize, Serialize};
@@ -35,6 +35,16 @@ impl Source {
         match self {
             Self::Repo => "repo",
             Self::Aur => "aur",
+        }
+    }
+}
+
+impl From<Source> for SourcePin {
+    /// The routing pin an explicit pick of this source carries into apply.
+    fn from(s: Source) -> Self {
+        match s {
+            Source::Repo => Self::Repo,
+            Source::Aur => Self::Aur,
         }
     }
 }
