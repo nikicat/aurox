@@ -17,6 +17,7 @@ use crate::names::{PkgBase, PkgName, PkgTarget, PkgTargetSetExt};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke;
 use crate::paths;
+use crate::resolver::pkgbase_expand::PkgnameSelector;
 use crate::resolver::{self, PkgbasePlan, Plan};
 use crate::ui;
 use crate::version::{Ver, Version};
@@ -440,14 +441,42 @@ impl InstallCtx<'_> {
     /// plan to [`apply_plan`] — re-resolving would re-run the split-package prompt
     /// inside `expand_pkgbase_targets`.
     pub(crate) fn resolve_targets(&self, targets: &[Target], noconfirm: bool) -> Result<Plan> {
-        // Expand bare `-S <pkgbase>` targets into the pkgname(s) the user wants
-        // installed as explicit. Split pkgbases prompt for a subset; single-pkgname
-        // pkgbases pass through silently. The selector closure delegates to
-        // `ui::select_pkgnames` so tests can swap in a deterministic picker.
-        let expanded =
-            resolver::expand_pkgbase_targets(self.aur, self.pac, targets, &mut |pb, pns| {
-                ui::select_pkgnames(pb, pns, noconfirm).map_err(|e| Error::other(e.to_string()))
-            })?;
+        // The interactive picker: split pkgbases prompt for a subset;
+        // single-pkgname pkgbases pass through silently. `ui::select_pkgnames`
+        // is behind the closure so tests can swap in a deterministic picker.
+        self.resolve_with_selector(targets, &mut |pb, pns| {
+            ui::select_pkgnames(pb, pns, noconfirm).map_err(|e| Error::other(e.to_string()))
+        })
+    }
+
+    /// Resolve `targets` reusing a prior run's split-package choices: a pkgbase
+    /// already in `seed` returns its stored subset without prompting; a
+    /// not-yet-seen split root still prompts once. The shell's `stage_plan`
+    /// re-resolves the whole cart on every `add`, so seeding is what keeps an
+    /// already-resolved split root from re-opening its picker each time.
+    pub(crate) fn resolve_seeded(
+        &self,
+        targets: &[Target],
+        seed: &HashMap<PkgBase, Vec<PkgName>>,
+    ) -> Result<Plan> {
+        self.resolve_with_selector(targets, &mut |pb, pns| {
+            if let Some(sel) = seed.get(pb) {
+                return Ok(sel.clone());
+            }
+            ui::select_pkgnames(pb, pns, false).map_err(|e| Error::other(e.to_string()))
+        })
+    }
+
+    /// Expand (via `select`) → resolve → carry the expansion's selections,
+    /// direct-pkgname markers, and counterpart hints back onto the plan. The
+    /// shared body behind [`Self::resolve_targets`] and [`Self::resolve_seeded`],
+    /// which differ only in the picker closure.
+    fn resolve_with_selector(
+        &self,
+        targets: &[Target],
+        select: &mut PkgnameSelector<'_>,
+    ) -> Result<Plan> {
+        let expanded = resolver::expand_pkgbase_targets(self.aur, self.pac, targets, select)?;
         // Each expanded target carries its `SourcePin`, so an explicit AUR pick
         // (`add N` on an `aur/…` row) stays on the build path even when a sync
         // repo owns the name; un-pinned targets resolve by pacman precedence.

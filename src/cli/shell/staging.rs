@@ -9,7 +9,7 @@ use super::cart::{
     StageResult, UnstageResult,
 };
 use super::selector::Resolved;
-use super::{ListSource, ShellEnv, State};
+use super::{CartEdit, ListSource, ShellEnv, State};
 use crate::build::review;
 use crate::index;
 use crate::names::{PkgBase, PkgName, PkgTarget, RepoName};
@@ -87,14 +87,18 @@ impl State {
             return;
         }
         let policy = env.aur_policy();
-        let changed = self.edit_cart(|s| s.stage_targets(targets, policy, env));
-        // One status line, not a table dump: the cart's standing stays on
-        // screen without printing row numbers that aren't addressable (the
-        // quiet-mutation rule — see `State::summarize`). Skipped when nothing
-        // actually changed (all already-staged / unknown), so a no-op `add`
-        // stays quiet.
-        if changed {
-            self.summarize(env);
+        // Stage the new items, then re-freeze the whole-cart resolution. A
+        // resolver / conflict error rejects the whole `add` and rolls the cart
+        // back — the "a cart with conflicting items is impossible" guarantee.
+        match self.edit_and_resolve(env, |s, env| s.stage_targets(targets, policy, env)) {
+            // One status line, not a table dump: the cart's standing stays on
+            // screen without printing row numbers that aren't addressable (the
+            // quiet-mutation rule — see `State::summarize`).
+            Ok(CartEdit::Changed) => self.summarize(env),
+            // Nothing actually changed (all already-staged / unknown) — a no-op
+            // `add` stays quiet.
+            Ok(CartEdit::Unchanged) => {}
+            Err(e) => env.print(&format!("add rejected — {e}; cart unchanged")),
         }
     }
 
@@ -106,7 +110,7 @@ impl State {
         targets: Vec<Resolved>,
         policy: AurApproval,
         env: &mut E,
-    ) -> bool {
+    ) -> CartEdit {
         let mut changed = false;
         let mut any_unknown = false;
         for r in targets {
@@ -163,7 +167,7 @@ impl State {
         if any_unknown && env.aur_state() == index::AurState::NotSetUp {
             env.print("unknown names may be in the AUR — `refresh aur` syncs it (one-time ~2 GiB)");
         }
-        changed
+        CartEdit::from_changed(changed)
     }
 
     /// `drop <sel…>`: unstage installs from the cart. Names/globs match staged
@@ -187,17 +191,21 @@ impl State {
             env.print("drop: nothing in the cart matched");
             return;
         }
-        let changed = self.edit_cart(|s| s.unstage_targets(targets, env));
-        // One status line (or "cart is empty" once the last row goes) — see
-        // `add` for the quiet-mutation rule.
-        if changed {
-            self.summarize(env);
+        // Removing rows can't introduce a resolver/conflict error, so the
+        // re-resolve always succeeds — but route it through `edit_and_resolve`
+        // so the frozen resolution tracks the smaller cart.
+        match self.edit_and_resolve(env, |s, env| s.unstage_targets(targets, env)) {
+            // One status line (or "cart is empty" once the last row goes) — see
+            // `add` for the quiet-mutation rule.
+            Ok(CartEdit::Changed) => self.summarize(env),
+            Ok(CartEdit::Unchanged) => {}
+            Err(e) => env.print(&format!("drop: {e}")),
         }
     }
 
     /// `drop`'s edit half: unstage each resolved target, acking hits (with
     /// row provenance) and wording misses. Returns whether anything left.
-    fn unstage_targets<E: ShellEnv>(&mut self, targets: Vec<Resolved>, env: &mut E) -> bool {
+    fn unstage_targets<E: ShellEnv>(&mut self, targets: Vec<Resolved>, env: &mut E) -> CartEdit {
         let mut changed = false;
         for r in targets {
             match self.cart.unstage(&r.target) {
@@ -208,7 +216,7 @@ impl State {
                 UnstageResult::NotStaged => env.print(&self.miss_note(&r)),
             }
         }
-        changed
+        CartEdit::from_changed(changed)
     }
 
     /// `keep <sel…>`: keep only the selected install rows, dropping every other
@@ -228,29 +236,30 @@ impl State {
                 return;
             }
         };
-        let changed = self.edit_cart(|s| s.keep_targets(&targets, env));
-        if changed {
-            self.summarize(env);
+        match self.edit_and_resolve(env, |s, env| s.keep_targets(&targets, env)) {
+            Ok(CartEdit::Changed) => self.summarize(env),
+            Ok(CartEdit::Unchanged) => {}
+            Err(e) => env.print(&format!("keep: {e}")),
         }
     }
 
     /// `keep`'s edit half: narrow the cart to the selected rows, wording the
     /// no-match and nothing-dropped cases. Returns whether any row dropped.
-    fn keep_targets<E: ShellEnv>(&mut self, targets: &[Resolved], env: &mut E) -> bool {
+    fn keep_targets<E: ShellEnv>(&mut self, targets: &[Resolved], env: &mut E) -> CartEdit {
         match self.cart.keep(targets.iter().map(|r| &r.target)) {
             KeepResult::NoMatch => {
                 env.print("keep: nothing in the cart matched — cart unchanged");
-                false
+                CartEdit::Unchanged
             }
             KeepResult::Kept { dropped } if dropped.is_empty() => {
                 env.print("keep: every staged package is already kept — nothing dropped");
-                false
+                CartEdit::Unchanged
             }
             KeepResult::Kept { dropped } => {
                 for spec in &dropped {
                     env.print(&format!("dropped {}", spec.as_str()));
                 }
-                true
+                CartEdit::Changed
             }
         }
     }
@@ -282,24 +291,25 @@ impl State {
             env.print("remove: nothing matched");
             return;
         }
-        let changed = self.edit_cart(|s| {
-            let mut changed = false;
+        match self.edit_and_resolve(env, |s, env| {
+            let mut outcome = CartEdit::Unchanged;
             for t in targets.into_iter().map(|r| r.target) {
-                changed |= s.remove_one(t, env);
+                outcome = outcome.or(s.remove_one(t, env));
             }
-            changed
-        });
-        // One status line (its counts include the new "will remove" row) — see
-        // `add` for the quiet-mutation rule.
-        if changed {
-            self.summarize(env);
+            outcome
+        }) {
+            // One status line (its counts include the new "will remove" row) —
+            // see `add` for the quiet-mutation rule.
+            Ok(CartEdit::Changed) => self.summarize(env),
+            Ok(CartEdit::Unchanged) => {}
+            Err(e) => env.print(&format!("remove: {e}")),
         }
     }
 
     /// One `remove` target: refuse a staged fresh install (pointing at
     /// `drop`), convert a staged upgrade into a removal, else stage the
     /// removal outright. Returns whether the cart changed.
-    fn remove_one<E: ShellEnv>(&mut self, t: PkgTarget, env: &mut E) -> bool {
+    fn remove_one<E: ShellEnv>(&mut self, t: PkgTarget, env: &mut E) -> CartEdit {
         // `Some(is_upgrade)` when the target is a staged install row.
         match self.cart.item(&t).map(|i| i.upgrade.is_some()) {
             // A fresh-install row isn't installed — you can't uninstall it.
@@ -310,7 +320,7 @@ impl State {
                     "{name} is staged for install, not installed — `drop {name}` to unstage it",
                     name = t.as_str()
                 ));
-                false
+                CartEdit::Unchanged
             }
             // An upgrade row is an installed package: removing it wins over
             // upgrading it, so the row makes way for the removal.
@@ -325,18 +335,18 @@ impl State {
                         "{name}: dropped the staged upgrade; already staged for removal"
                     )),
                 }
-                true
+                CartEdit::Changed
             }
             None => {
                 let name = PkgName::from(t.into_inner());
                 match self.cart.stage_remove(name.clone()) {
                     StageResult::Staged => {
                         env.print(&format!("staged removal of {name}"));
-                        true
+                        CartEdit::Changed
                     }
                     StageResult::AlreadyStaged => {
                         env.print(&format!("{name} is already staged for removal"));
-                        false
+                        CartEdit::Unchanged
                     }
                 }
             }
@@ -362,10 +372,11 @@ impl State {
             env.print("approve: nothing in the cart matched");
             return;
         }
-        let changed = self.edit_cart(|s| s.approve_targets(targets, env));
-        // The status line surfaces the "all approved — run `apply`" moment the
-        // instant the last gate clears (or how many gates remain).
-        if changed {
+        // Approval doesn't change the install set, so `edit_cart` (no re-resolve)
+        // — the frozen resolution is still valid; only the approval cell moved.
+        if self.edit_cart(|s| s.approve_targets(targets, env)) == CartEdit::Changed {
+            // The status line surfaces the "all approved — run `apply`" moment
+            // the instant the last gate clears (or how many gates remain).
             self.summarize(env);
         }
     }
@@ -373,7 +384,7 @@ impl State {
     /// `approve`'s edit half: clear each resolved target's gate (recording
     /// its pkgbase as reviewed so the build pipeline won't re-prompt).
     /// Returns whether any gate actually cleared.
-    fn approve_targets<E: ShellEnv>(&mut self, targets: Vec<Resolved>, env: &mut E) -> bool {
+    fn approve_targets<E: ShellEnv>(&mut self, targets: Vec<Resolved>, env: &mut E) -> CartEdit {
         let mut changed = false;
         for r in targets {
             let t = &r.target;
@@ -395,7 +406,7 @@ impl State {
                 ApproveResult::NotStaged => env.print(&self.miss_note(&r)),
             }
         }
-        changed
+        CartEdit::from_changed(changed)
     }
 
     /// `review [sel…]`: open each selected AUR item's PKGBUILD (diff-against-
@@ -437,10 +448,11 @@ impl State {
             env.print("review: nothing in the cart matched");
             return;
         }
-        let approved_any = self.edit_cart(|s| s.review_targets(targets, env));
-        // Same status line as `approve` — a review pass that cleared the last
-        // gate announces readiness without a `show`.
-        if approved_any {
+        // A review pass only flips approval cells — no install-set change, so
+        // `edit_cart` (no re-resolve).
+        if self.edit_cart(|s| s.review_targets(targets, env)) == CartEdit::Changed {
+            // Same status line as `approve` — a review pass that cleared the
+            // last gate announces readiness without a `show`.
             self.summarize(env);
         }
     }
@@ -450,7 +462,7 @@ impl State {
     /// all"). Guard clauses keep the loop flat — non-reviewable targets ack
     /// and continue; an abort or error stops the pass. Returns whether any
     /// gate cleared.
-    fn review_targets<E: ShellEnv>(&mut self, targets: Vec<Resolved>, env: &mut E) -> bool {
+    fn review_targets<E: ShellEnv>(&mut self, targets: Vec<Resolved>, env: &mut E) -> CartEdit {
         let mut approved_any = false;
         // Flips to `Auto` once the user picks "approve all": the remaining
         // AUR items clear without opening another diff.
@@ -511,7 +523,7 @@ impl State {
                 }
             }
         }
-        approved_any
+        CartEdit::from_changed(approved_any)
     }
 
     /// Word a cart-verb miss for one resolved selector: name-picked targets
