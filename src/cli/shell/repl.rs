@@ -186,6 +186,17 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
         helper.watch_first_keystroke(blink.cancel_on_keystroke());
     }
 
+    // Seed the helper's cart + ambient hint before the first prompt so a seeded
+    // `aurox <term>` launch already offers `add <number|pkgname>` inline (the
+    // loop refreshes it after every command below).
+    if let Some(helper) = rl.helper_mut() {
+        helper.sync(
+            Rc::clone(&env.caches.universe),
+            cart_targets(&state),
+            state.empty_line_hint().map(str::to_owned),
+        );
+    }
+
     let code = loop {
         // The prompt is recomputed per line: it carries the cart's standing
         // (counts + open review gates), so state stays ambient at the prompt
@@ -204,12 +215,17 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
                     rl.add_history_entry(line.as_str()).ok();
                 }
                 let flow = state.dispatch(&command::parse(&line), &mut env);
-                // Refresh Tab's view for the next line: the just-mutated cart,
-                // and the universe (a cheap `Rc` clone — only `upgrade`/`refresh`
-                // actually swaps it). Sharing the same sources the selector
-                // resolver uses keeps "what Tab offers" == "what the verb accepts".
+                // Refresh Tab's view + the inline hint for the next line: the
+                // just-mutated cart, the universe (a cheap `Rc` clone — only
+                // `upgrade`/`refresh` actually swaps it), and the session's next
+                // step. Sharing the same sources the selector resolver uses keeps
+                // "what Tab offers" == "what the verb accepts".
                 if let Some(helper) = rl.helper_mut() {
-                    helper.sync(Rc::clone(&env.caches.universe), cart_targets(&state));
+                    helper.sync(
+                        Rc::clone(&env.caches.universe),
+                        cart_targets(&state),
+                        state.empty_line_hint().map(str::to_owned),
+                    );
                 }
                 if let Flow::Exit(code) = flow {
                     break code;

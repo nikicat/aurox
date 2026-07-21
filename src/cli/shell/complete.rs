@@ -157,6 +157,14 @@ pub struct ShellHelper {
     /// of a line in progress. `None` when the splash isn't animating (a non-TTY
     /// or `--color never` session, and every unit test).
     first_key: Option<mpsc::Sender<()>>,
+    /// The ambient next-step suggestion shown dimmed at a *wholly empty* prompt
+    /// (`add <number|pkgname>`, `review`, `apply`) — the session's one obvious
+    /// next action, computed by
+    /// [`State::empty_line_hint`](super::State::empty_line_hint) and refreshed
+    /// by [`sync`](Self::sync) after each command. `None` when the session has
+    /// nothing to suggest (a fresh prompt), so the first bare launch stays clear
+    /// for the splash.
+    empty_hint: Option<String>,
 }
 
 impl ShellHelper {
@@ -167,6 +175,7 @@ impl ShellHelper {
             universe,
             cart: Vec::new(),
             first_key: None,
+            empty_hint: None,
         }
     }
 
@@ -177,12 +186,20 @@ impl ShellHelper {
         self.first_key = Some(cancel);
     }
 
-    /// Refresh the per-command snapshots: the staged cart specs, and (cheaply,
-    /// by `Rc`) the current name universe. Called after every dispatch so Tab
-    /// reflects the just-mutated cart and any `upgrade`/`refresh` reload.
-    pub fn sync(&mut self, universe: Rc<[PkgTarget]>, cart: Vec<PkgTarget>) {
+    /// Refresh the per-command snapshots: the staged cart specs, the current
+    /// name universe (cheaply, by `Rc`), and the ambient empty-prompt hint.
+    /// Called after every dispatch (and once before the first prompt) so Tab
+    /// and the inline suggestion reflect the just-mutated cart, any
+    /// `upgrade`/`refresh` reload, and the session's current next step.
+    pub fn sync(
+        &mut self,
+        universe: Rc<[PkgTarget]>,
+        cart: Vec<PkgTarget>,
+        empty_hint: Option<String>,
+    ) {
         self.universe = universe;
         self.cart = cart;
+        self.empty_hint = empty_hint;
     }
 
     /// The completion core, split out so it's unit-testable without a rustyline
@@ -197,7 +214,15 @@ impl ShellHelper {
         let before = &line[..start];
         // First word (nothing but whitespace before the cursor word) → verbs.
         let cands = if before.trim().is_empty() {
-            word_candidates(verb_names(), word)
+            let mut cands = word_candidates(verb_names(), word);
+            // On an empty prompt the dimmed hint already suggests one verb;
+            // float it to the front so the first Tab completes to what the user
+            // sees (`apply`), not whatever `Verb::ALL` happens to list first
+            // (`search`). Every verb is still offered — just reordered.
+            if word.is_empty() {
+                self.promote_hinted_verb(&mut cands);
+            }
+            cands
         } else if command::parse(before).verb() == Some(Verb::Config) {
             // `config`'s slots don't fit the single-scope model — action word,
             // then knob path (schema-derived), then nothing.
@@ -217,6 +242,27 @@ impl ShellHelper {
             }
         };
         (start, cands)
+    }
+
+    /// The canonical verb the ambient empty-line hint leads with (`apply`,
+    /// `review`, `add`), or `None` when there's no hint. The hint is a
+    /// `<verb> …` template ([`State::empty_line_hint`](super::State::empty_line_hint)),
+    /// so its first whitespace-delimited token is the verb.
+    fn hint_verb(&self) -> Option<&str> {
+        self.empty_hint.as_deref()?.split_whitespace().next()
+    }
+
+    /// Move the [`hint_verb`](Self::hint_verb)'s candidate to the front of an
+    /// empty-prompt verb list, so Tab's first completion is the verb the dimmed
+    /// hint is already showing. A no-op when there's no hint or its verb isn't
+    /// in the list (both currently impossible — the hint verbs are all real —
+    /// but kept total so a future hint can't desync the two).
+    fn promote_hinted_verb(&self, cands: &mut Vec<Pair>) {
+        let Some(verb) = self.hint_verb() else { return };
+        if let Some(i) = cands.iter().position(|p| p.display == verb) {
+            let hit = cands.remove(i);
+            cands.insert(0, hit);
+        }
     }
 
     /// Universe names with the given prefix, via a binary search over the sorted
@@ -251,10 +297,14 @@ impl ShellHelper {
     ///   `asdqwe`, `a` → `sd`); and once the next character diverges (`asd`,
     ///   `add a` thousands deep) there's nothing certain to add, so no hint.
     ///
-    /// Only fires at end-of-line and on a non-empty word (there's no prefix to
-    /// extend otherwise). Shares the Tab completer's sources, so the hint can
-    /// never suggest something Tab wouldn't complete. Split out from the
-    /// [`Hinter`] impl so it's unit-testable without a live history [`Context`].
+    /// Fires only at end-of-line. On a non-empty word it type-aheads as above;
+    /// on a *wholly empty* line it shows the session's ambient next-step
+    /// suggestion ([`empty_hint`](Self::empty_hint), e.g. `add <number|pkgname>`
+    /// after a search) instead — a `<verb> <placeholder>` template, not a
+    /// completion, so it deliberately isn't tied to the Tab sources. A trailing
+    /// space mid-command (`add `) has no tail to extend and no ambient hint.
+    /// Split out from the [`Hinter`] impl so it's unit-testable without a live
+    /// history [`Context`].
     fn hint_for(&self, line: &str, pos: usize) -> Option<String> {
         // Type-ahead only extends the tail: skip unless the cursor is at the end
         // of a non-empty word.
@@ -264,7 +314,11 @@ impl ShellHelper {
         let start = word_start(line, pos);
         let word = &line[start..pos];
         if word.is_empty() {
-            return None;
+            // A wholly empty prompt shows the session's ambient next step (the
+            // prompt ends in a space, so it reads `aurox> add …`); a trailing
+            // space mid-command (`add `) has no tail to extend, and no ambient
+            // hint either.
+            return line.is_empty().then(|| self.empty_hint.clone()).flatten();
         }
         let before = &line[..start];
         if before.trim().is_empty() {
@@ -528,6 +582,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_prompt_tab_leads_with_the_hinted_verb() {
+        // The bug: the dimmed hint says `apply`, but Tab on the empty line
+        // completed `search` (the first `Verb::ALL` entry). With a hint synced
+        // in, the hinted verb floats to the front so Tab agrees with what's
+        // shown — while still offering every verb (order aside).
+        let mut h = helper(&[], &[]);
+        h.empty_hint = Some("apply".to_owned());
+        let got = complete(&h, "");
+        assert_eq!(got.first().map(String::as_str), Some("apply "));
+        assert_eq!(got.len(), Verb::ALL.len(), "every verb still offered");
+
+        // The `add <number|pkgname>` hint promotes its verb (`add`) the same way.
+        h.empty_hint = Some("add <number|pkgname>".to_owned());
+        assert_eq!(complete(&h, "").first().map(String::as_str), Some("add "));
+
+        // No hint (a fresh prompt) → the list keeps its natural order.
+        h.empty_hint = None;
+        assert_eq!(
+            complete(&h, "").first().map(String::as_str),
+            Some("search ")
+        );
+    }
+
+    #[test]
     fn system_arg_completes_the_actions() {
         let h = helper(&["showcase", "pruneyard"], &[]);
         // The `system` argument position offers the sub-verbs — never the
@@ -751,10 +829,27 @@ mod tests {
         assert_eq!(h.hint_for("add zlib", 3), None);
         // Empty word (trailing space) → nothing to extend.
         assert_eq!(hint(&h, "add "), None);
-        assert_eq!(hint(&h, ""), None);
         // A no-argument verb takes no package hint.
         assert_eq!(hint(&h, "show z"), None);
         // Numeric selectors are never hinted.
         assert_eq!(hint(&h, "add 3"), None);
+    }
+
+    #[test]
+    fn empty_prompt_shows_the_ambient_hint_when_set() {
+        let mut h = helper(&["zlib"], &[]);
+        // No ambient hint (a fresh session) → the empty prompt stays bare.
+        assert_eq!(hint(&h, ""), None);
+        // Once the session syncs one in (from `State::empty_line_hint`), the
+        // empty prompt type-aheads the whole suggestion — the prompt's trailing
+        // space separates it, so it reads `aurox> add <number|pkgname>`.
+        h.empty_hint = Some("add <number|pkgname>".to_owned());
+        assert_eq!(hint(&h, "").as_deref(), Some("add <number|pkgname>"));
+        // A trailing space mid-command is not an empty line — the ambient hint
+        // must not bleed into `add `.
+        assert_eq!(hint(&h, "add "), None);
+        // And a partially-typed verb still type-aheads the verb, not the ambient
+        // hint (the empty-line path is only reached when the whole line is bare).
+        assert_eq!(hint(&h, "app").as_deref(), Some("rove "));
     }
 }
