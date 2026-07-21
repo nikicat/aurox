@@ -164,12 +164,12 @@ fn first_op_letter(argv: &[String]) -> Option<char> {
     })
 }
 
+/// Parse the `--color` CLI flag into a [`ui::ColorMode`] — the lenient surface
+/// (an unrecognized value degrades to `auto`), one match kept in
+/// [`ColorMode::from_str`](std::str::FromStr) so the flag and the config-file
+/// spellings can't drift.
 fn parse_color_mode(s: &str) -> ui::ColorMode {
-    match s {
-        "always" => ui::ColorMode::Always,
-        "never" => ui::ColorMode::Never,
-        _ => ui::ColorMode::Auto,
-    }
+    s.parse().unwrap_or_default()
 }
 
 #[cfg(test)]

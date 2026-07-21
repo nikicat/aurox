@@ -21,6 +21,7 @@
 //! and "what the verb accepts" can't drift.
 
 use super::command::{self, SystemAction, Verb};
+use crate::config::{ConfigPath, edit};
 use crate::names::PkgTarget;
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
@@ -68,9 +69,54 @@ const fn arg_kind(verb: Option<Verb>) -> ArgKind {
         Some(Verb::Drop | Verb::Keep | Verb::Review | Verb::Approve | Verb::Upgrade) => {
             ArgKind::Cart
         }
-        Some(Verb::Show | Verb::Apply | Verb::Undo | Verb::Redo | Verb::Clear | Verb::Quit)
+        // `config`'s two argument slots (action word, then knob path) don't fit
+        // the single-scope model — it's routed through [`config_slot`] before
+        // `arg_kind` is consulted, so it falls in with the complete-nothing verbs
+        // here purely to keep the match exhaustive.
+        Some(
+            Verb::Config
+            | Verb::Show
+            | Verb::Apply
+            | Verb::Undo
+            | Verb::Redo
+            | Verb::Clear
+            | Verb::Quit,
+        )
         | None => ArgKind::None,
     }
+}
+
+/// Which slot of a `config …` line the cursor's argument sits in — the action
+/// word, a knob path, or nothing (a `set`'s value). Positional like the rest of
+/// the completer, decided from the words *before* the cursor word.
+enum ConfigSlot {
+    /// The sub-verb word (`show`/`set`/`reset`).
+    Actions,
+    /// A knob path (`color`, `ages.caution_days`).
+    Paths,
+    /// A value or beyond — nothing to complete from a static list.
+    None,
+}
+
+/// Decide the config slot from the completed words before the cursor. `before`
+/// starts with the `config` verb, so one word means the cursor is on the action,
+/// two means it's on the path argument of a path-taking action.
+fn config_slot(before: &str) -> ConfigSlot {
+    let words: Vec<&str> = before.split_whitespace().collect();
+    match words.as_slice() {
+        [_config] => ConfigSlot::Actions,
+        [_config, action]
+            if command::CONFIG_ACTIONS.contains(&action.to_ascii_lowercase().as_str()) =>
+        {
+            ConfigSlot::Paths
+        }
+        _ => ConfigSlot::None,
+    }
+}
+
+/// The `config` sub-verb words — the completion list after `config`.
+fn config_action_names() -> impl Iterator<Item = &'static str> {
+    command::CONFIG_ACTIONS.iter().copied()
 }
 
 /// The canonical verb names, in help order — the command-position word list.
@@ -152,6 +198,14 @@ impl ShellHelper {
         // First word (nothing but whitespace before the cursor word) → verbs.
         let cands = if before.trim().is_empty() {
             word_candidates(verb_names(), word)
+        } else if command::parse(before).verb() == Some(Verb::Config) {
+            // `config`'s slots don't fit the single-scope model — action word,
+            // then knob path (schema-derived), then nothing.
+            match config_slot(before) {
+                ConfigSlot::Actions => word_candidates(config_action_names(), word),
+                ConfigSlot::Paths => config_path_candidates(word),
+                ConfigSlot::None => Vec::new(),
+            }
         } else {
             match arg_kind(command::parse(before).verb()) {
                 ArgKind::Verbs => word_candidates(verb_names(), word),
@@ -215,6 +269,13 @@ impl ShellHelper {
         let before = &line[..start];
         if before.trim().is_empty() {
             return word_hint(verb_names(), word);
+        }
+        if command::parse(before).verb() == Some(Verb::Config) {
+            return match config_slot(before) {
+                ConfigSlot::Actions => word_hint(config_action_names(), word),
+                ConfigSlot::Paths => config_path_hint(word),
+                ConfigSlot::None => None,
+            };
         }
         match arg_kind(command::parse(before).verb()) {
             ArgKind::Verbs => word_hint(verb_names(), word),
@@ -306,6 +367,35 @@ fn word_candidates(words: impl Iterator<Item = &'static str>, prefix: &str) -> V
             replacement: format!("{w} "),
         })
         .collect()
+}
+
+/// Config knob paths with the given prefix — the schema-derived leaf paths
+/// ([`edit::paths`]). A completed path carries a trailing space, readying the
+/// cursor for a `set`'s value (and harmlessly ignored by `show`/`reset`).
+fn config_path_candidates(prefix: &str) -> Vec<Pair> {
+    edit::paths()
+        .into_iter()
+        .filter(|p| p.as_str().starts_with(prefix))
+        .map(|p| Pair {
+            replacement: format!("{p} "),
+            display: p.as_str().to_owned(),
+        })
+        .collect()
+}
+
+/// Type-ahead hint for a config knob path: the longest common prefix every
+/// matching schema path agrees on beyond `word` (like [`cart_hint`], over the
+/// small static path set). `None` once the next character diverges.
+fn config_path_hint(word: &str) -> Option<String> {
+    let paths = edit::paths();
+    let mut matches = paths
+        .iter()
+        .map(ConfigPath::as_str)
+        .filter(|p| p.starts_with(word));
+    let first = matches.next()?;
+    let lcp = matches.fold(first.len(), |acc, p| acc.min(common_prefix_len(first, p)));
+    let suffix = &first[word.len()..lcp];
+    (!suffix.is_empty()).then(|| suffix.to_owned())
 }
 
 /// Linear prefix filter over a small name set (the cart), as plain name pairs.
@@ -501,6 +591,43 @@ mod tests {
         for line in ["approve ya", "review ya", "upgrade ya", "up ya", "keep ya"] {
             assert_eq!(complete(&h, line), vec!["yay-bin"], "line `{line}`");
         }
+    }
+
+    #[test]
+    fn config_first_arg_completes_the_sub_verbs() {
+        let h = helper(&[], &[]);
+        assert_eq!(complete(&h, "config "), vec!["show ", "set ", "reset "]);
+        // Narrowing to a shared prefix keeps the survivors.
+        assert_eq!(complete(&h, "config s"), vec!["show ", "set "]);
+    }
+
+    #[test]
+    fn config_path_position_completes_schema_keys() {
+        let h = helper(&["colorpkg"], &[]); // a universe name sharing the prefix
+        // The knob path, not the universe name that shares "col".
+        assert_eq!(complete(&h, "config set col"), vec!["color "]);
+        // `show` and `reset` complete paths too; a section prefix reaches its leaves.
+        assert!(
+            complete(&h, "config show ages.")
+                .iter()
+                .any(|p| p == "ages.caution_days ")
+        );
+        assert!(!complete(&h, "config reset ").is_empty());
+    }
+
+    #[test]
+    fn config_value_position_completes_nothing() {
+        let h = helper(&["neverpkg"], &[]);
+        assert!(complete(&h, "config set color ne").is_empty());
+    }
+
+    #[test]
+    fn config_action_and_path_hints() {
+        let h = helper(&[], &[]);
+        // The action word type-aheads like any command position.
+        assert_eq!(hint(&h, "config s").as_deref(), Some("how "));
+        // The path type-aheads to the schema key's certain tail.
+        assert_eq!(hint(&h, "config set col").as_deref(), Some("or"));
     }
 
     #[test]

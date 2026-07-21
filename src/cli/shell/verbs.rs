@@ -4,7 +4,7 @@
 //! cart-editing verbs live in [`super::staging`].
 
 use super::cart::{ApplyOutcome, Approval, Cart, CartItem, StageResult};
-use super::command::{Command, SystemAction, unknown_note};
+use super::command::{Command, ConfigAction, SystemAction, unknown_note};
 use super::help::{HELP_TEXT, help_topic};
 use super::staging::prior_approval;
 use super::{
@@ -37,6 +37,38 @@ const fn refresh_message(outcome: mirror::RefreshOutcome) -> Option<&'static str
             Some("AUR refresh skipped (aur = false in config.toml)")
         }
         mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::NotRequested) => None,
+    }
+}
+
+/// `config <show|set|reset>` — inspect or change a persistent config knob.
+/// A free function like [`system_dispatch`]: it reads no session state, only
+/// the env seam (which owns the config handle + its schema-validating edits).
+/// `None` is a missing/unknown sub-verb — usage line, never a silent no-op.
+/// Path/value validation lives behind the env; here we only route + prefix the
+/// error uniformly.
+fn config_dispatch<E: ShellEnv>(action: Option<&ConfigAction>, env: &mut E) {
+    match action {
+        None => env.print(
+            "usage: config <show [path] | set <path> <value> | reset <path>> — see `help config`",
+        ),
+        // Bare `config` — teach the command rather than dump every value.
+        Some(ConfigAction::Help) => env.print(&help_topic("config")),
+        // The table (current/default columns, colored changes) is presentation,
+        // so the env renders and prints it; the pure core only routes here and
+        // prefixes an unknown-path error uniformly.
+        Some(ConfigAction::Show(path)) => {
+            if let Err(e) = env.config_show(path.as_ref()) {
+                env.print(&format!("config: {e}"));
+            }
+        }
+        Some(ConfigAction::Set { path, value }) => match env.config_set(path, value) {
+            Ok(summary) => env.print(&summary),
+            Err(e) => env.print(&format!("config: {e}")),
+        },
+        Some(ConfigAction::Reset(path)) => match env.config_reset(path) {
+            Ok(summary) => env.print(&summary),
+            Err(e) => env.print(&format!("config: {e}")),
+        },
     }
 }
 
@@ -197,6 +229,10 @@ impl State {
             }
             Command::System(action) => {
                 system_dispatch(*action, env);
+                Flow::Continue
+            }
+            Command::Config(action) => {
+                config_dispatch(action.as_ref(), env);
                 Flow::Continue
             }
         }
@@ -1102,6 +1138,119 @@ mod tests {
         State::default().dispatch(&command::parse("system prune"), &mut env);
         assert_eq!(env.prune_calls.count(), 1, "the env owns the prompt");
         assert!(env.lines.contains("cancelled"), "{:?}", env.lines);
+    }
+
+    /// A knob row in the plain-paint config table: a line whose columns are the
+    /// path, the current value, and the default value (the fake pins `Plain`).
+    fn config_row(env: &FakeEnv, path: &str, current: &str, default: &str) -> bool {
+        env.lines.any(|l| {
+            let cols: Vec<&str> = l.split_whitespace().collect();
+            cols == [path, current, default]
+        })
+    }
+
+    #[test]
+    fn config_show_renders_the_current_and_default_columns() {
+        let (flow, env) = dispatch_one("config show");
+        assert_eq!(flow, Flow::Continue);
+        // A header, then one row per knob with current == default (unset).
+        assert!(
+            env.lines
+                .any(|l| l.split_whitespace().collect::<Vec<_>>()
+                    == ["setting", "current", "default"]),
+            "{:?}",
+            env.lines
+        );
+        assert!(config_row(&env, "aur", "true", "true"), "{:?}", env.lines);
+        assert!(config_row(&env, "color", "auto", "auto"), "{:?}", env.lines);
+    }
+
+    #[test]
+    fn config_set_persists_and_a_later_show_reflects_it() {
+        let mut env = FakeEnv::default();
+        let mut state = State::default();
+        state.dispatch(&command::parse("config set color never"), &mut env);
+        assert!(
+            env.lines
+                .any(|l| l.contains("color = never") && l.contains("was auto")),
+            "{:?}",
+            env.lines
+        );
+        env.lines.clear();
+        state.dispatch(&command::parse("config show color"), &mut env);
+        // The current column now shows the override against the `auto` default.
+        assert!(
+            config_row(&env, "color", "never", "auto"),
+            "{:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn config_set_rejects_a_bad_value_without_persisting() {
+        let mut env = FakeEnv::default();
+        let mut state = State::default();
+        state.dispatch(&command::parse("config set color bogus"), &mut env);
+        assert!(
+            env.lines.any(|l| l.starts_with("config:")),
+            "a rejected set reports an error: {:?}",
+            env.lines
+        );
+        env.lines.clear();
+        state.dispatch(&command::parse("config show color"), &mut env);
+        assert!(
+            config_row(&env, "color", "auto", "auto"),
+            "the file stayed unchanged (current == default): {:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn config_reset_clears_an_override() {
+        let mut env = FakeEnv::default();
+        let mut state = State::default();
+        state.dispatch(&command::parse("config set index_threads 8"), &mut env);
+        state.dispatch(&command::parse("config reset index_threads"), &mut env);
+        env.lines.clear();
+        state.dispatch(&command::parse("config show index_threads"), &mut env);
+        assert!(
+            config_row(&env, "index_threads", "4", "4"),
+            "reset returns the knob to its default (current == default): {:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn bare_config_prints_the_help_topic_not_a_value_dump() {
+        let (flow, env) = dispatch_one("config");
+        assert_eq!(flow, Flow::Continue);
+        let joined = env.lines.joined();
+        assert!(
+            joined.contains("config <show|set|reset>"),
+            "bare config shows help: {joined}"
+        );
+        // Not the value table.
+        assert!(
+            !env.lines
+                .any(|l| l.split_whitespace().collect::<Vec<_>>()
+                    == ["setting", "current", "default"]),
+            "bare config must not dump the table: {:?}",
+            env.lines
+        );
+    }
+
+    #[test]
+    fn config_without_a_valid_subcommand_prints_usage() {
+        // A missing value / unknown sub-verb never silently no-ops.
+        for line in ["config wat", "config set color", "config reset"] {
+            let mut env = FakeEnv::default();
+            State::default().dispatch(&command::parse(line), &mut env);
+            assert!(
+                env.lines.any(|l| l.starts_with("usage: config")),
+                "`{line}`: {:?}",
+                env.lines
+            );
+        }
     }
 
     #[test]

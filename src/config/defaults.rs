@@ -1,8 +1,8 @@
 //! Built-in defaults applied when `config.toml` is absent or a field is missing.
 
-use super::{AgeConfig, Config};
+use super::{AgeConfig, Config, PrivilegeEscalator};
 use crate::paths;
-use crate::ui::SearchLayout;
+use crate::ui::{ColorMode, SearchLayout};
 
 /// Construct a freshly-defaulted [`Config`].
 pub fn default_config() -> Config {
@@ -18,7 +18,7 @@ pub fn default_config() -> Config {
         bootstrap_idle_timeout_secs: 600,
         index_threads: 4,
         refresh_max_age_secs: 3600,
-        color: "auto".into(),
+        color: ColorMode::Auto,
         banner: true,
         makepkg_path: "makepkg".into(),
         // `-d` skips makepkg's own dep checks: aurox pre-installs makedeps
@@ -26,7 +26,7 @@ pub fn default_config() -> Config {
         // AUR-only deps via `pacman -S` and fail. Runtime `depends` are
         // satisfied later by the final `pacman -U` resolving intra-stratum.
         makepkg_args: vec!["-d".into(), "--noconfirm".into(), "--needed".into()],
-        privilege_escalator: "sudo".into(),
+        privilege_escalator: PrivilegeEscalator::Sudo,
         devel: false,
         check_repo_updates: true,
         review_default: "prompt".into(),

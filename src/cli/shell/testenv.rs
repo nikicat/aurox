@@ -9,6 +9,7 @@ use super::cart::{ApplyOutcome, ApplyRun, AurApproval, Cart, ReviewOutcome, Sour
 use super::command;
 use super::resolved::{FrozenPreflight, ResolvedCart};
 use super::{Flow, ListItem, ListSource, NumberedList, ShellEnv, State};
+use crate::config::{ConfigFile, ConfigPath, edit};
 use crate::error::{Error, Result};
 use crate::index;
 use crate::mirror;
@@ -16,7 +17,7 @@ use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, SearchTerm};
 use crate::pacman::alpm_db::PacmanIndex;
 use crate::pacman::invoke::PkgUpgrade;
 use crate::system;
-use crate::ui::UpgradeSelection;
+use crate::ui::{self, UpgradeSelection};
 use crate::units::ByteSize;
 use std::collections::HashMap;
 
@@ -123,6 +124,10 @@ pub(super) struct FakeEnv {
     /// How often the transaction table rendered — the quiet-mutation rule's
     /// observable: `show` renders, `add`/`drop`/… must not.
     pub(super) render_calls: CallCount,
+    /// The sparse on-disk config the `config` verbs act on. Default-empty; the
+    /// fake persists edits into it in-memory (no disk) so dispatch tests see the
+    /// real schema-validation path through [`edit`].
+    pub(super) config_file: ConfigFile,
 }
 
 impl ShellEnv for FakeEnv {
@@ -224,6 +229,24 @@ impl ShellEnv for FakeEnv {
     fn system_prune(&mut self) -> Result<Option<ByteSize>> {
         self.prune_calls.bump();
         Ok(self.prune_outcome)
+    }
+    fn config_show(&mut self, path: Option<&ConfigPath>) -> Result<()> {
+        // Same renderer the real env uses, pinned to plain paint so dispatch
+        // tests assert on stable text.
+        let rows = edit::show(&self.config_file, path)?;
+        let table = ui::config_table(&rows, ui::Paint::Plain);
+        self.print_table(&table);
+        Ok(())
+    }
+    fn config_set(&mut self, path: &ConfigPath, value: &[String]) -> Result<String> {
+        let change = edit::set(&self.config_file, path, value)?;
+        self.config_file = change.file;
+        Ok(change.summary)
+    }
+    fn config_reset(&mut self, path: &ConfigPath) -> Result<String> {
+        let change = edit::reset(&self.config_file, path)?;
+        self.config_file = change.file;
+        Ok(change.summary)
     }
 }
 

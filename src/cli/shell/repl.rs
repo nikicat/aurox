@@ -107,12 +107,11 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
     // First-launch question (no-op unless the AUR is enabled-but-unsynced).
     // Owns a local handle so a "pacman-only" answer takes effect immediately.
     let config = first_launch_setup(config.clone())?;
-    let cfg = config.cfg();
     // Once per session: load the AUR index (+ lookup maps) and the name
     // universe. Not repeated per command; `refresh` (later phase) re-fetches.
     // The AUR data loads empty (not absent) when the AUR isn't in play.
-    let aur_state = index::AurState::probe(cfg);
-    let aur_data = AurIndexData::load(cfg)?;
+    let aur_state = index::AurState::probe(config.cfg());
+    let aur_data = AurIndexData::load(config.cfg())?;
     let caches = build_universe(&aur_data);
     debug!(
         names = caches.universe.len(),
@@ -120,8 +119,13 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
         aur = ?aur_state,
         "shell session loaded"
     );
+    // Snapshot the Copy knobs the setup below reads before the handle moves into
+    // the env — from here on the resolved config lives in `env.config`, and
+    // `config set` mutates it there.
+    let banner = config.cfg().banner;
+    let color_mode = config.cfg().color_mode();
     let mut env = RealEnv {
-        cfg,
+        config,
         devel,
         aur_data,
         aur_state,
@@ -135,7 +139,7 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
     // a prompt — and before the caption, so the one-liner reads as the art's
     // caption whenever the art is there.
     let paint = ui::Paint::detect();
-    let banner_shown = splash_shown(cfg.banner, !initial_search.is_empty());
+    let banner_shown = splash_shown(banner, !initial_search.is_empty());
     if banner_shown {
         env.print_table(&ui::launch_banner(paint));
     }
@@ -160,7 +164,7 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
     // Follow the session's colour mode so `--color never` also stops rustyline
     // from dimming the history hint (it skips `highlight_hint` when Disabled).
     let rl_config = RlConfig::builder()
-        .color_mode(match cfg.color_mode() {
+        .color_mode(match color_mode {
             ui::ColorMode::Always => RlColorMode::Forced,
             ui::ColorMode::Never => RlColorMode::Disabled,
             ui::ColorMode::Auto => RlColorMode::Enabled,
