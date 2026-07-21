@@ -7,6 +7,9 @@ license = "MIT"
 repository = "https://github.com/nikicat/aurox"
 keywords = ["aur", "archlinux", "pacman", "package-manager"]
 categories = ["command-line-utilities"]
+# Two binaries live here (aurox + the aurox-trace profiling helper), so bare
+# `cargo run --` is otherwise ambiguous — pin the real CLI as the default.
+default-run = "aurox"
 
 # `pty-harness` (the e2e example drivers' shared PTY harness) is a workspace
 # member so it shares this Cargo.lock. Outside a workspace, running cargo inside

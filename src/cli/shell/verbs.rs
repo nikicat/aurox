@@ -10,6 +10,7 @@ use super::staging::prior_approval;
 use super::{
     CartEdit, Flow, ListItem, ListSource, NumberedList, ShellEnv, State, UNDO_DEPTH, selector,
 };
+use crate::index;
 use crate::mirror;
 use crate::names::{PkgTarget, RepoName, SearchTerm};
 use crate::pacman::invoke::PkgUpgrade;
@@ -37,6 +38,35 @@ const fn refresh_message(outcome: mirror::RefreshOutcome) -> Option<&'static str
             Some("AUR refresh skipped (aur = false in config.toml)")
         }
         mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::NotRequested) => None,
+    }
+}
+
+/// Word an empty search and propose a way forward.
+///
+/// An unsynced AUR ([`NotSetUp`](index::AurState::NotSetUp)) means the query
+/// only reached the sync repos, and most packages a user hunts for live in the
+/// AUR — so the likeliest fix is to sync it: point at `refresh aur` (the same
+/// one-time nudge the launch banner and `-Ss` use), with loosening the query as
+/// the fallback. A ready or deliberately-disabled AUR gets no such nudge —
+/// pacman-only is a standing choice, not a missing step (see
+/// [`crate::cli::search`]'s `gather`) — so the query itself is the thing to
+/// loosen. The match is exhaustive, so a new [`index::AurState`] variant is a
+/// compile error here rather than a silently-missing case.
+fn no_match_note(terms: &[SearchTerm], aur: index::AurState) -> String {
+    let joined = terms
+        .iter()
+        .map(SearchTerm::as_str)
+        .collect::<Vec<_>>()
+        .join(" ");
+    match aur {
+        index::AurState::NotSetUp => format!(
+            "no packages match `{joined}` — searched repos only; `refresh aur` to include the AUR, or try fewer/shorter terms"
+        ),
+        index::AurState::Ready | index::AurState::Disabled => {
+            format!(
+                "no packages match `{joined}` — try fewer or shorter terms, or check the spelling"
+            )
+        }
     }
 }
 
@@ -239,36 +269,31 @@ impl State {
     }
 
     /// `search <terms…>`: run the query, print a numbered list, remember it.
+    ///
+    /// The env printed the numbered table itself (rendering is its side of the
+    /// seam). A hit just snapshots the rows as the referent — the next step
+    /// (`add <number|pkgname>`) rides ambiently on the prompt via
+    /// [`Self::empty_line_hint`], not as a printed line. A miss is worded here,
+    /// where the data decision lives, with a proposed way forward
+    /// ([`no_match_note`]), and leaves the referent alone: the table still on
+    /// screen above stays addressable (WYSIWYG addressing).
     fn search<E: ShellEnv>(&mut self, terms: &[SearchTerm], env: &mut E) {
         if terms.is_empty() {
             env.print("usage: search <terms…>");
             return;
         }
         match env.search(terms) {
-            Ok(items) => {
-                // The env printed the numbered table itself (rendering is its
-                // side of the seam); the empty case is worded here where the
-                // data decision lives.
-                if items.is_empty() {
-                    let joined = terms
-                        .iter()
-                        .map(SearchTerm::as_str)
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    env.print(&format!("no packages match `{joined}`"));
-                }
-                // The just-printed rows become what numbers address. A
-                // fruitless search printed no numbered rows, so it leaves the
-                // referent alone — the table still on screen above stays
-                // addressable (WYSIWYG addressing).
-                if !items.is_empty() {
-                    self.referent = Some(NumberedList {
-                        source: ListSource::Search,
-                        rows: items,
-                    });
-                }
-            }
             Err(e) => env.print(&format!("search: {e}")),
+            Ok(items) if items.is_empty() => {
+                let note = no_match_note(terms, env.aur_state());
+                env.print(&note);
+            }
+            Ok(items) => {
+                self.referent = Some(NumberedList {
+                    source: ListSource::Search,
+                    rows: items,
+                });
+            }
         }
     }
 
@@ -458,6 +483,33 @@ impl State {
             format!("aurox [{staged} staged]> ")
         } else {
             format!("aurox [{staged} staged, {pending} to review]> ")
+        }
+    }
+
+    /// The dimmed suggestion shown inline at an **empty** prompt — the single
+    /// next action the session is set up for, so the user never has to
+    /// remember which verb comes next. Ambient like [`Self::prompt`] (the same
+    /// carry-state-in-the-prompt fix), but a whole command rather than a
+    /// counter, and rendered as a rustyline type-ahead hint (see
+    /// [`ShellHelper::hint_for`](super::complete::ShellHelper)) so it reads as a
+    /// suggestion, not typed text.
+    ///
+    /// One state → one step: a staged cart points at `review` while gates are
+    /// open, else `apply`; an empty cart with search results on screen points
+    /// at `add <number|pkgname>` (a placeholder, deliberately *not* a specific
+    /// result). A truly empty session (fresh, or just-applied) has nothing on
+    /// screen to act on and no splash to keep clear of, so it hints nothing.
+    pub(super) fn empty_line_hint(&self) -> Option<&'static str> {
+        if !self.cart.is_empty() {
+            return Some(if self.cart.pending_review().is_empty() {
+                "apply"
+            } else {
+                "review"
+            });
+        }
+        match self.referent.as_ref().map(|l| l.source) {
+            Some(ListSource::Search) => Some("add <number|pkgname>"),
+            _ => None,
         }
     }
 
@@ -829,6 +881,7 @@ mod tests {
     use crate::cli::shell::testenv::{
         FakeEnv, cart_specs, dispatch_one, env_with, li, li_repo, state_showing, up,
     };
+    use crate::index::AurState;
     use crate::names::PkgBase;
     use crate::units::ByteSize;
 
@@ -1392,6 +1445,106 @@ mod tests {
         let referent = state.referent.as_ref().expect("search sets the referent");
         assert_eq!(referent.rows.len(), 2, "the printed rows are the snapshot");
         assert_eq!(referent.source, ListSource::Search);
+    }
+
+    /// A hit prints no next-step line — the nudge rides ambiently on the prompt
+    /// (see `empty_line_hint`), so the only visible effect here is the referent
+    /// snapshot. Guards against a stray printed suggestion creeping back in.
+    #[test]
+    fn search_hit_prints_no_next_step_line() {
+        let mut env = FakeEnv {
+            search_result: vec![li("firefox"), li("firefox-bin")],
+            ..FakeEnv::default()
+        };
+        let mut state = State::default();
+        state.dispatch(&command::parse("search firefox"), &mut env);
+        assert!(
+            env.lines.is_empty(),
+            "the table is the env's to print; dispatch adds no line: {:?}",
+            env.lines
+        );
+        assert_eq!(state.empty_line_hint(), Some("add <number|pkgname>"));
+    }
+
+    /// The ambient prompt hint is one command per session state: a search on
+    /// screen → `add`, a gated cart → `review`, a ready cart → `apply`, and a
+    /// fresh session → nothing (no splash to disturb, nothing to act on).
+    #[test]
+    fn empty_line_hint_tracks_session_state() {
+        // Fresh: nothing on screen, no hint.
+        assert_eq!(State::default().empty_line_hint(), None);
+
+        // Search results up (cart empty) → stage something.
+        let searched = state_showing(vec![li("foo")]);
+        assert_eq!(searched.empty_line_hint(), Some("add <number|pkgname>"));
+
+        // A gated AUR item staged → review; approving it → apply.
+        let mut env = env_with(&[("yay-bin", Source::Aur)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add yay-bin"), &mut env);
+        assert_eq!(state.empty_line_hint(), Some("review"));
+        state.dispatch(&command::parse("approve yay-bin"), &mut env);
+        assert_eq!(state.empty_line_hint(), Some("apply"));
+    }
+
+    /// An empty search proposes loosening the query. With the AUR synced there
+    /// is no sync step to suggest, so `refresh aur` must not appear.
+    #[test]
+    fn empty_search_proposes_loosening_the_query() {
+        let mut env = FakeEnv {
+            aur_state: Some(AurState::Ready),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("search nope"), &mut env);
+        assert!(
+            env.lines
+                .any(|l| l.contains("no packages match `nope`") && l.contains("fewer")),
+            "{:?}",
+            env.lines
+        );
+        assert!(
+            !env.lines.contains("refresh aur"),
+            "a synced AUR is not a missing step — no nudge: {:?}",
+            env.lines
+        );
+    }
+
+    /// An empty search while the AUR was never synced points at `refresh aur`:
+    /// the query only reached the repos, and most packages live in the AUR.
+    #[test]
+    fn empty_search_points_unsynced_users_at_refresh_aur() {
+        let mut env = FakeEnv {
+            aur_state: Some(AurState::NotSetUp),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("search nope"), &mut env);
+        assert!(
+            env.lines
+                .any(|l| l.contains("no packages match `nope`") && l.contains("`refresh aur`")),
+            "an unsynced AUR proposes the sync: {:?}",
+            env.lines
+        );
+    }
+
+    /// Pacman-only mode (`aur = false`) is a standing choice, not a missing
+    /// step: an empty search must not nag it toward `refresh aur`.
+    #[test]
+    fn empty_search_does_not_nag_disabled_aur() {
+        let mut env = FakeEnv {
+            aur_state: Some(AurState::Disabled),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("search nope"), &mut env);
+        assert!(
+            env.lines.contains("no packages match `nope`"),
+            "{:?}",
+            env.lines
+        );
+        assert!(
+            !env.lines.contains("refresh aur"),
+            "disabled AUR is a standing choice, not a missing step: {:?}",
+            env.lines
+        );
     }
 
     #[test]
