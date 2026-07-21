@@ -48,6 +48,34 @@
   real-sized state (~2 GiB mirror, 155k-package index): dropping the
   zero-copy index mmaps, gix teardown, and the tracing file-log flush are
   the first suspects.
+- **organize command concerns around commands, not around concerns.** A
+  command's intrinsic traits are today scattered by *kind* across files: its
+  parse arm + sub-action vocab (`command.rs`), its dispatch handler
+  (`verbs.rs`, or `staging.rs` for cart verbs), its help one-liner + topic
+  (`help.rs` `HELP_TEXT`/`TOPICS`), its completion scope + any bespoke
+  arg-slot logic (`complete.rs` `arg_kind` + helpers), and its env-seam
+  methods (`ShellEnv` in `shell.rs` + `env.rs`/`testenv.rs`). Adding one
+  command is a shotgun edit across all of them, and each concern-file grows
+  without bound as commands accumulate — the recent `config` verb touched
+  every one of these (`command.rs`, `verbs.rs`, `help.rs`, `complete.rs`,
+  `shell.rs`, `env.rs`, `testenv.rs`, plus its own two-slot completion
+  special-case). Think about inverting the axis: a per-command descriptor (a
+  `ShellCommand` trait, or a const table of command specs) where each command
+  declares its name/aliases, parser, dispatch, help text, and completion
+  scope in *one* place, and the concern-files become thin drivers that fold
+  over that registry. **Constraint to preserve:** today's virtue is
+  compile-time completeness — the `Verb` enum is the single source of truth
+  and exhaustive `match`es on it (`name`, `arg_kind`, dispatch) plus the
+  `every_verb_has_a_help_topic` test mean the *compiler*, not a drift test,
+  walks each new verb through every decision (see `Verb`'s doc in
+  `command.rs`). Any reorg must keep that — a required-method trait gives it
+  for free (a new command can't compile until it supplies parse + dispatch +
+  help + completion), which is arguably a strict improvement over the current
+  side-table-per-concern arrangement. Watch the seams that *don't* fit a tidy
+  per-command box: shared vocab (aliases, `REFRESH_SCOPES`, `CONFIG_ACTIONS`),
+  the selector/referent machinery cart verbs share, and multi-slot arg
+  completion (`config`'s action-then-path) — a good design accommodates these
+  without forcing every command through the widest command's shape.
 
 ## Demos (docs/plans/screencasts.md)
 

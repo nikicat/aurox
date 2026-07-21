@@ -5,6 +5,7 @@
 //! argument-bearing verbs keep their args as raw strings; later phases parse
 //! them into `Selector`s (numbers / ranges / names / globs).
 
+use crate::config::ConfigPath;
 use crate::mirror::RefreshScope;
 use crate::names::SearchTerm;
 
@@ -35,6 +36,7 @@ pub enum Verb {
     Clear,
     Refresh,
     System,
+    Config,
     Help,
     Quit,
 }
@@ -58,6 +60,7 @@ impl Verb {
         Self::Clear,
         Self::Refresh,
         Self::System,
+        Self::Config,
         Self::Help,
         Self::Quit,
     ];
@@ -81,6 +84,7 @@ impl Verb {
             Self::Clear => "clear",
             Self::Refresh => "refresh",
             Self::System => "system",
+            Self::Config => "config",
             Self::Help => "help",
             Self::Quit => "quit",
         }
@@ -155,6 +159,67 @@ impl SystemAction {
     }
 }
 
+/// `config <action>` — inspect or change a persistent config knob.
+///
+/// A three-way sub-verb like [`SystemAction`], but two of the actions carry
+/// operands (a dotted knob path, and for `set` its value tokens). Bare `config`
+/// parses to [`Show(None)`](Self::Show) — a no-arg peek at the whole config;
+/// missing operands (`set` with no value, `reset` with no path) parse to `None`
+/// at the [`Command`] level so dispatch prints the usage line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigAction {
+    /// Bare `config` (no sub-verb) — print the `config` help. A request to learn
+    /// the command, not a 20-line value dump (that is the explicit `config
+    /// show`).
+    Help,
+    /// `config show [path]` — the effective config (all knobs, one knob, or a
+    /// whole section), each line tagged `(default)` when unset.
+    Show(Option<ConfigPath>),
+    /// `config set <path> <value…>` — validate + persist a knob's value.
+    Set {
+        /// The dotted knob path (`color`, `ages.caution_days`).
+        path: ConfigPath,
+        /// The value token(s) — one for a scalar knob, many for a list knob.
+        value: Vec<String>,
+    },
+    /// `config reset <path>` — clear a knob's override so it follows the default.
+    Reset(ConfigPath),
+}
+
+/// The `config` sub-verb words, in help order — the one list the completer
+/// offers after `config`.
+///
+/// [`ConfigAction::parse`]'s match arms carry each word's distinct operand
+/// logic, so this stays a plain vocabulary table (like [`REFRESH_SCOPES`])
+/// rather than an enum.
+pub const CONFIG_ACTIONS: &[&str] = &["show", "set", "reset"];
+
+impl ConfigAction {
+    /// Parse `config`'s argument words. `None` when the sub-verb is unknown or
+    /// its operands are missing (dispatch turns that into the usage line, like
+    /// [`SystemAction`]); bare `config` (no args) is [`Show(None)`](Self::Show),
+    /// handled by the caller.
+    fn parse(args: &[String]) -> Option<Self> {
+        let (sub, rest) = args.split_first()?;
+        match sub.to_ascii_lowercase().as_str() {
+            "show" => Some(Self::Show(
+                rest.first().map(|p| ConfigPath::from(p.clone())),
+            )),
+            "set" => {
+                let (path, value) = rest.split_first()?;
+                (!value.is_empty()).then(|| Self::Set {
+                    path: ConfigPath::from(path.clone()),
+                    value: value.to_vec(),
+                })
+            }
+            "reset" => rest
+                .first()
+                .map(|p| Self::Reset(ConfigPath::from(p.clone()))),
+            _ => None,
+        }
+    }
+}
+
 /// The typeable `refresh` scope words, in help order.
 ///
 /// One site for the vocabulary, shared by [`parse`] and the completer so
@@ -216,6 +281,10 @@ pub enum Command {
     /// `system <show|prune>` — state disk usage / cache pruning. `None` when
     /// the action is missing or unrecognized (dispatch prints the usage line).
     System(Option<SystemAction>),
+    /// `config <show|set|reset> …` — inspect or change a persistent config
+    /// knob. `None` when the sub-verb or its operands are missing (dispatch
+    /// prints the usage line, like `system`).
+    Config(Option<ConfigAction>),
     /// `help [command]` — command list (optional per-command topic).
     Help(Option<String>),
     /// `quit` / `exit` / Ctrl-D (or Ctrl-C at the prompt) — leave the shell.
@@ -250,6 +319,7 @@ impl Command {
             Self::Clear => Some(Verb::Clear),
             Self::Refresh(_) => Some(Verb::Refresh),
             Self::System(_) => Some(Verb::System),
+            Self::Config(_) => Some(Verb::Config),
             Self::Help(_) => Some(Verb::Help),
             Self::Quit => Some(Verb::Quit),
             Self::Empty | Self::Unknown(_) | Self::Syntax(_) => None,
@@ -294,6 +364,14 @@ pub fn parse(line: &str) -> Command {
             args.first()
                 .and_then(|a| SystemAction::parse(&a.to_ascii_lowercase())),
         ),
+        // Bare `config` prints the command's help (not a value dump — that is
+        // the explicit `config show`); anything else parses its sub-verb (a
+        // missing/unknown one becomes the usage line at dispatch).
+        Verb::Config => Command::Config(if args.is_empty() {
+            Some(ConfigAction::Help)
+        } else {
+            ConfigAction::parse(&args)
+        }),
         Verb::Help => Command::Help(args.into_iter().next()),
         Verb::Quit => Command::Quit,
     }
@@ -519,6 +597,49 @@ mod tests {
         // a typo'd action can never reach `prune`.
         assert_eq!(parse("system"), Command::System(None));
         assert_eq!(parse("system wat"), Command::System(None));
+    }
+
+    #[test]
+    fn config_parses_show_set_reset() {
+        // Bare `config` asks for help; `config show` is the explicit value dump.
+        assert_eq!(parse("config"), Command::Config(Some(ConfigAction::Help)));
+        assert_eq!(
+            parse("config show"),
+            Command::Config(Some(ConfigAction::Show(None)))
+        );
+        assert_eq!(
+            parse("config show color"),
+            Command::Config(Some(ConfigAction::Show(Some("color".into()))))
+        );
+        assert_eq!(
+            parse("config set color never"),
+            Command::Config(Some(ConfigAction::Set {
+                path: "color".into(),
+                value: v(&["never"]),
+            }))
+        );
+        // A list knob keeps every value token.
+        assert_eq!(
+            parse("config set makepkg_args -d --needed"),
+            Command::Config(Some(ConfigAction::Set {
+                path: "makepkg_args".into(),
+                value: v(&["-d", "--needed"]),
+            }))
+        );
+        assert_eq!(
+            parse("config reset color"),
+            Command::Config(Some(ConfigAction::Reset("color".into())))
+        );
+    }
+
+    #[test]
+    fn config_missing_operands_parse_to_none_for_usage() {
+        // `set` with no value, `reset` with no path, and an unknown sub-verb all
+        // become `None` so dispatch prints one usage line (like `system`).
+        assert_eq!(parse("config set color"), Command::Config(None));
+        assert_eq!(parse("config set"), Command::Config(None));
+        assert_eq!(parse("config reset"), Command::Config(None));
+        assert_eq!(parse("config wat"), Command::Config(None));
     }
 
     #[test]

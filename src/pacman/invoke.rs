@@ -99,7 +99,7 @@ pub fn query_repo_upgrades_in(alpm: &Alpm) -> Vec<PkgUpgrade> {
 pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
     let escalate = needs_sudo(argv);
     let (program, spawn_args) = if escalate {
-        (cfg.privilege_escalator.as_str(), with_pacman(argv))
+        (cfg.privilege_escalator.command(), with_pacman(argv))
     } else {
         ("pacman", argv.to_vec())
     };

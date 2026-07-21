@@ -14,6 +14,7 @@
 mod banner;
 mod cells;
 mod change_set;
+mod config_table;
 mod cost;
 mod freshness;
 mod gix_progress;
@@ -26,6 +27,7 @@ mod tables;
 
 pub use banner::{SPLASH_MIN_COLS, SplashBlink, launch_banner};
 pub use change_set::{ApprovalCell, ChangeSet, TxnRoot};
+pub use config_table::{ConfigRow, config_table};
 pub use cost::PreviewMetrics;
 pub use freshness::{AgeScale, AgeThresholds, Freshness, FreshnessBand};
 pub use gix_progress::{GixProgress, Operation};
@@ -44,7 +46,15 @@ use console::{Term, style};
 use std::sync::OnceLock;
 
 /// User preference for terminal color output.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+///
+/// The typed value behind the `color` config knob (a named enum, not a string,
+/// mirroring [`SearchLayout`]). Deserializing the config validates the spelling
+/// for free — an unknown `color = …` is a load error, not a silent fall-back to
+/// [`Auto`](Self::Auto). The `--color` CLI flag stays lenient via
+/// [`FromStr`](std::str::FromStr) (an unrecognized flag value degrades to
+/// `Auto`), so the two input surfaces keep their intended strictness.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ColorMode {
     /// Detect TTY/`NO_COLOR`/etc. at print time.
     #[default]
@@ -53,6 +63,22 @@ pub enum ColorMode {
     Always,
     /// Suppress all color escapes.
     Never,
+}
+
+impl std::str::FromStr for ColorMode {
+    type Err = std::convert::Infallible;
+
+    /// Lenient parse for the `--color` CLI flag: the three spellings map to
+    /// their variant, anything else degrades to [`Auto`](Self::Auto) (a bad
+    /// flag value must never abort the run). Config-file parsing is strict —
+    /// that goes through the serde derive above.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "always" => Self::Always,
+            "never" => Self::Never,
+            _ => Self::Auto,
+        })
+    }
 }
 
 static COLOR: OnceLock<ColorMode> = OnceLock::new();

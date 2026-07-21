@@ -161,6 +161,18 @@ impl AgeThresholds {
             stale: stale.map_or(base.stale, days),
         }
     }
+
+    /// The bands back as whole-day counts (`caution`, `fresh`, `stale`) — the
+    /// inverse of [`Self::from_days`], keeping the day↔`Duration` conversion in
+    /// this module. Lets the config layer surface the `[ages]` defaults as the
+    /// day numbers the knobs actually carry, without re-deriving them.
+    pub const fn to_days(self) -> (u64, u64, u64) {
+        (
+            self.caution.as_secs() / 86_400,
+            self.fresh.as_secs() / 86_400,
+            self.stale.as_secs() / 86_400,
+        )
+    }
 }
 
 impl Default for AgeThresholds {

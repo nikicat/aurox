@@ -12,7 +12,7 @@ use crate::build::reviews::ReviewStore;
 use crate::build::{self, ConfirmGate, DevelPolicy, InstallOpts, review};
 use crate::cli::dispatch;
 use crate::cli::search::{Row, rank_rows};
-use crate::config::Config;
+use crate::config::{Config, ConfigHandle, ConfigPath};
 use crate::error::{Error, Result};
 use crate::index::info::{self, InfoLookup};
 use crate::index::{self, AurIndexData, IndexEntry};
@@ -88,8 +88,12 @@ pub(super) fn cart_targets(state: &State) -> Vec<PkgTarget> {
 
 /// Production [`ShellEnv`]: the loaded AUR data + stdout, bridging `upgrade` to
 /// the existing loop.
-pub(super) struct RealEnv<'a> {
-    pub(super) cfg: &'a Config,
+pub(super) struct RealEnv {
+    /// The session's config bound to its file — owned here (not a borrowed
+    /// `&Config`) so `config set`/`reset` can persist through
+    /// [`ConfigHandle::update`], moving disk and the resolved view together.
+    /// Read access goes through [`Self::cfg`].
+    pub(super) config: ConfigHandle,
     pub(super) devel: DevelPolicy,
     /// The loaded AUR data — *empty* (never absent) when the AUR isn't in
     /// play, so every command takes one uniform path. See
@@ -162,7 +166,7 @@ impl TxnKey {
     }
 }
 
-impl ShellEnv for RealEnv<'_> {
+impl ShellEnv for RealEnv {
     fn print(&mut self, line: &str) {
         println!("{line}");
     }
@@ -215,7 +219,7 @@ impl ShellEnv for RealEnv<'_> {
         // One clock + thresholds for the whole render: ranking (the health
         // weight) and the freshness badges classify AUR ages against the same
         // `scale`.
-        let scale = ui::AgeScale::now(self.cfg.age_thresholds());
+        let scale = ui::AgeScale::now(self.cfg().age_thresholds());
         // Rank the merged repo+AUR list best-first (the `MatchTier` ladder; an
         // abandoned AUR row sinks within its tier; shorter names win; AUR ties
         // break freshest-first). `State::search` prints this reversed, so row 1
@@ -239,7 +243,7 @@ impl ShellEnv for RealEnv<'_> {
         let table = ui::SearchList {
             rows: &search_rows,
             numbers: ui::RowNumbers::Numbered,
-            layout: self.cfg.search_layout,
+            layout: self.cfg().search_layout,
         }
         .render(ui::Paint::detect(), ui::term_width());
         let items = ranked
@@ -293,7 +297,7 @@ impl ShellEnv for RealEnv<'_> {
         // The `aur_approval` knob wins when set; unset defers to the legacy
         // `review_default == "skip"` behaviour. Resolution + fallback live on
         // the type so they're unit-tested next to it.
-        AurApproval::from_config(self.cfg.aur_approval, &self.cfg.review_default)
+        AurApproval::from_config(self.cfg().aur_approval, &self.cfg().review_default)
     }
 
     fn aur_state(&self) -> index::AurState {
@@ -372,7 +376,7 @@ impl ShellEnv for RealEnv<'_> {
             new_ver: &new_ver,
             counterpart: counterpart.as_ref(),
             wt: &wt,
-            history_scan_max: self.cfg.review_history_scan_max,
+            history_scan_max: self.cfg().review_history_scan_max,
         };
         // The shell drives one interactive review per call; the "approve
         // all" fast path is the dispatch loop's job (it decides whether to
@@ -432,7 +436,7 @@ impl ShellEnv for RealEnv<'_> {
         // that check ends the apply here — before the cost summary and the
         // sudo prompt.
         if !cart.repo_upgrades().is_empty() {
-            upgrade::resync_repo_dbs(self.cfg);
+            upgrade::resync_repo_dbs(self.cfg());
         }
         let repo_sel = self.repo_upgrade_selection(aur_data, cart)?;
         let blockers = if repo_sel.repo.is_empty() {
@@ -488,7 +492,7 @@ impl ShellEnv for RealEnv<'_> {
             gate: ConfirmGate::AlreadyConfirmed,
         };
         let ctx = build::InstallCtx {
-            cfg: self.cfg,
+            cfg: self.cfg(),
             aur: aur_data,
             pac: &pac,
         };
@@ -514,7 +518,7 @@ impl ShellEnv for RealEnv<'_> {
         // the upgraded libs), via a partial `pacman -Syu` that ignores every
         // repo candidate the user didn't stage.
         if !repo_sel.repo.is_empty() {
-            dispatch::run_repo_upgrade(self.cfg, &repo_sel)?;
+            dispatch::run_repo_upgrade(self.cfg(), &repo_sel)?;
         }
 
         // Build + install the main AUR (and any fresh-install) half. The
@@ -541,7 +545,7 @@ impl ShellEnv for RealEnv<'_> {
             // Stringify only here, at pacman's argv boundary.
             let mut args = vec!["-R".to_owned()];
             args.extend(installed_removals.iter().map(|n| n.as_str().to_owned()));
-            if invoke::exec_pacman(self.cfg, &args)? != 0 {
+            if invoke::exec_pacman(self.cfg(), &args)? != 0 {
                 ui::warn("removal step did not complete");
                 // The whole install half already landed (we passed the
                 // success gate above); only the removal failed, so drop every
@@ -578,9 +582,35 @@ impl ShellEnv for RealEnv<'_> {
         // (the bare `refresh`/`upgrade` never spring the re-clone).
         system::prune().map(Some)
     }
+
+    fn config_show(&mut self, path: Option<&ConfigPath>) -> Result<()> {
+        let rows = self.config.show(path)?;
+        let table = ui::config_table(&rows, ui::Paint::detect());
+        self.print_table(&table);
+        Ok(())
+    }
+
+    fn config_set(&mut self, path: &ConfigPath, value: &[String]) -> Result<String> {
+        // One operation: validate, write the file, and re-resolve the view —
+        // subsequent commands (search layout, color, …) read the change through
+        // `self.cfg()` with no cache to invalidate (the `show` resolution cache
+        // is keyed on the cart's package set, not on config).
+        self.config.set(path, value)
+    }
+
+    fn config_reset(&mut self, path: &ConfigPath) -> Result<String> {
+        self.config.reset(path)
+    }
 }
 
-impl RealEnv<'_> {
+impl RealEnv {
+    /// The resolved runtime config — a thin accessor over the owned
+    /// [`ConfigHandle`] so read sites stay `self.cfg()` while `config set`
+    /// mutates through the handle.
+    const fn cfg(&self) -> &Config {
+        self.config.cfg()
+    }
+
     /// Re-fetch the mirror + index (subject to `policy`'s TTL) and reload the
     /// session in place, rebuilding the name caches so fresh data backs
     /// subsequent `search`/`info`/classification + completion. Shared by
@@ -590,10 +620,10 @@ impl RealEnv<'_> {
     /// resolution cache — the mirror/db data it was resolved against may have
     /// just changed.
     fn reload(&mut self, policy: upgrade::FetchPolicy) -> Result<Option<mirror::RefreshOutcome>> {
-        let reload = upgrade::refresh_and_reload(self.cfg, policy)?;
+        let reload = upgrade::refresh_and_reload(self.cfg(), policy)?;
         self.caches = build_universe(&reload.data);
         self.aur_data = reload.data;
-        self.aur_state = index::AurState::probe(self.cfg);
+        self.aur_state = index::AurState::probe(self.cfg());
         self.view = None;
         Ok(reload.outcome)
     }
@@ -712,7 +742,7 @@ impl RealEnv<'_> {
             return Ok(None);
         }
         let ctx = build::InstallCtx {
-            cfg: self.cfg,
+            cfg: self.cfg(),
             aur: aur_data,
             pac,
         };

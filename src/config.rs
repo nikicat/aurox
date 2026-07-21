@@ -3,12 +3,45 @@
 use crate::cli::shell::cart::AurApproval;
 use crate::error::Result;
 use crate::paths;
-use crate::ui::{AgeThresholds, ColorMode, SearchLayout};
+use crate::ui::{AgeThresholds, ColorMode, ConfigRow, SearchLayout};
 use optfield::optfield;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 pub mod defaults;
+pub mod edit;
+
+pub use edit::{ConfigError, ConfigPath};
+
+/// Which privilege escalator elevates the final `pacman` transaction.
+///
+/// The typed value behind the `privilege_escalator` config knob (a named enum,
+/// not a string, mirroring [`ColorMode`] and [`SearchLayout`]). Deserializing
+/// the config validates the spelling for free — an unknown escalator is a load
+/// error rather than a name aurox would blindly try to `exec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrivilegeEscalator {
+    /// `sudo` (the default).
+    #[default]
+    Sudo,
+    /// `doas` (OpenBSD's lighter escalator, common on minimal Arch installs).
+    Doas,
+    /// `run0` (systemd's `systemd-run`-based escalator).
+    Run0,
+}
+
+impl PrivilegeEscalator {
+    /// The binary aurox execs to elevate — the same word as the config
+    /// spelling, but named here so the call site reads intent, not a string.
+    pub const fn command(self) -> &'static str {
+        match self {
+            Self::Sudo => "sudo",
+            Self::Doas => "doas",
+            Self::Run0 => "run0",
+        }
+    }
+}
 
 /// The `[ages]` config section: freshness-band thresholds for the AUR search
 /// list, in **days**.
@@ -53,7 +86,8 @@ pub struct AgeConfig {
            whatever they were when the file was written.",
     attrs = (derive(Debug, Clone, Default, Deserialize, Serialize)),
     field_attrs = (serde(skip_serializing_if = "Option::is_none")),
-    merge_fn = merge_config_file
+    merge_fn = merge_config_file,
+    from
 )]
 #[derive(Debug, Clone)]
 // Config knobs are independent on/off switches whose on-disk form is a toml
@@ -87,8 +121,9 @@ pub struct Config {
     pub index_threads: usize,
     /// Re-fetch mirror if `index.bin` is older than this (used by no-arg run).
     pub refresh_max_age_secs: u64,
-    /// `auto` | `always` | `never`.
-    pub color: String,
+    /// Terminal color preference: `auto` | `always` | `never`. A typed enum
+    /// (see [`ColorMode`]); an unknown spelling is a config load error.
+    pub color: ColorMode,
     /// Show the ASCII-art splash when the interactive shell starts. `false`
     /// skips straight to the one-line session banner; the splash also follows
     /// `color`, so `--color never` keeps it plain rather than hiding it.
@@ -97,8 +132,9 @@ pub struct Config {
     pub makepkg_path: String,
     /// Default args passed to every `makepkg` invocation.
     pub makepkg_args: Vec<String>,
-    /// `sudo` | `doas` | `run0` — used to elevate pacman calls.
-    pub privilege_escalator: String,
+    /// `sudo` | `doas` | `run0` — used to elevate pacman calls. A typed enum
+    /// (see [`PrivilegeEscalator`]); an unknown spelling is a config load error.
+    pub privilege_escalator: PrivilegeEscalator,
     /// Include VCS pkgs (`-git`/`-svn`/…) in `-Syu` by default.
     pub devel: bool,
     /// On `-Sy`, also refresh the official-repo databases (rootless, in
@@ -155,13 +191,11 @@ impl Config {
         Ok(ConfigHandle::load()?.cfg().clone())
     }
 
-    /// Translate the `color` string into a typed [`ColorMode`].
-    pub fn color_mode(&self) -> ColorMode {
-        match self.color.as_str() {
-            "always" => ColorMode::Always,
-            "never" => ColorMode::Never,
-            _ => ColorMode::Auto,
-        }
+    /// The color preference — now a typed field, so this is just an accessor
+    /// (kept as a named method so call sites read `cfg.color_mode()`, and the
+    /// CLI's `--color` override can fall back through it).
+    pub const fn color_mode(&self) -> ColorMode {
+        self.color
     }
 
     /// The freshness-band thresholds for the search list — the `[ages]` section
@@ -204,6 +238,39 @@ impl ConfigFile {
         let mut cfg = defaults::default_config();
         cfg.merge_config_file(self);
         cfg
+    }
+
+    /// The whole schema materialized to its **effective defaults**: every
+    /// settable knob present with a concrete value, so `config show`/`set`/
+    /// `reset` can discover the full key set + types + default values by pure
+    /// reflection.
+    ///
+    /// The optfield-generated [`From<Config>`] materializes all but two knobs,
+    /// whose defaults are *resolved*, not stored, and so leave no trace in a
+    /// sparse TOML round-trip (TOML can't spell an absent optional, and the
+    /// `[ages]` section defaults empty):
+    /// - `aur_approval` defaults to `None`, deferring to the legacy
+    ///   `review_default`; its effective policy comes from
+    ///   [`AurApproval::from_config`].
+    /// - the `[ages]` bands default unset so upgrades can move them; their day
+    ///   counts come from [`Config::age_thresholds`] / [`AgeThresholds`].
+    ///
+    /// This is the **one** site that names those two fields — kept here beside
+    /// `Config` and the resolvers it calls, so [`edit`] reflects over the result
+    /// without any per-field knowledge of the schema.
+    pub(crate) fn effective_defaults() -> Self {
+        let defaults = defaults::default_config();
+        let (caution_days, fresh_days, stale_days) = defaults.age_thresholds().to_days();
+        let aur_approval =
+            AurApproval::from_config(defaults.aur_approval, &defaults.review_default);
+        let mut file = Self::from(defaults);
+        file.aur_approval = Some(aur_approval);
+        file.ages = Some(AgeConfig {
+            caution_days: Some(caution_days),
+            fresh_days: Some(fresh_days),
+            stale_days: Some(stale_days),
+        });
+        file
     }
 }
 
@@ -262,6 +329,31 @@ impl ConfigHandle {
         self.file.save(&self.path)?;
         self.cfg = self.file.clone().resolve();
         Ok(())
+    }
+
+    /// `config show [path]` — the effective config as current/default knob rows
+    /// (see [`edit::show`]); the env renders them into a colored table.
+    /// Read-only, so it takes `&self`.
+    pub fn show(&self, path: Option<&ConfigPath>) -> Result<Vec<ConfigRow>> {
+        Ok(edit::show(&self.file, path)?)
+    }
+
+    /// `config set <path> <value…>` — validate the knob + value, persist the
+    /// change through [`Self::update`] (disk + in-memory view move together),
+    /// and return the summary line. A validation failure leaves the file
+    /// untouched.
+    pub fn set(&mut self, path: &ConfigPath, value: &[String]) -> Result<String> {
+        let change = edit::set(&self.file, path, value)?;
+        self.update(|f| *f = change.file)?;
+        Ok(change.summary)
+    }
+
+    /// `config reset <path>` — drop the user's override so the knob follows the
+    /// built-in default again, persisted the same one-operation way.
+    pub fn reset(&mut self, path: &ConfigPath) -> Result<String> {
+        let change = edit::reset(&self.file, path)?;
+        self.update(|f| *f = change.file)?;
+        Ok(change.summary)
     }
 }
 
@@ -345,6 +437,23 @@ mod tests {
         assert!(
             !text.contains("stale_days"),
             "unset key must not persist: {text:?}"
+        );
+    }
+
+    /// The constrained-domain knobs are typed enums, so valid spellings parse
+    /// and an unknown one is a hard load error (serde validates for free — the
+    /// same strictness `config set` relies on), where the old string field
+    /// silently degraded to a default.
+    #[test]
+    fn color_and_escalator_are_validated_enums() {
+        let cfg = toml::from_str::<ConfigFile>("color = \"never\"\nprivilege_escalator = \"doas\"")
+            .expect("valid enum spellings parse")
+            .resolve();
+        assert_eq!(cfg.color, ColorMode::Never);
+        assert_eq!(cfg.privilege_escalator, PrivilegeEscalator::Doas);
+        assert!(
+            toml::from_str::<ConfigFile>("color = \"bogus\"").is_err(),
+            "an unknown color spelling is now a load error"
         );
     }
 

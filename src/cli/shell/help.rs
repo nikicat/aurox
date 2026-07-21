@@ -22,6 +22,7 @@ commands:
   clear                 empty the cart
   refresh [aur|pacman]  re-fetch the AUR mirror and/or the official repo DBs
   system show|prune     disk usage of aurox's state / delete the caches
+  config show|set|reset inspect or change a persistent config setting
   help [topic]          this list, or `help <command>` for detail on one
   quit                  leave the shell (also: Ctrl-D, Ctrl-C)
 selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
@@ -140,6 +141,18 @@ const TOPICS: &[(Verb, &str)] = &[
          recreates them (pruning the AUR mirror means the next AUR sync\n  \
          runs the full ~2 GiB re-clone); build metrics and shell history\n  \
          are never touched.",
+    ),
+    (
+        Verb::Config,
+        "config <show|set|reset> …\n  \
+         Inspect or change a persistent config setting (written to config.toml).\n  \
+         `config show` prints a table of every knob's current vs default value,\n  \
+         highlighting the ones you've changed; `config show <key>` shows one, or a\n  \
+         whole section (`config show ages`).\n  \
+         `config set <key> <value>` validates and saves — an unknown key or a value\n  \
+         the schema rejects (bad enum, non-integer) is refused, the file untouched.\n  \
+         `config reset <key>` drops your override so the key follows the default again.\n  \
+         Keys are dotted (`color`, `ages.caution_days`); Tab completes them.",
     ),
     (
         Verb::Help,

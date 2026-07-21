@@ -24,6 +24,7 @@
 //! so the cart mutations and the approval gate are exercised without a
 //! terminal, index, or `makepkg`.
 
+use crate::config::ConfigPath;
 use crate::error::Result;
 use crate::index;
 use crate::mirror;
@@ -230,4 +231,18 @@ pub trait ShellEnv {
     /// and info keep working from it until a `refresh aur` re-fetches the
     /// mirror + index.
     fn system_prune(&mut self) -> Result<Option<ByteSize>>;
+    /// `config show [path]`: render the effective config (all knobs, one knob,
+    /// or a whole `[section]`) as the current/default table and print it — the
+    /// coloring of changed values is presentation, so it stays env-side (like
+    /// [`Self::render_cart`]). `Err` for an unknown path (the core prefixes it).
+    fn config_show(&mut self, path: Option<&ConfigPath>) -> Result<()>;
+    /// `config set <path> <value…>`: validate the knob + value against the
+    /// schema and persist the change (disk + in-memory view together). Returns a
+    /// one-line summary; `Err` for an unknown path or a value the schema rejects
+    /// (leaving the file untouched).
+    fn config_set(&mut self, path: &ConfigPath, value: &[String]) -> Result<String>;
+    /// `config reset <path>`: drop the user's override so the knob follows the
+    /// built-in default again (sparse persistence — a now-empty section is
+    /// pruned). Returns a one-line summary.
+    fn config_reset(&mut self, path: &ConfigPath) -> Result<String>;
 }
