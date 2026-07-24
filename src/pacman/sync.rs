@@ -303,17 +303,39 @@ impl RefreshLock {
 }
 
 /// aurox's private dbpath, but only once it's actually usable — at least one
-/// downloaded `*.db` under `sync/` and a `local` symlink that still resolves.
+/// downloaded `*.db` under `sync/` and a `local` that is a *resolving
+/// symlink* to a localdb.
 ///
 /// Returning `None` until both hold is load-bearing: an empty or half-built
 /// store would report *every* installed package as foreign (no sync repo
 /// declares it), so the upgrade-check readers fall back to the system dbpath
 /// until the first successful [`refresh_sync_db`].
+///
+/// The symlink-shape check (not just existence) is load-bearing too: a real
+/// directory named `local` is the poisoned state a pre-fix
+/// `pacman -Su --dbpath` run left behind (see the module docs) — it holds a
+/// splinter of the localdb, not the installed set, so reading it would
+/// misreport nearly every package.
 pub fn synced_db_path() -> Option<PathBuf> {
     let db = paths::sync_db_path();
-    // `exists()` follows the symlink, so a dangling `local` reads as absent.
-    if !db.join("local").exists() {
-        return None;
+    let local = db.join("local");
+    match std::fs::symlink_metadata(&local) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            // `exists()` follows the symlink, so a dangling `local` reads as
+            // absent — unusable.
+            if !local.exists() {
+                return None;
+            }
+        }
+        Ok(_) => {
+            warn!(
+                local = %local.display(),
+                "private dbpath `local` is not a symlink (poisoned store); \
+                 falling back to the system db",
+            );
+            return None;
+        }
+        Err(_) => return None,
     }
     let has_db = match std::fs::read_dir(db.join("sync")) {
         Ok(entries) => entries
@@ -335,15 +357,37 @@ fn prepare_db_dir(db: &Path) -> Result<()> {
 }
 
 /// Idempotently make `link` a symlink to `target`. Re-points a link aimed
-/// elsewhere (e.g. the system dbpath moved) and clears a non-symlink sitting in
-/// the way; a no-op when it already points where we want.
+/// elsewhere (e.g. the system dbpath moved) and clears a plain *file* sitting
+/// in the way; a no-op when it already points where we want.
+///
+/// A *directory* in the way is refused, never deleted: that shape is what a
+/// pre-fix `pacman -Su --dbpath` run left behind after pacman unlinked the
+/// symlink mid-transaction (see the module docs), and it may hold the only
+/// copy of package records from that transaction. The error carries the
+/// recovery hint.
 fn ensure_symlink(target: &Path, link: &Path) -> Result<()> {
-    match std::fs::read_link(link) {
-        Ok(current) if current == target => return Ok(()),
+    match std::fs::symlink_metadata(link) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            if std::fs::read_link(link)? == target {
+                return Ok(());
+            }
+            std::fs::remove_file(link)?;
+        }
+        Ok(meta) if meta.is_dir() => {
+            return Err(Error::other(format!(
+                "{link} is a real directory where aurox expects a symlink to \
+                 the system localdb — it may hold the only copy of package \
+                 records from an interrupted transaction, so aurox won't \
+                 delete it. Inspect it (merge anything missing into the \
+                 system localdb), move it aside (`mv {link} {link}.bak`), \
+                 then re-run the refresh",
+                link = link.display(),
+            )));
+        }
+        // A plain file squatting where the symlink should go — clear it.
         Ok(_) => std::fs::remove_file(link)?,
-        // Not a symlink but something is there — clear it so we can relink.
-        Err(_) if link.exists() => std::fs::remove_file(link)?,
-        Err(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
     }
     std::os::unix::fs::symlink(target, link)?;
     Ok(())
@@ -455,6 +499,29 @@ mod tests {
 
         ensure_symlink(&target, &link).unwrap();
         assert_eq!(fs::read_link(&link).unwrap(), target);
+    }
+
+    /// The post-incident shape: a real directory (holding what may be the
+    /// only copy of package records) where the symlink belongs. Refused with
+    /// the recovery hint — and the directory plus its contents must survive
+    /// untouched.
+    #[test]
+    fn ensure_symlink_refuses_to_replace_a_directory() {
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("target");
+        fs::create_dir(&target).unwrap();
+        let link = dir.path().join("local");
+        fs::create_dir(&link).unwrap();
+        fs::write(link.join("pkg-1.0-1"), b"records").unwrap();
+
+        let err = ensure_symlink(&target, &link).unwrap_err().to_string();
+        crate::assert_contains!(err, "won't delete it");
+        crate::assert_contains!(err, "mv ");
+        assert!(link.is_dir(), "directory was replaced: {link:?}");
+        assert!(
+            link.join("pkg-1.0-1").exists(),
+            "directory contents were lost"
+        );
     }
 
     /// THE regression test for the unconditional-clear bug: while another
@@ -613,6 +680,23 @@ mod tests {
         // Points at a path that doesn't exist — `exists()` follows it and reads
         // false, so this dbpath must not be handed out.
         std::os::unix::fs::symlink(dir.path().join("gone"), db.join("local")).unwrap();
+        assert!(synced_db_path().is_none());
+    }
+
+    /// THE read-side regression test for the corruption incident: a real
+    /// directory named `local` (what a pre-fix `pacman -Su --dbpath` run left
+    /// behind) must read as unusable even though it exists and a sync db is
+    /// present — its contents are a splinter of the localdb, not the
+    /// installed set.
+    #[test]
+    fn synced_db_path_rejects_a_poisoned_local_dir() {
+        let dir = TempDir::new().unwrap();
+        let _root = ScopedStateRoot::new(dir.path().to_path_buf());
+        let db = paths::sync_db_path();
+        let sync = db.join("sync");
+        fs::create_dir_all(&sync).unwrap();
+        fs::write(sync.join("core.db"), b"x").unwrap();
+        fs::create_dir(db.join("local")).unwrap();
         assert!(synced_db_path().is_none());
     }
 }
