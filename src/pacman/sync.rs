@@ -25,6 +25,20 @@
 //! ([`crate::pacman::invoke::query_repo_upgrades`],
 //! [`crate::build::collect_upgrade_plan`]).
 //!
+//! The store is strictly a **read-side** cache (plus this module's rootless
+//! refresh as its one writer). The privileged pacman that applies a repo
+//! upgrade must **never** be pointed at it via `--dbpath`: pacman's commit
+//! path extracts each package's `.MTREE`/`.INSTALL` into
+//! `<dbpath>/local/<pkg>/` through libarchive with `ARCHIVE_EXTRACT_UNLINK |
+//! ARCHIVE_EXTRACT_SECURE_SYMLINKS`, which silently unlinks the store's
+//! `local` symlink mid-transaction and splits the localdb between the two
+//! stores (the 2026-07-25 corruption incident). Instead, apply *stages* the
+//! frozen `sync/*.db` into the system `DBPath` ([`SyncDbStaging`]) and runs a
+//! plain `pacman -Su` — deliberately writing the system sync dbs at that
+//! moment: a pinned `-Sy` immediately followed by `-Su`, so the versions
+//! pacman installs are exactly the plan's and no `-Sy`-without-`-u` window
+//! ever exists.
+//!
 //! Two locks are in play during a refresh. libalpm's own `db.lck` (created
 //! `O_EXCL` inside `update` and unlinked on return) serializes DB writers but
 //! is a pure *existence* lock: it can't distinguish a live holder from the
@@ -393,6 +407,92 @@ fn ensure_symlink(target: &Path, link: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The frozen `sync/*.db` files (plus their detached `.sig`s where present)
+/// that apply stages from the private store into the system `DBPath`, so the
+/// privileged `pacman -Su` installs exactly the versions the plan was
+/// resolved against — without ever pointing a *writing* pacman at the
+/// private dbpath (the module docs name the corruption that rule prevents).
+///
+/// Fields stay private so the `install` argv schema — flags, ordering — has
+/// exactly one site: [`Self::install_argv`].
+#[derive(Debug)]
+pub(crate) struct SyncDbStaging {
+    /// Absolute source paths, sorted by filename with each `.db` followed by
+    /// its `.sig` when present — a deterministic consent preview.
+    files: Vec<PathBuf>,
+    /// `<system DBPath>/sync`, the dir the upcoming pacman reads.
+    dest: PathBuf,
+}
+
+impl SyncDbStaging {
+    /// The staging for the current store and system, or `Ok(None)` when the
+    /// store isn't usable ([`synced_db_path`]) — the caller falls back to a
+    /// plain `-Syu`. A `pacman-conf` failure propagates; the caller decides
+    /// whether to degrade.
+    pub(crate) fn discover() -> Result<Option<Self>> {
+        let Some(store) = synced_db_path() else {
+            return Ok(None);
+        };
+        let system_db = alpm_db::system_db_path()?;
+        Self::collect(&store, &system_db)
+    }
+
+    /// Pure half of [`Self::discover`], parameter-injected for tests: every
+    /// `<store>/sync/*.db`, each followed by its `<name>.db.sig` when
+    /// present, sorted by filename. `Ok(None)` when no `*.db` exists.
+    ///
+    /// A repo configured in `pacman.conf` but absent from the store (added
+    /// after the last refresh) is simply not staged; pacman then reads
+    /// whatever the system has for it — the same view the old `--dbpath`
+    /// flow gave. An orphan `.sig` without its `.db` is never staged; a
+    /// system-side stale `.sig` beside a freshly staged unsigned `.db` is
+    /// left alone (rewriting it would need knowledge we don't have).
+    fn collect(store: &Path, system_db: &Path) -> Result<Option<Self>> {
+        let mut dbs: Vec<PathBuf> = std::fs::read_dir(store.join("sync"))?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "db"))
+            .collect();
+        if dbs.is_empty() {
+            return Ok(None);
+        }
+        dbs.sort();
+        let mut files = Vec::new();
+        for db in dbs {
+            let sig = db.with_extension("db.sig");
+            let has_sig = sig.exists();
+            files.push(db);
+            if has_sig {
+                files.push(sig);
+            }
+        }
+        Ok(Some(Self {
+            files,
+            dest: system_db.join("sync"),
+        }))
+    }
+
+    /// argv of the elevated copy: `install -pDm644 -t <dest> <files…>`.
+    /// `-D` creates `<DBPath>/sync` on a pristine system; `-p` preserves the
+    /// fetch-time mtimes libalpm's `If-Modified-Since` logic keys off, so
+    /// later refreshes (rootless or `pacman -Sy`) stay incremental.
+    pub(crate) fn install_argv(&self) -> Vec<String> {
+        let mut argv = vec![
+            "install".to_owned(),
+            "-pDm644".to_owned(),
+            "-t".to_owned(),
+            self.dest.to_string_lossy().into_owned(),
+        ];
+        argv.extend(self.files.iter().map(|f| f.to_string_lossy().into_owned()));
+        argv
+    }
+
+    /// How many files the staging copies — a tracing field.
+    pub(crate) const fn file_count(&self) -> usize {
+        self.files.len()
+    }
+}
+
 /// libalpm's fetch callback: downloads one file per call through
 /// [`crate::pacman::dload`], rendering repo DBs as one indicatif byte-row each
 /// in the shared [`MultiProgress`] so they line up with the AUR fetch rows.
@@ -458,7 +558,7 @@ impl DbFetcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{RefreshLock, ensure_symlink, synced_db_path};
+    use super::{RefreshLock, SyncDbStaging, ensure_symlink, synced_db_path};
     use crate::context;
     use crate::error::Error;
     use crate::paths;
@@ -698,5 +798,61 @@ mod tests {
         fs::write(sync.join("core.db"), b"x").unwrap();
         fs::create_dir(db.join("local")).unwrap();
         assert!(synced_db_path().is_none());
+    }
+
+    /// Pins the whole `install` argv schema at its one site: flag cluster,
+    /// dest, filename sort order, and each `.db` immediately followed by its
+    /// `.sig` when (and only when) one exists. Non-db files (`db.lck`, an
+    /// orphan `.sig`) never stage.
+    #[test]
+    fn staging_collects_dbs_and_matching_sigs() {
+        let dir = TempDir::new().unwrap();
+        let store = dir.path().join("store");
+        let sync = store.join("sync");
+        fs::create_dir_all(&sync).unwrap();
+        for f in [
+            "extra.db",
+            "core.db",
+            "core.db.sig",
+            "db.lck",
+            "orphan.db.sig",
+        ] {
+            fs::write(sync.join(f), b"x").unwrap();
+        }
+        let system_db = dir.path().join("sysdb");
+
+        let staging = SyncDbStaging::collect(&store, &system_db)
+            .unwrap()
+            .expect("two dbs present");
+        let p = |name: &str| sync.join(name).to_string_lossy().into_owned();
+        assert_eq!(
+            staging.install_argv(),
+            vec![
+                "install".to_owned(),
+                "-pDm644".to_owned(),
+                "-t".to_owned(),
+                system_db.join("sync").to_string_lossy().into_owned(),
+                p("core.db"),
+                p("core.db.sig"),
+                p("extra.db"),
+            ],
+        );
+        assert_eq!(staging.file_count(), 3);
+    }
+
+    /// No `*.db` in the store — even with a `db.lck` and an orphan `.sig`
+    /// present — reads as "nothing to stage": the caller falls back to a
+    /// plain `-Syu` rather than staging an empty set.
+    #[test]
+    fn staging_none_without_dbs() {
+        let dir = TempDir::new().unwrap();
+        let store = dir.path().join("store");
+        let sync = store.join("sync");
+        fs::create_dir_all(&sync).unwrap();
+        fs::write(sync.join("db.lck"), b"").unwrap();
+        fs::write(sync.join("orphan.db.sig"), b"x").unwrap();
+
+        let staging = SyncDbStaging::collect(&store, dir.path()).unwrap();
+        assert!(staging.is_none(), "staged with no dbs: {staging:?}");
     }
 }

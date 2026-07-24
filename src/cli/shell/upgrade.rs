@@ -259,8 +259,9 @@ fn pin_hint(issue: &preflight::Issue) -> Option<String> {
     })
 }
 
-/// A system-dbpath pacman snapshot — `pacman -S/-U/-Syu` act against this db, so
-/// the apply plan must match what pacman will see.
+/// A system-dbpath pacman snapshot — `pacman -S/-U` and the staged `-Su`
+/// (see [`crate::pacman::sync::SyncDbStaging`]) act against this db, so the
+/// apply plan must match what pacman will see.
 pub(crate) fn system_pac() -> Result<PacmanIndex> {
     let alpm = alpm_db::open()?;
     Ok(PacmanIndex::build(&alpm))
