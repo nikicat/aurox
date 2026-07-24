@@ -74,6 +74,10 @@ pub fn index_path() -> PathBuf {
 /// See [`crate::pacman::sync`]. Holds a `sync/` dir of downloaded repo DBs and a
 /// `local` symlink to the system localdb, so libalpm reads the real
 /// installed-package set while available versions come from aurox's own fetch.
+///
+/// A read-side store: at apply its `sync/*.db` are staged *into* the
+/// system `DBPath` — the dir itself is never handed to a privileged pacman
+/// (the sync module docs name the corruption that would cause).
 pub fn sync_db_path() -> PathBuf {
     state_dir().join("syncdb")
 }

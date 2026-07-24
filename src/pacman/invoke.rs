@@ -6,6 +6,7 @@ use crate::error::{Error, Result};
 use crate::names::{PkgName, RepoName};
 use crate::pacman::alpm_db;
 use crate::pacman::preflight;
+use crate::pacman::sync::SyncDbStaging;
 use crate::runopts;
 use crate::ui;
 use crate::version::Version;
@@ -108,7 +109,7 @@ pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
         // here, before the user answers "Continue?" and types a password
         // for a transaction pacman is certain to reject.
         preflight_remove(argv)?;
-        confirm_escalation(program, &spawn_args)?;
+        confirm_escalation(program, &[&spawn_args])?;
     }
     debug!(program, args = ?spawn_args, "spawning pacman");
     // For `-U <files>` and `-S…u` sysupgrades, ask libalpm what would happen
@@ -118,19 +119,74 @@ pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
     // the execution log is to do the prepare ourselves. Best-effort: any
     // failure is logged at debug and we still hand off to the real pacman.
     preflight_pacman(argv);
+    spawn_streamed(program, &spawn_args)
+}
 
-    // On a real terminal, hand pacman the inherited TTY: it draws its own
-    // download + transaction progress bars and reads prompts (and the sudo
-    // password) natively. Capturing output means piping pacman's stdout, which
-    // forces its degraded line-by-line mode — and can kill pacman with "unable
-    // to write to pipe" if our reader closes first — so we only tee off a
-    // terminal (cron / CI / a pipe), where there are no bars to lose and the
-    // execution log still wants pacman's output on failure (the contract
-    // `tests/container/smoke/57_pacman_conflict_logged` pins).
+/// The apply-time repo upgrade against the frozen store: stage the store's
+/// sync dbs into the system `DBPath`, then run a plain `pacman -Su` — both
+/// elevated, both disclosed under ONE consent prompt (the repo-half gate of
+/// the shell's `apply`).
+///
+/// The privileged pacman deliberately never sees `--dbpath`: pointing a
+/// *writing* pacman at the private store destroys its `local` symlink
+/// mid-transaction (see [`crate::pacman::sync`]'s module docs). Staging
+/// instead makes the system sync dbs identical to the store the plan was
+/// resolved against, so the plain `-Su` installs exactly the planned
+/// versions.
+///
+/// The copy takes no `db.lck`: rewriting sync dbs beside a concurrent pacman
+/// is the same exposure any `pacman -Sy` creates, the copy is idempotent,
+/// and the follow-up `-Su` fails cleanly on pacman's own lock. Escalators
+/// without sudo's timestamp cache (doas, run0) may prompt for a password
+/// once per command — the same assumption the build pipeline already makes
+/// for its back-to-back `-S` lanes.
+#[instrument(skip(cfg, staging))]
+pub(crate) fn exec_staged_sysupgrade(
+    cfg: &Config,
+    staging: &SyncDbStaging,
+    pacman_argv: &[String],
+) -> Result<u8> {
+    let program = cfg.privilege_escalator.command();
+    let stage_args = staging.install_argv();
+    let spawn_args = with_pacman(pacman_argv);
+    confirm_escalation(program, &[&stage_args, &spawn_args])?;
+    info!(
+        files = staging.file_count(),
+        "staging frozen sync dbs into the system dbpath"
+    );
+    if let Err(e) = spawn_streamed(program, &stage_args) {
+        // A failed copy is not a failed pacman: nothing touched the package
+        // db (at worst some sync-db cache files were part-copied, which any
+        // refresh rewrites) — say so instead of surfacing a bare exit code.
+        return Err(Error::other(format!(
+            "staging the frozen sync dbs failed ({e}); pacman was not run — \
+             retry `apply`, or upgrade directly with `sudo pacman -Syu`"
+        )));
+    }
+    preflight_pacman(pacman_argv);
+    debug!(program, args = ?spawn_args, "spawning pacman (staged sysupgrade)");
+    spawn_streamed(program, &spawn_args)
+}
+
+/// Dispatch a spawn to the terminal-inherited or teed runner.
+///
+/// On a real terminal, hand the child the inherited TTY: pacman draws its own
+/// download + transaction progress bars and reads prompts (and the sudo
+/// password) natively. Capturing output means piping pacman's stdout, which
+/// forces its degraded line-by-line mode — and can kill pacman with "unable
+/// to write to pipe" if our reader closes first — so we only tee off a
+/// terminal (cron / CI / a pipe), where there are no bars to lose and the
+/// execution log still wants pacman's output on failure (the contract
+/// `tests/container/smoke/57_pacman_conflict_logged` pins).
+///
+/// Also runs the staged sysupgrade's `install` step, whose teed failure
+/// output lands under the same pacman-labelled log event — a cosmetic
+/// mislabel that isn't worth forking the (smoke-57-pinned) event over.
+fn spawn_streamed(program: &str, spawn_args: &[String]) -> Result<u8> {
     if std::io::stdout().is_terminal() {
-        exec_pacman_inherited(program, &spawn_args)
+        exec_pacman_inherited(program, spawn_args)
     } else {
-        exec_pacman_teed(program, &spawn_args)
+        exec_pacman_teed(program, spawn_args)
     }
 }
 
@@ -251,22 +307,34 @@ fn status_to_exit_code(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-/// Show what's about to run with elevated privileges and gate it with a
-/// y/n confirm. No-op under `--noconfirm` (returns `Ok(())` immediately).
+/// Render the elevation preview: one header plus one indented line per
+/// command. Pure so the exact bytes are unit-testable — the single-command
+/// form is pinned by the container suite (smoke 56/66 grep for it), and a
+/// multi-command sequence shares ONE header because it shares one consent.
+fn escalation_preview(program: &str, commands: &[&[String]]) -> String {
+    use std::fmt::Write;
+    let mut out = format!("about to elevate via {program}:");
+    for args in commands {
+        write!(out, "\n   {program} {}", args.join(" ")).expect("write! to String");
+    }
+    out
+}
+
+/// Show every command the coming sequence will run with elevated privileges
+/// and gate them all with a single y/n confirm — consent at one decision
+/// point, never a prompt per command. No-op under `--noconfirm` (returns
+/// `Ok(())` immediately).
 ///
 /// Rings the terminal bell before the prompt: a `pacman -U` after a long
 /// AUR build can fire 5–30 min after the user's last interaction, and the
 /// bell pulls their attention back. Skipped under `--noconfirm` (no one
 /// is waiting) and inside [`ui::bell`] when stderr isn't a TTY.
-fn confirm_escalation(program: &str, spawn_args: &[String]) -> Result<()> {
+fn confirm_escalation(program: &str, commands: &[&[String]]) -> Result<()> {
     let noconfirm = runopts::noconfirm();
     if !noconfirm {
         ui::bell();
     }
-    ui::info(&format!(
-        "about to elevate via {program}:\n   {program} {}",
-        spawn_args.join(" "),
-    ));
+    ui::info(&escalation_preview(program, commands));
     if !ui::confirm("Continue?", noconfirm)? {
         return Err(Error::UserAbort);
     }
@@ -493,6 +561,40 @@ mod tests {
     fn print_flag_disables_sudo() {
         assert!(!needs_sudo(&["-Syu".into(), "--print".into()]));
         assert!(!needs_sudo(&["-Syu".into(), "-p".into()]));
+    }
+
+    /// Byte-pins the single-command preview: the container suite greps for
+    /// this exact shape (smoke 56 counts the header, smoke 66 matches the
+    /// command line), so the multi-command refactor must not perturb it.
+    #[test]
+    fn escalation_preview_single_command_is_unchanged() {
+        let args = argv(&["pacman", "-Su", "--noconfirm"]);
+        assert_eq!(
+            escalation_preview("sudo", &[&args]),
+            "about to elevate via sudo:\n   sudo pacman -Su --noconfirm",
+        );
+    }
+
+    /// A staged sequence shares one consent, so it shares one header — each
+    /// command gets its own indented line beneath it.
+    #[test]
+    fn escalation_preview_lists_each_command_under_one_header() {
+        let stage = argv(&[
+            "install",
+            "-pDm644",
+            "-t",
+            "/var/lib/pacman/sync",
+            "/s/core.db",
+        ]);
+        let pacman = argv(&["pacman", "-Su", "--noconfirm"]);
+        let preview = escalation_preview("sudo", &[&stage, &pacman]);
+        assert_eq!(
+            preview,
+            "about to elevate via sudo:\n   \
+             sudo install -pDm644 -t /var/lib/pacman/sync /s/core.db\n   \
+             sudo pacman -Su --noconfirm",
+        );
+        assert_eq!(preview.matches("about to elevate").count(), 1);
     }
 
     // Linux wait-status encoding (per waitpid(2)): low 7 bits = signal,

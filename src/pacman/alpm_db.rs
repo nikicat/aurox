@@ -278,6 +278,12 @@ pub fn open() -> Result<Alpm> {
 /// privileged `pacman -Sy`. Installed-package reads are identical either way —
 /// the private dbpath's `local` is a symlink to the system one.
 ///
+/// Every consumer of the store is a *reader* like this handle; the one
+/// writer is the rootless refresh. The privileged pacman never opens the
+/// store at all — apply stages the frozen dbs into the system `DBPath`
+/// instead ([`crate::pacman::sync::SyncDbStaging`]; the sync module docs
+/// name the corruption a `--dbpath`-writing pacman causes).
+///
 /// Falls back to [`open`] (system dbpath) until the first successful refresh,
 /// and is deliberately *not* used on the install path: `pacman -S` runs against
 /// the system db, so resolving installs against a fresher store could plan a
@@ -307,7 +313,9 @@ pub(crate) fn system_db_path() -> Result<PathBuf> {
 
 /// Open alpm with sync repos from `pacman.conf`, optionally overriding the
 /// dbpath and/or logfile. `dbpath = None` uses the system dbpath; `Some(db)`
-/// points at a private store (whose `local` must resolve to a real localdb).
+/// points at a private store (whose `local` must resolve to a real localdb)
+/// and only ever backs an in-process read handle or the rootless refresh
+/// writer — never a spawned pacman.
 fn build_alpm(dbpath: Option<&Path>, logfile: Option<&Path>) -> Result<Alpm> {
     let mut conf = load_pacman_conf()?;
     if let Some(db) = dbpath {

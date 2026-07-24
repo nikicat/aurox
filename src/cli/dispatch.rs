@@ -13,7 +13,7 @@ use crate::names::{PkgTarget, SearchTerm};
 use crate::pacman::{invoke, sync};
 use crate::ui;
 use std::io::IsTerminal;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Top-level routing entry — clap already pre-scanned for pacman-owned ops,
 /// so by this point `cli.args` is aurox's responsibility (`-S` family,
@@ -183,21 +183,29 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
     Ok(0)
 }
 
-/// Drive `pacman -Su` for the selected repo packages, **against aurox's rootless
-/// synced db** rather than a fresh `-Sy`.
+/// Drive `pacman -Su` for the selected repo packages, **with aurox's rootless
+/// synced dbs staged into the system `DBPath`** rather than a fresh `-Sy`.
 ///
 /// The shell resolves the whole cart at `add`/`upgrade` and freezes the plan;
-/// `apply` must install exactly the versions that plan was resolved against, so
-/// the repo lane upgrades from the synced store the last `refresh` populated
-/// ([`sync::synced_db_path`]) — no apply-time `-Sy` that could pull newer
-/// versions and drift from the frozen plan. That store's `sync/*.db` are the
-/// refresh-fetched official-repo dbs and its `local` symlinks the system
-/// localdb, so pacman installs the frozen versions into the real system.
-/// Refresh is the *only* point the sync DBs move.
+/// `apply` must install exactly the versions that plan was resolved against,
+/// so before the upgrade the frozen `sync/*.db` the last `refresh` fetched
+/// are *staged into the system `DBPath`* ([`sync::SyncDbStaging`]) and pacman
+/// runs a plain `-Su` — a pinned `-Sy` immediately followed by the upgrade,
+/// both under one consent prompt. No apply-time `-Sy` that could pull newer
+/// versions and drift from the frozen plan; refresh remains the only point
+/// the store's DBs move.
 ///
-/// If that store isn't populated yet (no `refresh` this session — e.g. a repo
-/// upgrade staged before the first sync), fall back to a full `-Syu` so the
-/// upgrade still runs; pacman does its own `-Sy` in that case.
+/// The privileged pacman must **never** be pointed at the private store via
+/// `--dbpath`: its commit path extracts `.MTREE`/`.INSTALL` through
+/// libarchive with `ARCHIVE_EXTRACT_UNLINK | ARCHIVE_EXTRACT_SECURE_SYMLINKS`,
+/// which unlinks the store's `local` symlink mid-transaction and splits the
+/// localdb between the two stores (the 2026-07-25 corruption incident; see
+/// [`crate::pacman::sync`]'s module docs).
+///
+/// If the store isn't populated yet (no `refresh` this session — e.g. a repo
+/// upgrade staged before the first sync) or can't be staged (unreadable
+/// pacman-conf), fall back to a full `-Syu` so the upgrade still runs;
+/// pacman does its own `-Sy` in that case.
 ///
 /// If the user deselected any rows, those pkgnames become `--ignore=<csv>` —
 /// pacman still resolves the full upgrade graph (partial-upgrade safety) but
@@ -220,23 +228,27 @@ pub(crate) fn run_repo_upgrade(cfg: &Config, sel: &ui::UpgradeSelection) -> Resu
             sel.repo_skipped.len()
         ));
     }
-    let mut argv: Vec<String> = if let Some(db) = sync::synced_db_path() {
-        // `-Su` (no `-y`) against the frozen synced db: install the resolved
-        // versions, don't re-fetch.
-        vec![
-            "-Su".to_owned(),
-            "--noconfirm".to_owned(),
-            "--dbpath".to_owned(),
-            db.to_string_lossy().into_owned(),
-        ]
-    } else {
-        // No synced store yet — a full `-Syu` still gets the upgrade done.
-        debug!("no rootless synced db; repo upgrade falls back to a full -Syu");
-        vec!["-Syu".to_owned(), "--noconfirm".to_owned()]
+    // Degrade, don't die: an unreadable pacman-conf or store is exactly the
+    // situation where plain pacman should stay the authority.
+    let staging = match sync::SyncDbStaging::discover() {
+        Ok(staging) => staging,
+        Err(e) => {
+            warn!(error = %e, "sync-db staging unavailable; falling back to a full -Syu");
+            None
+        }
     };
+    let mut argv = vec![
+        if staging.is_some() { "-Su" } else { "-Syu" }.to_owned(),
+        "--noconfirm".to_owned(),
+    ];
     if !sel.repo_skipped.is_empty() {
         argv.push("--ignore".to_owned());
         argv.push(sel.repo_skipped.join(","));
     }
-    invoke::exec_pacman(cfg, &argv).map(|_| ())
+    if let Some(staging) = staging {
+        invoke::exec_staged_sysupgrade(cfg, &staging, &argv).map(|_| ())
+    } else {
+        debug!("no rootless synced db; repo upgrade falls back to a full -Syu");
+        invoke::exec_pacman(cfg, &argv).map(|_| ())
+    }
 }
