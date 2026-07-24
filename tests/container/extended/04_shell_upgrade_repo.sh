@@ -11,6 +11,10 @@
 # The driver also folds in the synced-db size guard the retired
 # `05_loop_size_from_synced_db` test covered (the preview total must not be
 # `0 B`).
+#
+# With the suite-default `check_repo_updates=false` the rootless store never
+# populates, so this test deliberately pins the `-Syu` FALLBACK lane of
+# `run_repo_upgrade`; the staged lane is pinned by 42.
 source /work/tests/container/lib.sh
 bootstrap
 reset_state
