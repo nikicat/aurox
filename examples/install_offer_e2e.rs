@@ -9,7 +9,8 @@
 //! ```text
 //!   (launch) → "may be in the AUR" note + cost announcement + Y/n prompt
 //!   y        → clone + index build, then the install plan for test-trivial
-//!   (build)  → makepkg + pacman -U run unattended to a clean exit
+//!   (review) → Enter approves; makepkg runs unattended
+//!   (gate)   → Enter passes the sudo `Continue?` gate; pacman -U → clean exit
 //! ```
 //!
 //! The `.sh` sets `review_default = "skip"` so the offer prompt is the only
@@ -37,7 +38,13 @@ fn main() {
     pty.expect("review prompt", |s| s.contains("review —"));
     pty.send(b"\r");
 
-    // Build + install run unattended; finish_clean waits for the exit status.
+    // After the unattended build, the batched `pacman -U` stops at the sudo
+    // escalation gate — every driver that reaches it must answer it (this one
+    // historically didn't, and only passed when a stray buffered newline fed
+    // the gate; the teardown deadline turned that into a caught 45s stall).
+    pty.expect("sudo gate", |s| s.contains("Continue?"));
+    pty.send(b"\r");
+
     pty.finish_clean();
     println!("INSTALL_OFFER_E2E_OK");
 }

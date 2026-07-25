@@ -62,6 +62,27 @@ Hard-won rules from review; hold new code to these.
   structural; when reviewing one, the question is "which copy is the truth
   afterwards?", not "how many bytes?" (that question found the apply
   reviewed-set loss).
+- **Time enters as a duration, never a clock read.** `Instant::now()` is for
+  *measuring* (metrics, progress rates); control flow never hand-rolls
+  deadline/remaining arithmetic. A bounded wait is a `Duration` budget turned
+  into a timer channel (crossbeam `after()`) `select!`ed beside the data
+  channel, and the timer's *scope* is the semantics: created once outside
+  the loop = absolute bound (required where streamed redraws would reset a
+  per-recv timeout); fresh per recv = silence bound (right for teardowns,
+  where the only legitimate wake is an event). See pty-harness's `Timer`.
+- **Block on events; funnel them into one channel.** No sleep-and-poll. An
+  API that only blocks (`Child::wait` — Unix has no portable timed wait)
+  moves to a sentinel thread that owns it and reports completion as a
+  message; cancellation goes through an out-of-band handle (`clone_killer`).
+  The channel protocol is decoded at ONE site (`pump_one`) — callers own
+  only their termination policy, as a match on the decoded event. Every
+  wait on an external process is bounded, with containment layered above
+  (harness deadline → run.sh `TEST_TIMEOUT` → CI `timeout-minutes`): an
+  unbounded `wait()` once held CI to the 6h runner kill (run 29876293421).
+- **Panics state the violated expectation.** `.expect()` messages use the
+  std "should" style — "git should be installed and on PATH", never an
+  operation label ("git available") — so the panic reads as the broken
+  assumption, not an opcode. Test-scaffolding expects may stay terse.
 
 ## Testing
 

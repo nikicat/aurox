@@ -11,6 +11,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+crossbeam-channel = "0.5"
 fastrand = "2"
 portable-pty = "0.9"
 serde_json = "1"

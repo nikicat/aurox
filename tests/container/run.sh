@@ -12,6 +12,8 @@
 # Image is cached as `aurox-test:latest`; rebuild with --rebuild.
 # Parallelism: -j N (default = $(nproc), 1 disables, all tests are
 # fully isolated by container so contention is on host CPU/IO only).
+# Per-test timeout: TEST_TIMEOUT=<seconds> (default 600). A test that
+# exceeds it FAILs with a note instead of wedging the whole run.
 #
 # Coverage mode:
 #   --coverage <dir>   Bind-mount <dir> into each test container at /profraw
@@ -32,6 +34,11 @@ set -euo pipefail
 
 CONTAINER="${CONTAINER:-podman}"
 IMAGE="aurox-test:latest"
+# Per-test wall-clock cap. One wedged test (a PTY driver stuck in teardown, a
+# hung container) must FAIL loudly, not hold the xargs pool until CI's 6h job
+# kill (run 29876293421). GNU timeout runs podman in its own process group,
+# so the TERM at expiry can't leak to sibling test jobs.
+TEST_TIMEOUT="${TEST_TIMEOUT:-600}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 TESTS_DIR="$REPO_ROOT/tests/container"
 
@@ -151,13 +158,16 @@ run_one() {
         )
     fi
 
-    if "$CONTAINER" run --rm \
+    local status=0
+    timeout --kill-after=30s "$TEST_TIMEOUT" \
+        "$CONTAINER" run --rm \
             -v "$REPO_ROOT:/work:ro" \
             -v "$(mktemp -d):/tmp/target" \
             "${cov_args[@]}" \
             "${rec_args[@]}" \
             "$IMAGE" \
-            bash -c "set -e; cd /work && bash $rel" >"$out" 2>&1; then
+            bash -c "set -e; cd /work && bash $rel" >"$out" 2>&1 || status=$?
+    if [[ "$status" -eq 0 ]]; then
         echo "PASS $rel"
     else
         # Print the captured-output path explicitly so the user can re-read
@@ -165,9 +175,12 @@ run_one() {
         # between FAIL header and captured lines is unambiguous. An empty
         # `$out` (e.g. when podman exits before producing output) shows up
         # as a clearly empty body, which is itself diagnostic.
-        local size
+        local size why=""
         size=$(wc -c <"$out" 2>/dev/null || echo 0)
-        echo "FAIL $rel  ($size bytes captured at $out)"
+        # 124 is timeout(1)'s own expiry code — unambiguous. (137 could also
+        # be a KILL from elsewhere, e.g. the OOM killer, so it gets no note.)
+        [[ "$status" -eq 124 ]] && why="  (hit the ${TEST_TIMEOUT}s per-test timeout)"
+        echo "FAIL $rel$why  ($size bytes captured at $out)"
         if [[ "$size" -gt 0 ]]; then
             sed 's/^/    /' "$out"
         else
@@ -176,7 +189,7 @@ run_one() {
     fi
 }
 export -f run_one
-export CONTAINER IMAGE REPO_ROOT results_dir
+export CONTAINER IMAGE REPO_ROOT results_dir TEST_TIMEOUT
 export COVERAGE_DIR="$coverage_dir"
 export CASTS_DIR="$casts_dir"
 export AUROX="${AUROX:-}"
