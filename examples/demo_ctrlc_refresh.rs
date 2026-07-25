@@ -38,6 +38,7 @@ fn main() {
     pty.expect("shell banner", |s| s.contains("aurox shell"));
     dwell(1500);
 
+    pty.wait_for_prompt();
     pty.send_human("refresh");
     pty.expect("fetch started", |s| s.contains("refreshing AUR mirror"));
     // The mirror answered, then went silent: the fetch is now hung. Let the
@@ -53,6 +54,7 @@ fn main() {
     // shell survived rather than dying with the fetch.
     dwell(2500);
 
+    pty.wait_for_prompt();
     pty.send_human("quit");
     pty.finish_clean();
 

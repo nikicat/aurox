@@ -94,26 +94,38 @@
 
 - account for already downloaded sources when printing download sizes in tables
 
-## Code health — 2026-07-25 harness-refactor follow-ups
-
-The pty-harness rewrite (funnel channel + waiter thread, `pump_one` single
-decode site, crossbeam `after()` timer channels, silence-vs-absolute bounds,
-"should"-style expect messages) established conventions now recorded in
-CLAUDE.md ("Time enters as a duration…", "Block on events…", "Panics state
-the violated expectation"). Sweep the rest of the tree up to them:
-
-- **PTY driver ack-discipline audit** — every `examples/*_e2e.rs` and
-  `demo_*.rs` against the two failure classes from the 2026-07-25 CI hang
-  post-mortem (see docs/TESTING.md "Writing PTY e2e drivers"): needles that
-  stale-match earlier screen content instead of proving the reading prompt
-  is armed (the `1 to install` txn-header trap, run 29876293421's 6h hang),
-  and prompts reached but never answered (`install_offer_e2e` passed for
-  weeks only because a stray buffered newline fed the sudo `Continue?`
-  gate). For each driver: trace the scenario's real prompt sequence, verify
-  each prompt has an expect+answer pair with an arming-proof needle;
-  flake-hunt with the test listed several times in one `run.sh` call.
-
 <!-- Done:
+- the 2026-07-25 harness-refactor follow-up sweep is finished: all four
+  items below (expect wording, `Instant::now()`, sleep/poll loops, PTY ack
+  discipline) landed, and the conventions they enforce now live in CLAUDE.md
+  ("Time enters as a duration…", "Block on events…", "Panics state the
+  violated expectation") plus docs/TESTING.md, not in this list.
+- PTY driver ack-discipline audit (26 drivers): the fix is structural, not
+  26 better needles. `Pty::send_command` blocks on `at_prompt` (the `aurox>`
+  line, last non-blank) before typing, so a REPL command *cannot* be sent
+  into a rustyline that hasn't re-armed — 83 command sends converted, and
+  the content `expect`s around them go back to being assertions instead of
+  doubling as timing barriers. Demo drivers that type with `send_human`
+  call `wait_for_prompt()`; a `dwell` was pacing masquerading as an ack
+  (`demo_upgrade` was riding on one).
+  Two live class-A races found and fixed, both on a *repeated* prompt where
+  the obvious needle matches early: the second sudo gate in `demo_upgrade`
+  and in `shell_preflight_e2e` was acked by the elevation preview
+  (`pacman -U` / `pacman -Syu`), which prints *before* dialoguer arms, while
+  the leftover `Continue?` from the answered first gate covers the other
+  half. New `armed_after(s, marker, prompt)` — the prompt rendered since the
+  marker — is the ack for both.
+  Class B (prompts reached but never answered) came up clean once the flow
+  was traced: the AUR lanes run `pacman -S/-U --noconfirm` under one
+  consolidated elevation, `-R` is the only lane with pacman's own confirm
+  (answered in `shell_remove_e2e`), and `Proceed with installation?` fires
+  only when a plan drags in unrequested packages, which no driver's does.
+  Worth knowing for the next driver: the review selector prints its own
+  prompt line and reads via plain `read_line`, so `contains("review —")` is
+  genuinely arming-proof — only the raw-mode dialoguer prompts can eat early
+  input. Verified: all 24 PTY container tests pass, plus a flake hunt
+  (3× preflight, 3× demo_upgrade, 2× cart, 2× conflict).
+
 - sleep/poll sweep of `src/`: one real offender, `ui/gix_progress.rs`'s
   `NetMeter` pump, which slept 120 ms then re-read an `AtomicBool` — so a
   teardown waited out the current nap. The flag is now an `mpsc::Sender`

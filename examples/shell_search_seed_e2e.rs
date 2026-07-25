@@ -37,10 +37,10 @@ fn main() {
 
     // The seeded list is remembered, so the row is addressable by its number —
     // proof the launch went through the same `search` dispatch as typing it.
-    pty.send(b"add 1\r");
+    pty.send_command("add 1");
     pty.expect("staged by number", |s| s.contains("staged test-trivial"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_SEARCH_SEED_E2E_OK");
 }

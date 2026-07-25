@@ -33,6 +33,7 @@ fn main() {
     pty.expect("shell banner", |s| s.contains("aurox shell"));
     dwell(1500);
 
+    pty.wait_for_prompt();
     pty.send_human("refresh pacman");
     // The DB's byte-row is on screen: the transfer is in flight — and parked,
     // since the server sent headers then went silent.

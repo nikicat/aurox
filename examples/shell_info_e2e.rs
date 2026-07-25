@@ -28,7 +28,7 @@ fn main() {
     // A name both sources resolve: the sync repo owns `repo-base` while the
     // AUR index reaches it via test-provides-repo-base's provides=. Repo must
     // win — an index-first lookup would print the provider's block.
-    pty.send(b"info repo-base\r");
+    pty.send_command("info repo-base");
     pty.expect("repo info block", |s| {
         s.contains("Repository      : local-repo") && s.contains("Name            : repo-base")
     });
@@ -41,12 +41,12 @@ fn main() {
     );
 
     // An AUR-only package still routes to the index.
-    pty.send(b"info test-trivial\r");
+    pty.send_command("info test-trivial");
     pty.expect("aur info block", |s| {
         s.contains("Repository      : aur") && s.contains("Name            : test-trivial")
     });
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_INFO_E2E_OK");
 }

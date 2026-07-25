@@ -38,7 +38,7 @@ fn main() {
     // config, so the rootless store picks up the 3.0 only the local repo
     // carries) and stages the repo row. Naming the target keeps the image's
     // real core/extra upgrades out of the transaction, as in extended/04.
-    pty.send(b"upgrade loop-repo\r");
+    pty.send_command("upgrade loop-repo");
     pty.expect("repo-only degradation note", |s| {
         has(s, "upgrades are repo-only")
     });
@@ -53,7 +53,7 @@ fn main() {
     // `apply` hits the one-consent sudo gate for the staged pair. Pin the
     // shape: one elevation header, the `install` staging line, the plain
     // `pacman -Su` line — and never `--dbpath`.
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     pty.expect("sudo gate", |s| s.contains("Continue?"));
     let screen = pty.screen();
     assert!(
@@ -78,10 +78,10 @@ fn main() {
     // A clean apply prints `done` and clears the cart; `show` confirms from
     // the shell side (the script asserts the pacman-side effects).
     pty.expect("apply finished", |s| s.contains("done"));
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("cart cleared after apply", |s| s.contains("cart is empty"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_UPGRADE_STAGED_E2E_OK");
 }

@@ -311,12 +311,38 @@ impl Pty {
         self.writer.flush().ok();
     }
 
+    /// Block until aurox's REPL prompt is armed ([`at_prompt`]).
+    ///
+    /// The ack every command send needs, and the reason it's a method rather
+    /// than each driver's business: a content needle ("staged foo") proves
+    /// output *started*, and rustyline discards whatever arrived before it
+    /// re-entered raw mode — so a command sent on a content ack can vanish,
+    /// leaving the scenario waiting on a reply to something aurox never read.
+    /// [`Self::send_command`] calls this for you; demo drivers that type with
+    /// [`Self::send_human`] call it themselves.
+    pub fn wait_for_prompt(&mut self) {
+        self.expect("the aurox prompt to be armed", at_prompt);
+    }
+
+    /// Type one REPL command line, once the prompt is actually armed.
+    ///
+    /// The whole point is that the wait is not optional: content `expect`s
+    /// around the call stay *assertions* about what the session showed,
+    /// instead of doubling as timing barriers that a table printed after them
+    /// silently invalidates.
+    pub fn send_command(&mut self, line: &str) {
+        self.wait_for_prompt();
+        self.send(line.as_bytes());
+        self.send(b"\r");
+    }
+
     /// Demo pacing: type `line` character by character with a human-ish,
     /// *deterministic* rhythm, then Enter after a beat. rustyline echoes each
     /// keystroke, so in a cast recording this reads as live typing. Only call
-    /// at a prompt (same ack rule as [`Self::send`] — buffered input sent
-    /// before rustyline reads is dropped); the per-char trickle itself is
-    /// what a terminal delivers anyway.
+    /// at a prompt — [`Self::wait_for_prompt`] first for the aurox REPL,
+    /// [`back_at_prompt`] for the demo bash shell — since buffered input sent
+    /// before the reader arms is dropped; the per-char trickle itself is what
+    /// a terminal delivers anyway.
     pub fn send_human(&mut self, line: &str) {
         let mut buf = [0u8; 4];
         for c in line.chars() {
@@ -440,13 +466,59 @@ pub fn back_at_prompt(screen: &str) -> bool {
         .is_some_and(|l| l.trim() == "\u{276F}")
 }
 
+/// True when aurox's own REPL prompt (`aurox> `, `aurox [2 staged]> `) is the
+/// last non-blank line: the command finished rendering and rustyline is
+/// reading again.
+///
+/// The predicate behind [`Pty::send_command`] / [`Pty::wait_for_prompt`],
+/// public for drivers that need it inside a compound expectation. Prefer
+/// those methods: a content needle ("staged foo") says the output *started*,
+/// not that it finished — a cart mutation still has a transaction table to
+/// print — and input that lands before rustyline re-enters raw mode is
+/// discarded, so a command sent on a content ack vanishes and the scenario
+/// deadlocks. The counterpart to [`back_at_prompt`], which does the same job
+/// for the demo bash shell.
+pub fn at_prompt(screen: &str) -> bool {
+    screen
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .is_some_and(|l| {
+            let line = l.trim_start();
+            line.starts_with("aurox") && line.contains('>')
+        })
+}
+
+/// True when `prompt` appears *after* the last occurrence of `marker` — the
+/// ack for a prompt whose text repeats within one session.
+///
+/// The sudo gate asks `Continue?` once per elevation, and the answered first
+/// one stays on the vt100 grid, so a bare `contains("Continue?")` acks the
+/// *previous* gate. Reaching instead for the disclosed command line
+/// (`pacman -U`) trades one stale match for another: the elevation preview
+/// prints *before* dialoguer arms the prompt, so that needle fires early and
+/// the answer races into a reader that isn't there yet. Only "the prompt
+/// rendered since the preview" proves this gate is live:
+/// `armed_after(s, "pacman -U", "Continue?")`.
+pub fn armed_after(screen: &str, marker: &str, prompt: &str) -> bool {
+    let (screen, marker, prompt) = (compact(screen), compact(marker), compact(prompt));
+    screen
+        .rfind(&marker)
+        .is_some_and(|i| screen[i..].contains(&prompt))
+}
+
 /// Whitespace-insensitive containment: table columns pad to the widest staged
 /// row and long lines wrap on the 100-col vt100 grid, so a literal
 /// `1.0-1 → 2.0-1` match breaks whenever padding widths or the wrap position
 /// shift. Compacting both sides makes the match immune to both.
 pub fn has(screen: &str, needle: &str) -> bool {
-    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
     compact(screen).contains(&compact(needle))
+}
+
+/// Strip every whitespace character, so a match can't hinge on padding widths
+/// or where a 100-col wrap fell.
+fn compact(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 fn spawn_reader(

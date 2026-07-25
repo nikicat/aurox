@@ -42,7 +42,7 @@ fn main() {
     // `pacman -Syu` local to the fixture repo. The repo row auto-approves and
     // shows its old → new transition. With the AUR unsynced ("later"), the
     // upgrade must degrade to repo-only with a hint — never trigger the clone.
-    pty.send(b"upgrade loop-repo\r");
+    pty.send_command("upgrade loop-repo");
     pty.expect("repo-only degradation note", |s| {
         has(s, "upgrades are repo-only")
     });
@@ -77,7 +77,7 @@ fn main() {
     // table — and its `this batch` total — prints at `upgrade` above). The
     // first prompt after the one-line cost summary is the sudo gate for the
     // partial `pacman -Syu`.
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     pty.expect("sudo gate", |s| s.contains("Continue?"));
     pty.send(b"\r");
 
@@ -87,10 +87,10 @@ fn main() {
     // raw mode. A clean apply prints `done` and clears the cart.
     pty.expect("apply finished", |s| s.contains("done"));
     // `show` then reports the cart empty — the shell-side proof the upgrade landed.
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("cart cleared after apply", |s| s.contains("cart is empty"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_UPGRADE_E2E_OK");
 }

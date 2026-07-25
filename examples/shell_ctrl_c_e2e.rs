@@ -16,14 +16,14 @@ fn main() {
     let mut pty = Pty::spawn_aurox();
     pty.expect("shell banner", |s| s.contains("aurox shell"));
 
-    pty.send(b"add test-sleep-build\r");
+    pty.send_command("add test-sleep-build");
     pty.expect("staged test-sleep-build", |s| {
         s.contains("staged test-sleep-build")
     });
-    pty.send(b"approve *\r");
+    pty.send_command("approve *");
     pty.expect("approved", |s| s.contains("approved test-sleep-build"));
 
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     pty.expect("build started (sentinel)", |s| {
         s.contains("AUROX_SLEEP_BUILD_SENTINEL")
     });
@@ -37,7 +37,7 @@ fn main() {
 
     // Back at a live prompt: a clean quit is the proof (a shell killed by the
     // SIGINT would exit non-zero and fail finish_clean).
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_CTRL_C_E2E_OK");
 }

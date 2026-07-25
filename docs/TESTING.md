@@ -186,18 +186,32 @@ reset_state                   # wipe ~/.local/state/aurox between phases
 The `examples/*_e2e.rs` drivers script a real interactive session through
 `pty_harness::Pty`. Two rules, each learned from a CI hang:
 
-- **Every `send` is preceded by an `expect` that proves the *reading*
-  prompt is armed, with a needle unique to that moment.** A needle already
-  on screen from an earlier step acks nothing: the txn header
-  (`… 1 to install`) is printed by every cart mutation, so it can never
-  identify `show` — expect the numbered table row instead. The
-  `shell_conflict_e2e` stale-needle race sent `quit` into a not-yet-armed
-  rustyline and held CI to the 6h runner kill (run 29876293421).
-- **Answer every prompt the scenario reaches.** Trace aurox's real prompt
-  sequence for the flow (PKGBUILD review selector, the sudo `Continue?`
-  gate before elevated pacman, per-lane pacman prompts) and pair each with
-  an expect+send. `install_offer_e2e` never answered the sudo gate and
-  passed for weeks only while a stray buffered newline happened to feed it.
+- **Every `send` is preceded by proof the *reading* prompt is armed.**
+  Input that lands before the reader re-enters raw mode is discarded, so
+  the scenario then waits forever on a reply to something aurox never read
+  — the `shell_conflict_e2e` stale-needle race held CI to the 6h runner
+  kill (run 29876293421). For REPL commands the proof is structural: use
+  **`send_command("add foo")`**, which blocks on `at_prompt` (the `aurox>`
+  line, last non-blank) before typing. Demo drivers that type with
+  `send_human` call `wait_for_prompt()` first — a `dwell` is pacing, never
+  an ack. Content `expect`s stay *assertions*; they make poor barriers,
+  since a cart mutation still has a transaction table to print after
+  "staged foo" (and the txn header `… 1 to install` is printed by every
+  mutation, so it can never identify `show`).
+- **Answer every prompt the scenario reaches, and prove *that* prompt is
+  the one on screen.** Trace aurox's real sequence for the flow (PKGBUILD
+  review selector, the sudo `Continue?` gate before each elevation,
+  per-lane pacman prompts) and pair each with an expect+send.
+  `install_offer_e2e` never answered the sudo gate and passed for weeks
+  only while a stray buffered newline happened to feed it. For a prompt
+  whose text *repeats*, neither half of the obvious needle works alone:
+  the answered gate's `Continue?` is still on screen, and the elevation
+  preview (`sudo pacman -U …`) prints *before* dialoguer arms. Use
+  **`armed_after(s, "pacman -U", "Continue?")`** — the prompt rendered
+  since that preview. Which prompts need it: the review selector prints
+  its own line and reads with a plain line-buffered `read_line` (nothing
+  to drop), while dialoguer gates (`Continue?`, the first-launch question)
+  read in raw mode and do drop early input.
 
 A driver bug now costs 45 seconds, not 6 hours — hangs are contained in
 layers, each with a diagnostic: pty-harness panics after `PATIENCE` (45s)

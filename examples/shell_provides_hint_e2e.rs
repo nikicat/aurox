@@ -31,7 +31,7 @@ fn main() {
     // screen holds just the banner + this table, so checking that "-newer"
     // appears nowhere is safe (later screens print the PKGBUILD, whose
     // provides= array legitimately names it).
-    pty.send(b"upgrade test-syu-hint-*\r");
+    pty.send_command("upgrade test-syu-hint-*");
     pty.expect("older staged by its foreign pkgname", |s| {
         has(s, "test-syu-hint-older 1.0-1 → 2.0-1")
     });
@@ -42,7 +42,7 @@ fn main() {
     );
 
     // The review header must name the package the user acted on.
-    pty.send(b"review test-syu-hint-older\r");
+    pty.send_command("review test-syu-hint-older");
     pty.expect("header names the user's package", |s| {
         has(s, "[provides test-syu-hint-older]")
     });
@@ -58,7 +58,7 @@ fn main() {
         s.contains("approved test-syu-hint-older")
     });
 
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     pty.expect("sudo gate", |s| s.contains("Continue?"));
     pty.send(b"\r");
     // Expect exactly one sudo prompt. The regression would add a second one:
@@ -75,7 +75,7 @@ fn main() {
          dependency\n--- screen ---\n{screen}\n--- end ---"
     );
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_PROVIDES_HINT_E2E_OK");
 }

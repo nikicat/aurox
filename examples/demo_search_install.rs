@@ -40,24 +40,29 @@ fn main() {
     dwell(2000);
 
     // A typed search fills the numbered result table mixing repo and AUR rows.
+    pty.wait_for_prompt();
     pty.send_human("search hello");
     pty.expect("search results", |s| s.contains("test-hello"));
     dwell(2500);
 
+    pty.wait_for_prompt();
     pty.send_human("add test-hello");
     pty.expect("staged", |s| s.contains("staged test-hello"));
     dwell(1800);
 
     // The gate refuses to install an unreviewed AUR package…
+    pty.wait_for_prompt();
     pty.send_human("apply");
     pty.expect("review gate", |s| s.contains("needs review"));
     dwell(2000);
 
     // …and clears after an explicit approve.
+    pty.wait_for_prompt();
     pty.send_human("approve test-hello");
     pty.expect("approved", |s| s.contains("approved test-hello"));
     dwell(1400);
 
+    pty.wait_for_prompt();
     pty.send_human("apply");
     pty.expect("sudo gate", |s| s.contains("Continue?"));
     dwell(1500);
@@ -65,6 +70,7 @@ fn main() {
     pty.expect("apply finished", |s| s.contains("done"));
     dwell(2500);
 
+    pty.wait_for_prompt();
     pty.send_human("quit");
     pty.expect("back at the bash prompt", back_at_prompt);
     dwell(1200);

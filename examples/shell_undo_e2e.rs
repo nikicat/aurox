@@ -39,9 +39,9 @@ fn main() {
     // numbered table), so `show` prints the numbered transaction first —
     // numbers name rows of the last numbered table printed, and none has been.
     // The cart sorts by spec, so shown row 1 is `test-epoch`.
-    pty.send(b"add test-trivial test-epoch\r");
+    pty.send_command("add test-trivial test-epoch");
     pty.expect("both staged", |s| s.contains("staged test-epoch"));
-    pty.send(b"show\r");
+    pty.send_command("show");
     // The needle must be unique to the *table*: the staging status line also
     // says "transaction — 2 to install", and matching it would race the next
     // send against rustyline's redraw (the buffered-input drop — the same
@@ -53,35 +53,35 @@ fn main() {
 
     // `remove 1` lands on a staged install — you can't uninstall what isn't
     // installed yet, so it's refused and pointed at `drop`.
-    pty.send(b"remove 1\r");
+    pty.send_command("remove 1");
     pty.expect("remove refuses a staged install", |s| {
         s.contains("is staged for install")
     });
 
     // Narrow the cart to one package — the classic over-eager `keep`.
-    pty.send(b"keep test-trivial\r");
+    pty.send_command("keep test-trivial");
     pty.expect("keep dropped the other row", |s| {
         s.contains("dropped test-epoch")
     });
 
     // `undo` brings the dropped package back (the reported "no way to get it
     // back" gap).
-    pty.send(b"undo\r");
+    pty.send_command("undo");
     pty.expect("undo ran", |s| s.contains("undone"));
 
     // `redo` reapplies the `keep`.
-    pty.send(b"redo\r");
+    pty.send_command("redo");
     pty.expect("redo ran", |s| s.contains("redone"));
 
     // After the redo, `test-epoch` is out of the cart again — so a `keep` on it
     // matches nothing. Proves the redo actually reapplied the drop, not just
     // printed a message.
-    pty.send(b"keep test-epoch\r");
+    pty.send_command("keep test-epoch");
     pty.expect("redo really re-dropped test-epoch", |s| {
         s.contains("nothing in the cart matched")
     });
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_UNDO_E2E_OK");
 }
