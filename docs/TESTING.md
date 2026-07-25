@@ -25,6 +25,18 @@ binary that links the aurox lib. `tests/testing.rs` (re-exported via
 `git` CLI for fixture setup, since gix doesn't expose every plumbing
 operation we need.
 
+A third, rarer shape lives beside the pure-data tests: a **source
+tripwire** — a test that walks `src/` and fails on a banned token, for
+conventions the compiler can't express. Today: `units.rs` bans
+`Instant::now()` outside itself (measure with `Stopwatch`), `context.rs`
+bans bare thread-local declarations outside itself (use `context_local!`).
+Reach for one only when the convention is a *single grep-able token* and
+drift is silent; anything with real structure belongs in the type system
+instead. Two consequences worth knowing: the scan reads every `.rs` under
+`src/`, so a doc comment that spells the banned token trips its own
+tripwire, and the failure message must name the replacement — the reader
+hitting it is usually meeting the rule for the first time.
+
 **When to add a cargo test:**
 - The function is pure data → put the test in the same file under
   `#[cfg(test)] mod tests`.

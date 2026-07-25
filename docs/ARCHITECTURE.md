@@ -108,7 +108,9 @@ src/
 ├── git.rs           centralized, instrumented system-`git` invocation
 ├── names.rs         typed PkgName / PkgBase / PkgTarget / VirtualName
 ├── version.rs       typed [epoch:]pkgver-pkgrel with vercmp baked in
+├── units.rs         typed quantities: ByteSize / UnixTime / Stopwatch
 ├── paths.rs         XDG-aware state/config path helpers
+├── context.rs       context_local! — thread-locals that reach spawned workers
 ├── rotate.rs        per-run file creation + retention (logs, traces)
 ├── runopts.rs       per-invocation CLI options via a thread-local
 ├── trace.rs         read-side span-trace analysis (shared by bin/trace.rs)
@@ -781,3 +783,11 @@ to plumb it through both.
 - **Don't add `aur_order: Vec<String>`**: it was replaced by
   `aur_strata: Vec<Vec<String>>`. Use `plan.aur_order()` for a flat
   view; the strata structure is load-bearing for the build pipeline.
+- **Two source-scanning tripwires guard conventions the compiler can't**,
+  and both fail with the offending file listed: `units.rs` forbids
+  `Instant::now()` outside itself (measure with `Stopwatch` — needing a
+  *duration* is not a reason to name a point in time), and `context.rs`
+  forbids bare thread-local declarations outside itself (use
+  `context_local!`, or the value won't reach spawned/rayon workers). They
+  grep the whole `src/` tree, so a doc comment that merely *spells* a
+  banned token trips them — say "bare thread-local", not the macro name.

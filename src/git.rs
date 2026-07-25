@@ -12,12 +12,12 @@ use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Instant;
 
 use gix::ObjectId;
 use tracing::{debug, field, info_span};
 
 use crate::error::{Error, Result};
+use crate::units::Stopwatch;
 
 /// Run `git <args>` in `cwd` (or the current directory when `None`), capturing
 /// its output.
@@ -64,7 +64,7 @@ where
         .collect::<Vec<_>>()
         .join(" ");
     debug!(args = %printable, "running git");
-    let started = Instant::now();
+    let started = Stopwatch::start();
 
     let mut cmd = Command::new("git");
     cmd.args(&args);
@@ -94,7 +94,7 @@ where
 
     span.record("exit_code", out.status.code().unwrap_or(-1));
     debug!(
-        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        elapsed_ms = started.ms(),
         ok = out.status.success(),
         "git finished"
     );

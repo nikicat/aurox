@@ -20,6 +20,7 @@ use crate::paths;
 use crate::resolver::pkgbase_expand::PkgnameSelector;
 use crate::resolver::{self, PkgbasePlan, Plan};
 use crate::ui;
+use crate::units::Stopwatch;
 use crate::version::{Ver, Version};
 use gix::ObjectId;
 use reviews::ReviewStore;
@@ -27,7 +28,6 @@ use std::collections::{HashMap, HashSet};
 use std::io::IsTerminal;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
-use std::time::Instant;
 use tracing::{debug, error, info, instrument, warn};
 
 pub mod install;
@@ -1167,7 +1167,7 @@ enum Disposition {
 #[instrument(skip(cfg, prep), fields(pkgbase = %prep.pkgbase, version = %prep.new_ver))]
 fn run_build(cfg: &Config, prep: &Prep<'_>) -> Result<Vec<PathBuf>> {
     ui::step(&format!("makepkg {}", prep.pkgbase));
-    let started = Instant::now();
+    let started = Stopwatch::start();
 
     // VCS pkgbases resolve their real `pkgver()` only while makepkg extracts
     // sources (it then rewrites `pkgver=` in place), so the artifact can't be

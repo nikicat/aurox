@@ -7,12 +7,11 @@ use crate::index::schema::{IndexEntry, IndexFile};
 use crate::index::srcinfo;
 use crate::mirror::MirrorRepo;
 use crate::ui;
-use crate::units::UnixTime;
+use crate::units::{Stopwatch, UnixTime};
 use gix::ObjectId;
 use rayon::prelude::*;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
 use tracing::{debug, info, instrument, warn};
 
 /// Regression guardrail for [`full_build`].
@@ -37,7 +36,7 @@ pub static WORKER_REPO_OPENS: AtomicU64 = AtomicU64::new(0);
 /// Build a fresh index by scanning every `refs/heads/*` branch on the mirror.
 #[instrument(skip(cfg, mirror))]
 pub fn full_build(cfg: &Config, mirror: &MirrorRepo) -> Result<IndexFile> {
-    let started = Instant::now();
+    let started = Stopwatch::start();
     let refs: Vec<(String, ObjectId)> = collect_branches(&mirror.repo)?;
     info!(branches = refs.len(), "starting parallel index build");
 
@@ -111,7 +110,7 @@ pub fn full_build(cfg: &Config, mirror: &MirrorRepo) -> Result<IndexFile> {
     info!(
         entries = idx.entries.len(),
         skipped = skipped.load(Ordering::Relaxed),
-        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        elapsed_ms = started.ms(),
         "index build complete"
     );
     Ok(idx)

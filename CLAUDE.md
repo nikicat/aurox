@@ -62,8 +62,13 @@ Hard-won rules from review; hold new code to these.
   structural; when reviewing one, the question is "which copy is the truth
   afterwards?", not "how many bytes?" (that question found the apply
   reviewed-set loss).
-- **Time enters as a duration, never a clock read.** `Instant::now()` is for
-  *measuring* (metrics, progress rates); control flow never hand-rolls
+- **Time enters as a duration, never a clock read.** Needing to know how long
+  something took, or whether long enough has passed, is a need for a
+  `Duration` — not for a point in time. So no call site names one: measuring
+  goes through `units::Stopwatch` (the crate's only `Instant::now()`, kept
+  that way by a source tripwire), and decision logic takes the elapsed span
+  as a *parameter* (`ui::gix_progress::IdleTracker`, whose tests pass plain
+  `Duration`s and never touch a clock). Control flow never hand-rolls
   deadline/remaining arithmetic. A bounded wait is a `Duration` budget turned
   into a timer channel (crossbeam `after()`) `select!`ed beside the data
   channel, and the timer's *scope* is the semantics: created once outside

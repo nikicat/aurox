@@ -102,15 +102,6 @@ decode site, crossbeam `after()` timer channels, silence-vs-absolute bounds,
 CLAUDE.md ("Time enters as a duration…", "Block on events…", "Panics state
 the violated expectation"). Sweep the rest of the tree up to them:
 
-- **`Instant::now()` audit in `src/`** — `pacman/dload.rs`, `build.rs`,
-  `index/build.rs`, `git.rs`, `mirror/fetch.rs`, `ui/gix_progress.rs`.
-  Classify each: genuine *measurement* (elapsed metrics, progress rates)
-  keeps the clock; *control-flow* deadline/remaining arithmetic converts to
-  a `Duration` budget turned into a crossbeam `after()` timer selected
-  beside the data channel, choosing absolute vs silence semantics per site
-  (absolute where continuous redraws would reset a per-recv timeout;
-  silence where the only legitimate wake is an event). Exemplar:
-  `pty-harness/src/lib.rs` (`Timer`, `pump_one`, `try_expect` vs `finish`).
 - **sleep/poll loops in `src/`** — `build/makepkg.rs`, `ui/gix_progress.rs`,
   `ui/banner.rs`, `pacman/sync.rs`, `logging/chrome.rs`. Sleep-and-check
   loops become blocking waits on the actual event; an API that only blocks
@@ -131,6 +122,26 @@ the violated expectation"). Sweep the rest of the tree up to them:
   flake-hunt with the test listed several times in one `run.sh` call.
 
 <!-- Done:
+- `Instant::now()` swept out of `src/`: code that only needs a *duration* —
+  to measure a span, or to be triggered after one — must not name a point in
+  time at all, so the clock read now lives in exactly one place,
+  `units::Stopwatch` (`start()` / `elapsed()` / `ms()`), pinned by a
+  `no_bare_instant_now_outside_units` source tripwire. (The item as written
+  said to *classify* each site and let "genuine measurement" keep its clock;
+  that was the wrong axis — measurement is precisely what a duration type is
+  for.) Converted: the six tracing spans (`git.rs`, `mirror/fetch.rs` ×3,
+  `index/build.rs`, `build.rs`), which also stop retyping the saturating
+  `u64::try_from(…as_millis())` narrowing five times; `ui/gix_progress.rs`'s
+  `IdleTracker`, whose samples are now `(Duration, u64)` ages measured from
+  the pump's start, so its four tests feed plain `Duration::from_millis` and
+  mention no clock at all; the `wait_for_position` helper's hand-rolled
+  deadline; and `pacman/dload.rs`'s interrupt-latency assertion. Production
+  timeouts were already where they belong — curl's `connect_timeout` /
+  `low_speed_time`, not hand-rolled arithmetic. `wait_for_position` stays a
+  *poll* (indicatif publishes no change signal, so there is no event to block
+  on) and now says so. Wall-clock `SystemTime` (`mirror.rs` fetch stamp,
+  `ui/freshness.rs` ages) is a different question — cross-process, must be
+  absolute — and is out of scope.
 - `.expect()` messages in `src/` converted to the std "should" phrasing (21
   production sites; `#[cfg(test)]` bodies left alone). The "git available"
   offenders were in `src/testing.rs`, not `src/git.rs` as the item claimed.
