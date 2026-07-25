@@ -20,8 +20,8 @@ use gix::progress::{Count as GixCount, Id, MessageLevel, Unit};
 use gix::{NestedProgress, Progress as GixProgressTrait};
 use indicatif::{MultiProgress, ProgressBar};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -70,11 +70,20 @@ struct NetMeter {
     counter: Arc<AtomicU64>,
     /// The `network` row in the [`Shared::multi`].
     bar: ProgressBar,
-    /// Set to stop the pump thread.
-    stop: Arc<AtomicBool>,
+    /// Stop signal. The pump spends its rest between samples blocked on the
+    /// receiving end, so a teardown lands immediately instead of up to one
+    /// sample interval late — and the send is what ends the thread, not a
+    /// flag it happens to notice next time it wakes.
+    stop: mpsc::Sender<()>,
     /// Pump handle; `take`n by the first [`NetMeter::stop_and_clear`].
     handle: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// How often the pump samples [`NetMeter::counter`] into its bar. The sample
+/// itself can't be event-driven — the curl backend just bumps an atomic, with
+/// nothing to subscribe to — so this cadence is a genuine forced poll, and
+/// the only one in the meter: stopping is an event (see [`NetMeter::stop`]).
+const NET_SAMPLE_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Trailing window over which wire activity is judged: the `network` row is
 /// parked in its idle style once fewer than [`NET_ACTIVE_BYTES`] arrived
@@ -162,15 +171,19 @@ impl NetMeter {
         let counter = Arc::new(AtomicU64::new(0));
         let bar = multi.add(bar_bytes_streaming("network"));
         tick(&bar);
-        let stop = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = mpsc::channel();
         let handle = context::spawn({
             let counter = Arc::clone(&counter);
             let bar = bar.clone();
-            let stop = Arc::clone(&stop);
             move || {
                 let running = Stopwatch::start();
                 let mut wire = IdleTracker::new();
-                while !stop.load(Ordering::Relaxed) {
+                // Rest on the stop channel rather than sleeping through it: a
+                // timeout is the next sample, anything else (a ping, or the
+                // meter dropping its sender) ends the pump at once.
+                while stopped.recv_timeout(NET_SAMPLE_INTERVAL)
+                    == Err(mpsc::RecvTimeoutError::Timeout)
+                {
                     let pos = counter.load(Ordering::Relaxed);
                     match wire.observe(pos, running.elapsed()) {
                         Some(WireState::Idle) => idle_byte_bar(&bar),
@@ -178,7 +191,6 @@ impl NetMeter {
                         None => {}
                     }
                     bar.set_position(pos);
-                    std::thread::sleep(Duration::from_millis(120));
                 }
             }
         });
@@ -193,7 +205,8 @@ impl NetMeter {
     /// Stop the pump, join it, and clear the row. Idempotent: the handle is
     /// taken once, so a later call (e.g. from `Drop`) is a no-op.
     fn stop_and_clear(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // A failed send means the pump already returned — nothing to stop.
+        self.stop.send(()).ok();
         // Bind the `take` out of the guard first so the lock isn't held across
         // the `join` (matches the leaf-clearing idiom in `finish`/`Drop`).
         let handle = self.handle.lock().unwrap().take();

@@ -102,14 +102,6 @@ decode site, crossbeam `after()` timer channels, silence-vs-absolute bounds,
 CLAUDE.md ("Time enters as a duration…", "Block on events…", "Panics state
 the violated expectation"). Sweep the rest of the tree up to them:
 
-- **sleep/poll loops in `src/`** — `build/makepkg.rs`, `ui/gix_progress.rs`,
-  `ui/banner.rs`, `pacman/sync.rs`, `logging/chrome.rs`. Sleep-and-check
-  loops become blocking waits on the actual event; an API that only blocks
-  gets the sentinel-thread pattern (blocking call owned by a thread,
-  completion becomes a channel message, out-of-band cancel handle). Where a
-  poll is genuinely forced, keep it with a comment naming the API constraint
-  that forces it. Pure pacing sleeps (animation frames, demo dwell) are not
-  polls — leave them.
 - **PTY driver ack-discipline audit** — every `examples/*_e2e.rs` and
   `demo_*.rs` against the two failure classes from the 2026-07-25 CI hang
   post-mortem (see docs/TESTING.md "Writing PTY e2e drivers"): needles that
@@ -122,6 +114,22 @@ the violated expectation"). Sweep the rest of the tree up to them:
   flake-hunt with the test listed several times in one `run.sh` call.
 
 <!-- Done:
+- sleep/poll sweep of `src/`: one real offender, `ui/gix_progress.rs`'s
+  `NetMeter` pump, which slept 120 ms then re-read an `AtomicBool` — so a
+  teardown waited out the current nap. The flag is now an `mpsc::Sender`
+  and the rest is `recv_timeout(NET_SAMPLE_INTERVAL)`: a timeout is the next
+  sample, a ping (or the meter dropping its sender) ends the thread at once.
+  The *sampling* itself stays a poll and now says why — the curl backend just
+  bumps an atomic, so there is nothing to subscribe to. Everything else on
+  the list was already event-driven and stays: `build/makepkg.rs` blocks on
+  `signals.forever()` and its 300 ms `recv_timeout` is a deliberate
+  re-forward beat against the fork-window race (`sigint_forward_stress`
+  proves it), `ui/banner.rs` rests between blink symbols on the cancel
+  channel so a keystroke interrupts mid-letter, `logging/chrome.rs` is
+  push-driven (its only sleep is a test making a span long enough to split).
+  `pacman/sync.rs`'s flock re-probe stays a poll and gained the missing
+  *why*: a sentinel thread owning the blocking `lock()` can't be cancelled,
+  so a Ctrl+C would strand it waiting to acquire a lock nobody wants.
 - `Instant::now()` swept out of `src/`: code that only needs a *duration* —
   to measure a span, or to be triggered after one — must not name a point in
   time at all, so the clock read now lives in exactly one place,

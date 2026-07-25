@@ -251,6 +251,13 @@ impl RefreshLock {
     /// [`Error::Interrupted`]; the sender must stay alive while the wait runs
     /// (in production [`Self::wait_interruptible`]'s watcher holds it until
     /// the wait returns).
+    ///
+    /// The re-probe is the one poll the usual fix doesn't fit: handing the
+    /// blocking `lock()` to a sentinel thread would make acquisition an event,
+    /// but nothing can then *cancel* that thread — a Ctrl+C would leave it
+    /// parked in the kernel until the peer released, at which point it would
+    /// take a lock this process no longer wants and hold it until exit.
+    /// `try_lock` + a bounded rest keeps cancellation cheap and correct.
     fn wait_for_lock(dir: File, cancel: &Receiver<()>) -> Result<Self> {
         loop {
             // Probe first: the peer may have released between the caller's
