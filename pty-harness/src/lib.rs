@@ -1,9 +1,9 @@
-//! Shared PTY harness for the aurox e2e example drivers (`upgrade_loop_e2e`,
-//! `loop_built_tag_e2e`, …).
+//! Shared PTY harness for the aurox e2e example drivers (`examples/*_e2e.rs`
+//! and the `demo_*.rs` recorders).
 //!
-//! The upgrade loop only runs interactively (stdin must be a TTY), so each
-//! driver spawns the real `aurox` binary under a PTY, parses its VT100 output
-//! into a screen grid, and walks the expected UI sequence. The mechanics —
+//! The shell only runs interactively (stdin must be a TTY), so each driver
+//! spawns the real `aurox` binary under a PTY, parses its VT100 output into a
+//! screen grid, and walks the expected UI sequence. The mechanics —
 //! spawn, read pump, [`Pty::expect`]/[`Pty::send`], clean teardown — are
 //! identical across scenarios; only the sequence of expectations differs.
 //!
@@ -114,15 +114,15 @@ pub struct Pty {
 
 impl Pty {
     /// Spawn `aurox` (from argv[1], else `$AUROX`, else the default debug path)
-    /// with no args — the upgrade loop — inheriting the container env so it
-    /// finds its config, the mock mirror, pacman, sudo, and makepkg.
+    /// with no args — the interactive shell — inheriting the container env so
+    /// it finds its config, the mock mirror, pacman, sudo, and makepkg.
     pub fn spawn_aurox() -> Self {
         Self::spawn_aurox_args(&[])
     }
 
     /// Like [`Self::spawn_aurox`] but passes `args` to `aurox`. Used to drive the
     /// bare-term launch (`aurox <term>…`), which opens the shell *seeded* with
-    /// that `search` instead of the plain upgrade-loop prompt.
+    /// that `search` instead of the plain prompt.
     pub fn spawn_aurox_args(args: &[&str]) -> Self {
         let aurox = resolve_aurox();
         let mut cmd = CommandBuilder::new(&aurox);

@@ -73,8 +73,8 @@ the rationale.
 What this catches at compile time:
 - Passing an AUR pkgbase string to a function expecting a localdb pkgname
 - HashMap collisions when an AUR pkgbase ships a pkgname matching an
-  unrelated pkgbase (the `commit-mono-font` regression — see the
-  `pkgname_collision_with_another_pkgbase_does_not_leak_into_plan` test)
+  unrelated pkgbase (pinned by
+  `pkgname_collision_with_another_pkgbase_does_not_leak_into_plan`)
 - Mixing `provides=` virtuals with real pkgnames at API boundaries
 
 This is the part of aurox with the most invasive refactor relative to
@@ -103,33 +103,17 @@ can label the screen (`install` / `reinstall` / `upgrade`), pick a diff
 base, and write a sensible fallback note when no diff is found.
 
 yay/paru answer this implicitly by checking the pkgname match. aurox
-makes the answer explicit via `PacmanIndex::counterpart_with_hint`,
-which returns an `InstalledCounterpart { pkgname, version, via }` tagged
-with how it matched:
+makes the answer explicit and *typed*: `PacmanIndex::counterpart_with_hint`
+returns an `InstalledCounterpart` tagged with how it matched — the pkgname
+itself, a `replaces=`, or a `provides=` — and that provenance then shapes the
+review header, the diff base, and the fallback note. Where the two really
+diverge is ambiguity: when several installed packages match one pkgbase's
+`provides=`, aurox plumbs the name the user actually meant through
+expand → resolve → prepare instead of taking whichever was declared first.
 
-- `via = Pkgname` — entry's own pkgname matched
-- `via = Replaces` — entry's `replaces=` named an installed pkg
-- `via = Provides` — entry's `provides=` (pkgname-scoped or
-  pkgbase-level) named an installed pkg
-
-The provenance shapes the review header ("upgrade: foo-ng 1.0-1 → 2.0-1
-[replaces old-foo]"), drives a different fallback-note phrasing per tier,
-and surfaces in the noconfirm trace for container tests.
-
-**Hint plumbing.** When multiple installed pkgs match the same pkgbase's
-`provides=`, the user's typed name (from `-S foo` argv, or the foreign
-pkgname a shell `upgrade` row carries) is plumbed as a `Target::hint`
-through expand → resolve → prepare, biasing the lookup to the pkgname the
-user actually meant. Two
-`tracing::warn!` diagnostics fire when this kicks in:
-
-- `multiple installed pkgs match this pkgbase's provides` — there's
-  ambiguity to disambiguate
-- `counterpart hint diverged from unhinted lookup` — the hint changed
-  the picked pkgname vs. what the unhinted walk would return
-
-See [`ARCHITECTURE.md#resolving-the-installed-counterpart-of-an-aur-entry`](ARCHITECTURE.md#resolving-the-installed-counterpart-of-an-aur-entry)
-for the full table.
+The provenance hierarchy, the header table, the hint plumbing, and the case
+matrix are one concern with one home:
+[`ARCHITECTURE.md#resolving-the-installed-counterpart-of-an-aur-entry`](ARCHITECTURE.md#resolving-the-installed-counterpart-of-an-aur-entry).
 
 ### Stratified build orchestration
 
@@ -228,16 +212,6 @@ neither has both.
 
 A config knob (`syu_propose_provides_upgrades = false` default) would
 let users opt back into the current behavior.
-
-### Auto-pre-selection of AUR rows (resolved: the picker is gone)
-
-This used to be `Config::aur_default_select` — whether AUR rows were
-pre-checked in the interactive `-Syu` multi-select picker. That picker has
-been removed: the explicit `-Syu` flag is now a plain `pacman -Syu`
-passthrough, and AUR upgrades live in the shell (`aurox` → `upgrade`), where
-the equivalent "AUR is opt-in" stance is the per-item **approval gate** (repo
-rows auto-approve; AUR rows need `review`/`approve`) rather than a pre-check
-mask. The `aur_default_select` knob was dropped.
 
 ### Should foreign pkgs without an AUR home appear in `-Qu`?
 

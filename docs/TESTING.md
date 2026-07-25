@@ -260,14 +260,15 @@ cast to see the session up to the exact hang. Render one to a GIF with
 
 ### Common pitfalls
 
-- **`makepkg` refuses root.** The image's `builder` user owns
-  `/srv/local-repo` and `/srv/mock-aur` so `setup-fixtures.sh` can run
-  as builder. Don't `sudo` setup scripts.
-- **Refs land under `refs/remotes/origin/*` by default.** gix's
-  `prepare_clone_bare` matches non-bare `git clone` semantics, not
-  `git clone --bare`. `src/mirror/clone.rs` overrides this — if you ever
-  touch the clone path, run `cargo test --test clone_refs_layout` to
-  confirm the regression test still catches it.
+- **`makepkg` refuses root** (see ARCHITECTURE.md's gotcha list). In the
+  image that means the `builder` user owns `/srv/local-repo` and
+  `/srv/mock-aur` so `setup-fixtures.sh` can run as builder — don't `sudo`
+  setup scripts.
+- **The clone's refspec is overridden**, because gix would otherwise put
+  refs under `refs/remotes/origin/*` (ARCHITECTURE.md, "Why gix instead of
+  libgit2"). If you touch the clone path, run
+  `cargo test --test clone_refs_layout` to confirm the regression test still
+  catches it.
 - **alpm sync DBs are empty by default.** `Alpm::new` doesn't register
   syncdbs from `pacman.conf` — `pacman::alpm_db::open` uses
   `alpm-utils::alpm_with_conf` to do that. If you reach for `Alpm::new`
@@ -387,18 +388,8 @@ Per project rule (`memory/feedback_*`):
   real aurox bugs surfacing for the first time, not test setup issues.
   Don't assume the test is wrong before checking the binary's behaviour.
 
-## Future work for the container suite
+## Planned tests
 
-The `extended/` tier is mostly empty stubs in `.scope`. The next ones
-worth adding (in roughly priority order):
-
-- `epoch_dominates_version.sh`
-- `vcs_pkg_skipped_without_devel.sh` / `…picked_up_with_devel.sh`
-- `install_hook_runs.sh`
-- `provides_virtual_resolves.sh`
-- `cycle_in_aur_deps_errors.sh` (we have one for cycle-makedep already)
-- `rebuild_cached_skips.sh` (artifact-cache idempotency — a pkgbase whose
-  `.pkg.tar.*` is already on disk at the index version skips makepkg)
-- `mirror_unreachable.sh` (rm /srv/mock-aur mid-test)
-
-Pick from `tests/container/extended/.scope` for the full backlog.
+`tests/container/extended/.scope` is the backlog, and the only place a planned
+test is written down — it sits next to the tests so a landed one can't linger
+in a list somewhere else. It also carries the convention for adding one.

@@ -3,7 +3,8 @@
 //! `add`/`drop`/`remove`/`clear` mutate a [`Cart`]; `upgrade` seeds it with the
 //! available upgrades; `review`/`approve` move AUR items past the approval gate;
 //! `apply` runs the whole thing in one go. None of it is persisted — quitting
-//! drops the cart. See `docs/plans/shell-ui.md` for the design.
+//! drops the cart. `docs/RESOLUTION_FLOW.md` maps how a cart is resolved,
+//! frozen, and executed.
 //!
 //! This module is the pure data model: staging, dedup, and the approval-state
 //! transitions, all unit-tested here without I/O. The side effects the verbs

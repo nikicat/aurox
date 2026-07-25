@@ -170,11 +170,14 @@ cost that lives directly in that span. Pass `--file <path>` for a specific trace
 
 ## How it differs from yay / paru
 
-- **No `aurweb` RPC.** All metadata comes from the GitHub mirror clone.
-- **Incremental refresh.** `git fetch` reports changed refs; only those are re-indexed.
-- **Zero-copy index.** `index.bin` is a `rkyv` archive, mmap'd directly — no parse step on load.
-- **One sudo prompt per install.** Repo deps go in via a single batched `pacman -S`; built `.pkg.tar.zst`s go in via a single batched `pacman -U` at the very end. No keepalive loop.
-- **Idempotent builds.** A pkgbase whose worktree already holds a `.pkg.tar.zst` at the AUR index's exact `[epoch:]pkgver-pkgrel` for every required pkgname is skipped, so re-running after declining the install just replays the install step. No sidecar DB — the artifact filename is the cache key.
+- **No `aurweb` RPC** — all metadata comes from the GitHub mirror clone.
+- **Incremental refresh** — `git fetch` reports changed refs; only those are re-indexed.
+- **Zero-copy index** — `index.bin` is a `rkyv` archive, mmap'd directly.
+- **One sudo prompt per install** — repo deps and built packages each go in as one batched pacman call. No keepalive loop.
+- **Idempotent builds** — the artifact filename is the cache key, so a re-run after declining the install just replays the install step.
+
+Each of these, with the tradeoffs and the yay/paru behaviour it's measured
+against: [`docs/COMPARISON.md`](docs/COMPARISON.md).
 
 ## Development
 
@@ -184,23 +187,18 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-CI runs all of the above on an `archlinux:latest` container.
-
-In addition to the in-process Rust tests there is a black-box container
-suite under `tests/container/` that runs every aurox command against
-real `pacman` + `makepkg` inside an ephemeral Arch userspace (podman
-default, docker via `CONTAINER=docker`). It is the only place where the
-multi-process build pipeline — sudo gating, asdeps flips, build
-failure isolation, makepkg log capture — is exercised end-to-end. CI runs
-it (both the `smoke` and `extended` tiers) as its own gating job alongside
-the Rust tests.
+The multi-process half — sudo gating, asdeps flips, build-failure isolation,
+makepkg log capture — can only be tested against real `pacman` + `makepkg`, so
+there is a black-box container suite alongside the Rust tests:
 
 ```sh
 bash tests/container/run.sh                 # smoke tier (~30 s on 8 cores)
 bash tests/container/run.sh --rebuild smoke # bust image cache after fixture changes
 ```
 
-Full details: [`docs/TESTING.md`](docs/TESTING.md).
+Both layers gate CI. [`docs/TESTING.md`](docs/TESTING.md) is the reference:
+tiers, fixtures, PTY drivers, and the traps (that `--rebuild` above is the one
+that bites everyone).
 
 A `.pre-commit-config.yaml` is checked in to catch the cheap failures
 (`cargo fmt --check`, `taplo fmt --check`, `taplo lint`) before they round-trip

@@ -73,7 +73,7 @@ fi
 if [[ -z "$coverage_dir" ]]; then
     # Build aurox plus every example driver the suite shells out to: `tarpit`
     # (HTTP-stall for the idle-timeout test) and the PTY loop drivers
-    # (`upgrade_loop_e2e`, `loop_built_tag_e2e`, …). `--examples` builds them
+    # (`shell_cart_e2e`, `demo_upgrade`, …). `--examples` builds them
     # all, so adding a new scenario driver needs no edit here. Cheap, and keeps
     # the tests container-side (no host cargo inside the container).
     ( cd "$REPO_ROOT" && cargo build --bin aurox --examples )
