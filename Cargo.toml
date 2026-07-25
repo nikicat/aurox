@@ -102,7 +102,7 @@ path = "src/bin/trace.rs"
 #    thousands-of-refs fetch stays within `ulimit -n`; any error enumerating
 #    loose names disables the snapshot so I/O errors still surface per edit
 #    rather than reading as packed-only (PR #2705).
-gix = { git = "https://github.com/nikicat/gitoxide", rev = "2605633e1", features = [
+gix = { git = "https://github.com/nikicat/gitoxide", rev = "a19c553b7", features = [
   # curl-rustls (over reqwest-rust-tls) so gix's low_speed_* / lowSpeedLimit
   # config actually fires — only the curl transport implements it, the
   # reqwest blocking transport silently ignores those fields. Adds libcurl
