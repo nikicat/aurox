@@ -102,12 +102,6 @@ decode site, crossbeam `after()` timer channels, silence-vs-absolute bounds,
 CLAUDE.md ("Time enters as a duration…", "Block on events…", "Panics state
 the violated expectation"). Sweep the rest of the tree up to them:
 
-- **`.expect()` messages in `src/`** — convert runtime expects from terse
-  operation labels to the std "should" phrasing (`.expect("git available")`
-  → `.expect("git should be installed and on PATH")`). Known offenders in
-  `src/git.rs` ("git available" ×2, "git stdout utf8"); grep `\.expect\("`
-  for the rest. `#[cfg(test)]` scaffolding may stay terse; invariant
-  statements ("writing to a String never fails") just need phrase-checking.
 - **`Instant::now()` audit in `src/`** — `pacman/dload.rs`, `build.rs`,
   `index/build.rs`, `git.rs`, `mirror/fetch.rs`, `ui/gix_progress.rs`.
   Classify each: genuine *measurement* (elapsed metrics, progress rates)
@@ -137,6 +131,12 @@ the violated expectation"). Sweep the rest of the tree up to them:
   flake-hunt with the test listed several times in one `run.sh` call.
 
 <!-- Done:
+- `.expect()` messages in `src/` converted to the std "should" phrasing (21
+  production sites; `#[cfg(test)]` bodies left alone). The "git available"
+  offenders were in `src/testing.rs`, not `src/git.rs` as the item claimed.
+  Enumerate the production set with a brace-depth scan, not a plain grep:
+  `src/build/review.rs`'s `mod highlight` lives *after* its `#[cfg(test)] mod
+  tests`, so "first cfg(test) wins" misses it.
 - search ranking weights freshness (health), not just tie-breaks on it
   (`src/cli/search.rs` `RankKey`): the chain is now exact-name → match-tier →
   health → repo-before-AUR → shorter-name → freshest-commit → lexical. An

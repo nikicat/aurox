@@ -84,7 +84,7 @@ where
         child
             .stdin
             .take()
-            .expect("stdin piped above")
+            .expect("git stdin should be piped, as configured above")
             .write_all(bytes)
             .map_err(|e| Error::other(format!("write git stdin: {e}")))?;
     }

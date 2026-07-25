@@ -307,7 +307,9 @@ fn fetch_aur(cfg: &Config, mp: &MultiProgress) -> Result<()> {
             }
         });
         let updates = fetch::incremental_fetch(cfg, &mirror, mp)?;
-        let existing = loader.join().expect("index loader thread panicked");
+        let existing = loader
+            .join()
+            .expect("the index loader thread should not panic");
         Ok::<_, Error>((updates, existing))
     })?;
 

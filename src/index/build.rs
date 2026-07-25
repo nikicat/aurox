@@ -63,7 +63,12 @@ pub fn full_build(cfg: &Config, mirror: &MirrorRepo) -> Result<IndexFile> {
     let mut entries: Vec<IndexEntry> = pool.install(|| {
         refs.par_iter()
             .map_init(
-                || repo_source.lock().expect("repo_source poisoned").clone(),
+                || {
+                    repo_source
+                        .lock()
+                        .expect("the repo_source lock should not be poisoned")
+                        .clone()
+                },
                 |repo, (branch, oid)| {
                     let r = parse_branch(repo, branch, *oid);
                     pb.inc(1);

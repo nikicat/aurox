@@ -113,7 +113,7 @@ impl Error {
         let mut msg = format!("{context}: {err}");
         let mut source = err.source();
         while let Some(cause) = source {
-            write!(msg, ": {cause}").expect("writing to a String never fails");
+            write!(msg, ": {cause}").expect("writing to a String should never fail");
             source = cause.source();
         }
         Self::Gix(msg)

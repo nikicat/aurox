@@ -64,7 +64,8 @@ impl Lookup {
         let mut by_provides: HashMap<VirtualName, SmallVec<[u32; 2]>> = HashMap::new();
         let mut by_pkgbase = HashMap::with_capacity(idx.entries.len());
         for (i, e) in idx.entries.iter().enumerate() {
-            let i = u32::try_from(i).expect("AUR index entries exceed u32::MAX");
+            let i =
+                u32::try_from(i).expect("the AUR index should hold fewer than u32::MAX entries");
             for pkg in &e.pkgnames {
                 by_name.insert(pkg.name.clone(), i);
             }
