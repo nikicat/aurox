@@ -36,15 +36,23 @@ path = "src/bin/trace.rs"
 [dependencies]
 # Pinned to nikicat/gitoxide#gitaur-integration for changes not yet in a
 # published gix release. The branch is upstream main (rebased onto 9a9a166f5
-# on 2026-07-25) plus merges of the upstream PR branches #2608/#2704/#2705/#2706
-# and two not-yet-submitted branches (mark_all_refs commit-graph, update_refs
-# fast paths), carrying:
+# on 2026-07-25) plus merges of the upstream PR branches
+# #2608/#2704/#2705/#2706/#2835/#2837 and two not-yet-submitted branches
+# (mark_all_refs commit-graph, update_refs fast paths), carrying:
 #
 # Upstream status: #2608/#2704/#2705 were closed on 2026-07-25 at the
 # maintainer's request — reftable support is expected to land within ~a month
-# and to become the default, which solves the same problem generically. Only
-# #2706 is still open. These branches stay alive on the fork purely to keep
-# this pin building; re-measure once reftable lands and drop what it obsoletes.
+# and to become the default, which solves the same problem generically. Still
+# open: #2706 and #2835 (both transport features) and #2837 (a test fix, see
+# below). These branches stay alive on the fork purely to keep this pin
+# building; re-measure once reftable lands and drop what it obsoletes.
+#
+# #2837 is why this branch no longer excludes the two `fetch_pack` tests from
+# `cargo nextest`: they asserted byte-exact pack checksums, which encode the
+# host's zlib (Arch's git links zlib-ng and deflates one object a byte smaller
+# than stock zlib), so they failed here for reasons unrelated to gitoxide. They
+# now assert the pack's object ids, which hash uncompressed content and match on
+# every host, so the whole `gix` suite runs green locally again.
 #  - a lazy packed-refs name index for fast bulk lookups (PR #2608; replaces
 #    the closed #2605 hashmap cache) — with #2604 this brings `aurox -Sy`
 #    against the AUR mirror from ~11s to ~5s (≈ git fetch parity);
@@ -94,7 +102,7 @@ path = "src/bin/trace.rs"
 #    thousands-of-refs fetch stays within `ulimit -n`; any error enumerating
 #    loose names disables the snapshot so I/O errors still surface per edit
 #    rather than reading as packed-only (PR #2705).
-gix = { git = "https://github.com/nikicat/gitoxide", rev = "ade2b53d3", features = [
+gix = { git = "https://github.com/nikicat/gitoxide", rev = "2605633e1", features = [
   # curl-rustls (over reqwest-rust-tls) so gix's low_speed_* / lowSpeedLimit
   # config actually fires — only the curl transport implements it, the
   # reqwest blocking transport silently ignores those fields. Adds libcurl
