@@ -6,7 +6,7 @@
 # proves the shell survived by quitting cleanly (finish_clean asserts exit 0).
 # The `DEMO_CTRLC_REFRESH_OK` sentinel is printed only if every expect —
 # including "refresh: interrupted" and the clean quit — held. See
-# docs/TODO.md "Shell" and docs/plans/screencasts.md.
+# docs/plans/screencasts.md.
 source /work/tests/container/lib.sh
 bootstrap; reset_state
 

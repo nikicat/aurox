@@ -1,5 +1,5 @@
 //! Demo driver: Ctrl-C during a shell `refresh` bails back to the prompt
-//! instead of taking the whole shell down (docs/TODO.md "Shell").
+//! instead of taking the whole shell down.
 //!
 //! The harness bootstraps the mirror from the fast `file://` mock AUR first;
 //! this driver then repoints both aurox's config and the bootstrapped mirror

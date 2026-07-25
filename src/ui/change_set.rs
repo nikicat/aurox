@@ -826,7 +826,7 @@ mod tests {
         );
     }
 
-    /// Regression (docs/TODO.md): a single never-built AUR package has an
+    /// Regression: a single never-built AUR package has an
     /// `Unknown` build time. The summary must never fake a summed `0s build`;
     /// since the screencast review (docs/plans/screencasts.md) the unknown
     /// term is dropped outright — `? build` was noise on top of the per-row
