@@ -10,7 +10,8 @@
 //! ```text
 //!   add test-xconflict       → staged (aur)            ← resolves fine alone
 //!   add test-xconflict-bin   → add rejected — … conflicts with … ; cart unchanged
-//!   show                     → still just 1 to install (the base survived)
+//!   show                     → row `1 aur review test-xconflict` — the base
+//!                              is the only staged install
 //! ```
 //!
 //! The `.sh` runs `aurox -Sy` first so the index carries both AUR entries, and
@@ -37,11 +38,17 @@ fn main() {
         has(s, "add rejected") && has(s, "conflicts with")
     });
 
-    // The reject preserved the existing cart: the base is still the only staged
-    // install (a robust count check — the reject line still names the -bin, so
-    // don't test for its absence as a substring).
+    // The reject preserved the existing cart: row 1 of the table is the base,
+    // still the only staged install. The needle must be the *numbered* row —
+    // `show` is the only verb that prints numbers, while the txn header
+    // ("… 1 to install") is already on screen from the first `add`'s summary,
+    // so matching it acks nothing and the `quit` below races rustyline
+    // re-arming (the 6h CI hang of run 29876293421). Don't test for the
+    // -bin's absence either — the reject line still names it.
     pty.send(b"show\r");
-    pty.expect("only the base survived", |s| has(s, "1 to install"));
+    pty.expect("only the base survived", |s| {
+        has(s, "1 aur review test-xconflict")
+    });
 
     pty.send(b"quit\r");
     pty.finish_clean();

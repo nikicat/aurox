@@ -152,7 +152,10 @@ fn decode_prefix(buf: &[u8]) -> (String, &[u8]) {
             }
             Err(e) => {
                 let (valid, after) = rest.split_at(e.valid_up_to());
-                text.push_str(std::str::from_utf8(valid).expect("validated prefix"));
+                text.push_str(
+                    std::str::from_utf8(valid)
+                        .expect("the split at valid_up_to() should always be valid UTF-8"),
+                );
                 match e.error_len() {
                     None => return (text, after),
                     Some(n) => {

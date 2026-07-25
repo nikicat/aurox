@@ -114,6 +114,10 @@ jobs:
   container:
     name: container tests + coverage
     runs-on: ubuntu-latest
+    # Backstop above run.sh's per-test TEST_TIMEOUT: one wedged test used to
+    # hold this job to the runner's 6h ceiling (run 29876293421). A warm run
+    # takes ~8 min; a cold cache pays a full instrumented build on top.
+    timeout-minutes: 45
     # The container-suite gate. Runs the black-box container suite
     # (tests/container, smoke + extended) end-to-end against real
     # pacman/makepkg, in parallel to the `ci` job. A container-test failure

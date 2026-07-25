@@ -2487,6 +2487,7 @@ dependencies = [
 name = "pty-harness"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "fastrand",
  "portable-pty",
  "serde_json",

@@ -169,6 +169,33 @@ install_foreign <pkgbase>     # sudo pacman -U /srv/foreign-pkgs/<pkgbase>-*.pkg
 reset_state                   # wipe ~/.local/state/aurox between phases
 ```
 
+### Writing PTY e2e drivers
+
+The `examples/*_e2e.rs` drivers script a real interactive session through
+`pty_harness::Pty`. Two rules, each learned from a CI hang:
+
+- **Every `send` is preceded by an `expect` that proves the *reading*
+  prompt is armed, with a needle unique to that moment.** A needle already
+  on screen from an earlier step acks nothing: the txn header
+  (`… 1 to install`) is printed by every cart mutation, so it can never
+  identify `show` — expect the numbered table row instead. The
+  `shell_conflict_e2e` stale-needle race sent `quit` into a not-yet-armed
+  rustyline and held CI to the 6h runner kill (run 29876293421).
+- **Answer every prompt the scenario reaches.** Trace aurox's real prompt
+  sequence for the flow (PKGBUILD review selector, the sudo `Continue?`
+  gate before elevated pacman, per-lane pacman prompts) and pair each with
+  an expect+send. `install_offer_e2e` never answered the sudo gate and
+  passed for weeks only while a stray buffered newline happened to feed it.
+
+A driver bug now costs 45 seconds, not 6 hours — hangs are contained in
+layers, each with a diagnostic: pty-harness panics after `PATIENCE` (45s)
+of *silence* in teardown, dumping the final screen; `run.sh` fails any
+test at `TEST_TIMEOUT` (default 600s, env-overridable); CI caps the
+container job at 45 minutes. To flake-hunt a racy driver, list the test
+several times — `run.sh smoke/65_install_offer.sh smoke/65_install_offer.sh`
+runs it once per mention — and `--record` + `asciinema play` shows the
+session up to the exact stall.
+
 ### Debugging a failing container test
 
 ```sh

@@ -94,6 +94,48 @@
 
 - account for already downloaded sources when printing download sizes in tables
 
+## Code health — 2026-07-25 harness-refactor follow-ups
+
+The pty-harness rewrite (funnel channel + waiter thread, `pump_one` single
+decode site, crossbeam `after()` timer channels, silence-vs-absolute bounds,
+"should"-style expect messages) established conventions now recorded in
+CLAUDE.md ("Time enters as a duration…", "Block on events…", "Panics state
+the violated expectation"). Sweep the rest of the tree up to them:
+
+- **`.expect()` messages in `src/`** — convert runtime expects from terse
+  operation labels to the std "should" phrasing (`.expect("git available")`
+  → `.expect("git should be installed and on PATH")`). Known offenders in
+  `src/git.rs` ("git available" ×2, "git stdout utf8"); grep `\.expect\("`
+  for the rest. `#[cfg(test)]` scaffolding may stay terse; invariant
+  statements ("writing to a String never fails") just need phrase-checking.
+- **`Instant::now()` audit in `src/`** — `pacman/dload.rs`, `build.rs`,
+  `index/build.rs`, `git.rs`, `mirror/fetch.rs`, `ui/gix_progress.rs`.
+  Classify each: genuine *measurement* (elapsed metrics, progress rates)
+  keeps the clock; *control-flow* deadline/remaining arithmetic converts to
+  a `Duration` budget turned into a crossbeam `after()` timer selected
+  beside the data channel, choosing absolute vs silence semantics per site
+  (absolute where continuous redraws would reset a per-recv timeout;
+  silence where the only legitimate wake is an event). Exemplar:
+  `pty-harness/src/lib.rs` (`Timer`, `pump_one`, `try_expect` vs `finish`).
+- **sleep/poll loops in `src/`** — `build/makepkg.rs`, `ui/gix_progress.rs`,
+  `ui/banner.rs`, `pacman/sync.rs`, `logging/chrome.rs`. Sleep-and-check
+  loops become blocking waits on the actual event; an API that only blocks
+  gets the sentinel-thread pattern (blocking call owned by a thread,
+  completion becomes a channel message, out-of-band cancel handle). Where a
+  poll is genuinely forced, keep it with a comment naming the API constraint
+  that forces it. Pure pacing sleeps (animation frames, demo dwell) are not
+  polls — leave them.
+- **PTY driver ack-discipline audit** — every `examples/*_e2e.rs` and
+  `demo_*.rs` against the two failure classes from the 2026-07-25 CI hang
+  post-mortem (see docs/TESTING.md "Writing PTY e2e drivers"): needles that
+  stale-match earlier screen content instead of proving the reading prompt
+  is armed (the `1 to install` txn-header trap, run 29876293421's 6h hang),
+  and prompts reached but never answered (`install_offer_e2e` passed for
+  weeks only because a stray buffered newline fed the sudo `Continue?`
+  gate). For each driver: trace the scenario's real prompt sequence, verify
+  each prompt has an expect+answer pair with an arming-proof needle;
+  flake-hunt with the test listed several times in one `run.sh` call.
+
 <!-- Done:
 - search ranking weights freshness (health), not just tie-breaks on it
   (`src/cli/search.rs` `RankKey`): the chain is now exact-name → match-tier →
