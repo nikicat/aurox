@@ -3,6 +3,7 @@
 use crate::build;
 use crate::cli::Cli;
 use crate::cli::flags::{self, PacFlags};
+use crate::cli::getpkgbuild;
 use crate::cli::search;
 use crate::cli::shell;
 use crate::config::{Config, ConfigHandle};
@@ -53,6 +54,17 @@ pub fn dispatch(config: &ConfigHandle, cli: &Cli) -> Result<u8> {
         Some('Q') => build::cmd_query_upgrades(
             cfg,
             build::DevelPolicy::from_enabled(cli.devel || cfg.devel || f.has_long("devel")),
+        ),
+        // `-G` / `-Gp`: pacman owns no `G` operation, so the pre-scan never
+        // diverts it and the whole letter is aurox's.
+        Some('G') => getpkgbuild::cmd_get(
+            cfg,
+            &pkg_targets(&f.positional),
+            if f.has('p') {
+                getpkgbuild::GetMode::Print
+            } else {
+                getpkgbuild::GetMode::Clone
+            },
         ),
         Some(other) => Err(Error::other(format!(
             "unsupported aurox op `-{other}`; see `aurox --help` for supported operations"

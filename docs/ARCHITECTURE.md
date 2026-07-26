@@ -24,8 +24,9 @@ branch (~154 k of them, ~2 GiB pack). Three big moving parts:
 Anything pacman owns (`-Q`, `-R`, `-T`, `-D`, `-F`, `-U`, `-Su` system
 upgrades, and the `pacman.conf` it reads) is forwarded verbatim. `aurox`
 owns `-S <pkg>` (install), `-Sy` (mirror refresh), `-Ss`/`-Si` (search/info),
-and `-Sc` (clean). AUR upgrades are the interactive shell's job (`aurox` →
-`upgrade`), not the `-Syu` flag — that's a plain `pacman -Syu` passthrough.
+`-Sc` (clean), and `-G`/`-Gp` (hand a pkgbase's repo to the user). AUR
+upgrades are the interactive shell's job (`aurox` → `upgrade`), not the
+`-Syu` flag — that's a plain `pacman -Syu` passthrough.
 
 ## Module map
 
@@ -39,6 +40,7 @@ src/
 │   ├── flags.rs        pacman-style clustered flag parser (-Syyu → S,y,y,u)
 │   ├── dispatch.rs     routes to mirror / index / build subcommands; -Su → pacman
 │   ├── search.rs       -Ss + bare `aurox <term>...`: merged repo+AUR search, ranked
+│   ├── getpkgbuild.rs  -G/-Gp: clone a pkgbase off the mirror, origin = AUR SSH
 │   ├── shell.rs        the interactive no-arg REPL (cart / approval / apply)
 │   └── shell/          command, selector, cart, upgrade (refresh+reload + cost preview)
 │

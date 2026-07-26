@@ -16,6 +16,7 @@ use clap::Parser;
 
 pub mod dispatch;
 pub mod flags;
+pub mod getpkgbuild;
 pub mod search;
 pub mod shell;
 
@@ -75,6 +76,9 @@ const AFTER_HELP: &str = "AUROX-OWNED OPERATIONS:\n\
   -Si <pkg>      show package info (repos + AUR; repo wins a shared name)\n\
   -Sc / -Scc     remove built worktrees + pass -Sc/-Scc through to pacman\n\
   -Qu            list upgrades from repos + AUR, no sudo (dry-run for -Syu)\n\
+  -G <pkg>...    clone a pkgbase from the local mirror into ./<pkgbase>,\n\
+                 origin set to the AUR's pushable SSH URL (no network)\n\
+  -Gp <pkg>...   print a pkgbase's PKGBUILD to stdout\n\
 \n\
 YAY PARITY SHORTCUTS:\n\
   aurox                 run -Syu (refresh + upgrade)\n\
