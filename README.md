@@ -92,6 +92,8 @@ upgrades are repo-only, and unknown install targets say how to enable the AUR.
 | `aurox -Ss <regex>`    | Search repos + AUR by name / desc / provides                  |
 | `aurox -Si <pkg>`      | Show package info (repos + AUR; repo wins a shared name)      |
 | `aurox -Sc` / `-Scc`   | Remove built worktrees + pass `-Sc`/`-Scc` through to `pacman` |
+| `aurox -G <pkg>...`    | Clone a pkgbase into `./<pkgbase>` from the local mirror (no network), `origin` set to the AUR's pushable SSH URL |
+| `aurox -Gp <pkg>`      | Print a pkgbase's PKGBUILD to stdout                          |
 | `aurox -Rns <pkg>`     | Forwarded to `pacman` unchanged                               |
 
 AUR upgrades are an interactive flow now: run `aurox` (no args) to open the shell, then `upgrade` to stage the available AUR + repo upgrades, `review`/`approve` the AUR ones, and `do`. The explicit `-Syu` flag is a plain `pacman -Syu` passthrough.
