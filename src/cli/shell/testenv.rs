@@ -303,9 +303,17 @@ pub(super) fn up(repo: &str, name: &str) -> PkgUpgrade {
     }
 }
 
-/// The staged install specs, in cart order — the assertion view of the cart
-/// the repo-filter tests compare against.
+/// The specs still **in the transaction**, in cart order — the assertion view
+/// of "what would run". Since `drop` marks rather than deletes, this is the
+/// half that shrinks; [`listed_specs`] is the half that doesn't.
 pub(super) fn cart_specs(state: &State) -> Vec<PkgTarget> {
+    state.cart.staged().map(|i| i.spec().clone()).collect()
+}
+
+/// Every spec the cart still **holds**, skipped items included — the
+/// assertion view of what `show` renders a row for and what the numbered
+/// referent addresses.
+pub(super) fn listed_specs(state: &State) -> Vec<PkgTarget> {
     state
         .cart
         .items()

@@ -194,6 +194,13 @@ impl State {
                     }
                     changed = true;
                 }
+                // A row the user had dropped, put back in place — with its
+                // number, its approval, and (for an `upgrade` row) its
+                // old→new pair intact.
+                StageResult::Restaged => {
+                    env.print(&format!("restaged {name} ({label})"));
+                    changed = true;
+                }
                 StageResult::AlreadyStaged => {
                     env.print(&format!("{name} is already staged"));
                 }
@@ -250,6 +257,12 @@ impl State {
                 UnstageResult::Unstaged => {
                     env.print(&drop_ack(&r));
                     changed = true;
+                }
+                // Still listed and still numbered, so a second `drop` on the
+                // same row is a no-op worth saying out loud — the row didn't
+                // disappear, and the user may have meant `remove`.
+                UnstageResult::AlreadySkipped => {
+                    env.print(&format!("{} is already skipped", r.target.as_str()));
                 }
                 UnstageResult::NotStaged => env.print(&self.miss_note(&r)),
             }
@@ -366,7 +379,9 @@ impl State {
                 self.cart.unstage(&t);
                 let name = PkgName::from(t.into_inner());
                 match self.cart.stage_remove(name.clone()) {
-                    StageResult::Staged => env.print(&format!(
+                    // A removal is never skipped, so `Restaged` can't arise —
+                    // it reads the same as `Staged` here either way.
+                    StageResult::Staged | StageResult::Restaged => env.print(&format!(
                         "{name} was staged for upgrade — staged removal instead"
                     )),
                     StageResult::AlreadyStaged => env.print(&format!(
@@ -378,7 +393,7 @@ impl State {
             None => {
                 let name = PkgName::from(t.into_inner());
                 match self.cart.stage_remove(name.clone()) {
-                    StageResult::Staged => {
+                    StageResult::Staged | StageResult::Restaged => {
                         env.print(&format!("staged removal of {name}"));
                         CartEdit::Changed
                     }
@@ -603,7 +618,7 @@ mod tests {
 
     use crate::build::SourcePin;
     use crate::cli::shell::testenv::{
-        FakeEnv, cart_specs, dispatch_one, env_with, li, li_repo, state_showing, up,
+        FakeEnv, cart_specs, dispatch_one, env_with, li, li_repo, listed_specs, state_showing, up,
     };
     use crate::cli::shell::{Flow, command};
     use crate::names::PkgBase;
@@ -652,6 +667,37 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("glibc"), &mut env);
         assert_eq!(cart_specs(&state), vec![PkgTarget::new("glibc")]);
+    }
+
+    /// The header counts what will run, and names the skips so the numbers
+    /// add up to the rows on screen. A cart whose rows were all dropped has
+    /// nothing to run — `do` says so — while `show` still lists them.
+    #[test]
+    fn header_counts_staged_and_names_the_skipped() {
+        let mut env = env_with(&[("foo", Source::Repo), ("bar", Source::Repo)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add foo bar"), &mut env);
+        state.dispatch(&command::parse("drop foo"), &mut env);
+        assert!(
+            env.lines
+                .contains("transaction — 1 to install, 0 to remove, 1 skipped"),
+            "{:?}",
+            env.lines
+        );
+
+        env.lines.clear();
+        state.dispatch(&command::parse("drop bar"), &mut env);
+        state.dispatch(&command::parse("do"), &mut env);
+        assert!(
+            env.lines.contains("cart is empty — nothing to apply"),
+            "an all-skipped cart has nothing to run: {:?}",
+            env.lines
+        );
+        assert_eq!(
+            listed_specs(&state).len(),
+            2,
+            "both rows are still listed for `show`"
+        );
     }
 
     /// What the shortcut deliberately refuses: a typo'd verb (which keeps its
@@ -813,18 +859,28 @@ mod tests {
     }
 
     #[test]
-    fn drop_unstages_a_cart_row() {
+    /// `drop` takes the row out of the transaction but leaves it listed, so
+    /// the numbered table doesn't renumber under the user — and `add` on the
+    /// same name puts it back.
+    fn drop_marks_a_cart_row_without_removing_it() {
         let mut env = env_with(&[("foo", Source::Aur), ("bar", Source::Repo)]);
         let mut state = State::default();
         state.dispatch(&command::parse("add foo bar"), &mut env);
         state.dispatch(&command::parse("drop foo"), &mut env);
-        let specs: Vec<&str> = state
-            .cart
-            .items()
-            .iter()
-            .map(|i| i.spec().as_str())
-            .collect();
-        assert_eq!(specs, vec!["bar"]);
+        assert_eq!(cart_specs(&state), vec!["bar"], "foo left the transaction");
+        assert_eq!(
+            listed_specs(&state),
+            vec!["bar", "foo"],
+            "foo is still listed, holding its row"
+        );
+
+        state.dispatch(&command::parse("add foo"), &mut env);
+        assert_eq!(
+            cart_specs(&state),
+            vec!["bar", "foo"],
+            "re-adding restores it"
+        );
+        assert!(env.lines.contains("restaged foo"), "{:?}", env.lines);
     }
 
     #[test]
@@ -1087,14 +1143,45 @@ mod tests {
         assert_eq!(env.render_calls.count(), 0, "drop must not draw the table");
     }
 
+    /// Dropping the last row leaves nothing to run but something to see: the
+    /// status says so and points at the way back, rather than claiming an
+    /// empty cart the `show` table would contradict.
     #[test]
-    fn dropping_the_last_row_reports_the_empty_cart() {
+    fn dropping_the_last_row_reports_nothing_staged_not_an_empty_cart() {
         let mut env = env_with(&[("foo", Source::Aur)]);
         let mut state = State::default();
         state.dispatch(&command::parse("add foo"), &mut env);
         env.lines.clear();
         state.dispatch(&command::parse("drop foo"), &mut env);
-        assert!(env.lines.contains("cart is empty"), "{:?}", env.lines);
+        assert!(
+            env.lines
+                .contains("transaction — 0 to install, 0 to remove, 1 skipped"),
+            "{:?}",
+            env.lines
+        );
+        assert!(
+            env.lines
+                .contains("nothing staged — `add <number>` restores a skipped row"),
+            "{:?}",
+            env.lines
+        );
+    }
+
+    /// A cart with no rows at all still reports the plain empty state — the
+    /// wording above is for "everything skipped", not for "nothing here".
+    #[test]
+    fn a_cart_with_no_rows_still_reports_empty() {
+        let mut env = env_with(&[("foo", Source::Aur)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add foo"), &mut env);
+        state.dispatch(&command::parse("clear"), &mut env);
+        env.lines.clear();
+        state.dispatch(&command::parse("show"), &mut env);
+        assert!(
+            env.lines.any(|l| l.contains("cart is empty")),
+            "{:?}",
+            env.lines
+        );
     }
 
     #[test]

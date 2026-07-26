@@ -441,7 +441,10 @@ impl State {
     /// transaction prints *numbered*, so it is the one place the referent flips
     /// to it — render and capture can't drift.
     pub(super) fn show<E: ShellEnv>(&mut self, env: &mut E) {
-        if self.cart.is_empty() {
+        // Rows, not *staged* rows: a cart the user dropped everything from
+        // still has something to render — that's what marking is for — and it
+        // still numbers, so `add 2` can put a row back.
+        if self.cart.items().is_empty() && self.cart.removals().is_empty() {
             env.print("cart is empty — `add <pkg>` to stage an install");
             return;
         }
@@ -460,7 +463,11 @@ impl State {
     /// so the cart's standing is always on screen without a table dump — and
     /// without printing row numbers that aren't addressable.
     pub(super) fn summarize<E: ShellEnv>(&self, env: &mut E) {
-        if self.cart.is_empty() {
+        // "Empty" means nothing left on screen. A cart holding only skipped
+        // rows has nothing to run, but saying "cart is empty" would contradict
+        // the rows a `show` still lists — the header's `N skipped` says it
+        // exactly.
+        if self.cart.items().is_empty() && self.cart.removals().is_empty() {
             env.print("cart is empty");
             return;
         }
@@ -477,7 +484,7 @@ impl State {
         if self.cart.is_empty() {
             return "aurox> ".to_owned();
         }
-        let staged = self.cart.items().len() + self.cart.removals().len();
+        let staged = self.cart.staged_len() + self.cart.removals().len();
         let pending = self.cart.pending_review().len();
         if pending == 0 {
             format!("aurox [{staged} staged]> ")
@@ -516,10 +523,17 @@ impl State {
     /// The transaction header line, shared by `show` and [`Self::summarize`]
     /// so the two can't drift apart in wording.
     fn txn_header(&self) -> String {
+        // Skipped rows are still on screen and still numbered, so without
+        // their count the header wouldn't add up to the rows below. Named only
+        // when there are any — a cart nobody dropped from says nothing of it.
+        let skipped = match self.cart.skipped_len() {
+            0 => String::new(),
+            n => format!(", {n} skipped"),
+        };
         format!(
-            "transaction — {} to install, {} to remove",
-            self.cart.items().len(),
-            self.cart.removals().len()
+            "transaction — {} to install, {} to remove{skipped}",
+            self.cart.staged_len(),
+            self.cart.removals().len(),
         )
     }
 
@@ -529,6 +543,12 @@ impl State {
     /// have to substitute a `<sel>` placeholder; the plural points at bare
     /// `review`, which walks every pending item.
     fn approval_status(&self) -> String {
+        // Nothing staged (the user dropped it all, or dropped down to bare
+        // skips): "all approved — run `do`" would be true and useless. Point
+        // at the way back instead — the rows are still numbered.
+        if self.cart.staged_len() == 0 && self.cart.removals().is_empty() {
+            return "nothing staged — `add <number>` restores a skipped row".to_owned();
+        }
         let pending = self.cart.pending_review();
         match *pending.as_slice() {
             [] => "all approved — run `do`".to_owned(),
@@ -583,12 +603,15 @@ impl State {
                 env.print("done");
             }
             ApplyOutcome::Failed { installed } => {
-                // Drop the rows that actually landed so a retry doesn't reinstall
-                // them; keep the offenders (and any staged removals, which don't
-                // run once a build fails) staged for `drop`/fix + `apply` again.
+                // Remove — not mark — the rows that actually landed: an
+                // installed package is done, not a decision worth keeping on
+                // screen, and a retry must not reinstall it. The offenders
+                // (and any staged removals, which don't run once a build
+                // fails) stay for `drop`/fix + `do` again, as do the user's
+                // own skips.
                 let landed = installed.len();
                 for t in &installed {
-                    self.cart.unstage(t);
+                    self.cart.remove_applied(t);
                 }
                 // A run happened — old undo snapshots reference a pre-apply world.
                 self.clear_undo_history();
@@ -598,7 +621,7 @@ impl State {
                     env.print(&format!(
                         "apply partly failed — {landed} installed (dropped), \
                          {} still staged; fix and `do` again",
-                        self.cart.items().len()
+                        self.cart.staged_len()
                     ));
                 }
                 // Reprint what's left so the failures are on screen to act on.
@@ -1725,10 +1748,13 @@ mod tests {
         );
     }
 
+    /// Dropping twice can no longer slide onto a neighbour: the row stays
+    /// where it was printed, so the second `drop 1` finds the same package and
+    /// reports it already skipped. (Before rows were marked instead of
+    /// deleted, this was the stale-snapshot hazard — index 1 pointing at
+    /// whatever had shuffled up into it.)
     #[test]
-    fn stale_snapshot_row_is_a_clean_miss() {
-        // A number whose package already left the cart misses by name — it
-        // must never slide onto whatever occupies that index now.
+    fn dropping_the_same_row_twice_stays_on_that_row() {
         let mut env = FakeEnv {
             upgrade_candidates: vec![up("aur", "bar"), up("aur", "foo")],
             ..FakeEnv::default()
@@ -1736,6 +1762,29 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("upgrade"), &mut env); // shows [bar, foo]
         state.dispatch(&command::parse("drop 1"), &mut env);
+        env.lines.clear();
+        state.dispatch(&command::parse("drop 1"), &mut env);
+        assert!(
+            env.lines.contains("bar is already skipped"),
+            "row 1 is still bar: {:?}",
+            env.lines
+        );
+        assert_eq!(cart_specs(&state), vec!["foo"], "foo must not be hit");
+    }
+
+    /// A row *can* still leave the cart outright — `clear` empties it, and a
+    /// failed apply removes what landed — so a number held over from an older
+    /// table must miss by the name printed there, never slide onto whatever
+    /// occupies that index now. The surviving stale-snapshot path now that
+    /// `drop` marks instead of deleting.
+    #[test]
+    fn a_number_from_a_stale_table_misses_by_name() {
+        let mut env = env_with(&[("bar", Source::Repo), ("foo", Source::Repo)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add bar foo"), &mut env);
+        state.dispatch(&command::parse("show"), &mut env); // referent = [bar, foo]
+        state.dispatch(&command::parse("clear"), &mut env);
+        state.dispatch(&command::parse("add foo"), &mut env); // foo is live row 1 now
         env.lines.clear();
         state.dispatch(&command::parse("drop 1"), &mut env);
         assert!(

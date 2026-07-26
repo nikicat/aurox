@@ -128,6 +128,48 @@ impl Approval {
     }
 }
 
+/// Whether a cart item is part of the transaction, or a decision against it.
+///
+/// Orthogonal to [`Approval`], not a third value of it: this says *is it in
+/// the transaction*, approval says *has the user cleared its PKGBUILD*. All
+/// four combinations are real — an item you dropped after approving comes back
+/// approved, one you dropped without looking comes back needing review — which
+/// is why skipping doesn't overwrite the approval it would otherwise destroy.
+/// The `show` table collapses the two into one column (a skipped item's
+/// approval is moot until it's restaged), and that collapse is presentation,
+/// so it lives in the renderer.
+///
+/// `drop` **marks** an item rather than deleting it: it keeps its place and
+/// its number, so the numbered table doesn't renumber under a user working
+/// down it, the choice stays visible instead of vanishing, and `add` on the
+/// same item (by name or by its unchanged number) restores it. Only
+/// [`Staged`](Self::Staged) items resolve, gate on approval, or reach `apply`
+/// — see [`Cart::staged`] vs [`Cart::items`], the split that keeps what the
+/// cart *holds* from being read as what it will *run*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Staging {
+    /// In the transaction.
+    Staged,
+    /// Dropped by the user: still held (and still numbered), excluded from
+    /// everything else.
+    Skipped,
+}
+
+impl Staging {
+    /// Display label for the `show` table's state column.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    /// In the transaction?
+    pub const fn is_staged(self) -> bool {
+        matches!(self, Self::Staged)
+    }
+}
+
 /// One staged install/upgrade: the target plus the bookkeeping the cart tracks.
 #[derive(Debug, Clone)]
 pub struct CartItem {
@@ -146,6 +188,9 @@ pub struct CartItem {
     /// versions for the `show` table and routes repo rows through the partial
     /// `pacman -Syu` lane at apply (rather than a fresh `pacman -S`).
     pub upgrade: Option<PkgUpgrade>,
+    /// In the transaction, or dropped by the user and kept on screen. See
+    /// [`Staging`].
+    pub staging: Staging,
 }
 
 impl CartItem {
@@ -166,6 +211,7 @@ impl CartItem {
             approval: Approval::default_for(source, aur),
             repo,
             upgrade: None,
+            staging: Staging::Staged,
         }
     }
 
@@ -192,6 +238,7 @@ impl CartItem {
             approval: Approval::default_for(source, aur),
             repo,
             upgrade: Some(u),
+            staging: Staging::Staged,
         }
     }
 
@@ -216,6 +263,11 @@ impl CartItem {
     /// fresh `pacman -S`.
     pub fn is_repo_upgrade(&self) -> bool {
         self.source == Source::Repo && self.upgrade.is_some()
+    }
+
+    /// Still in the transaction — the filter every "what runs" query applies.
+    pub const fn is_staged(&self) -> bool {
+        self.staging.is_staged()
     }
 
     /// `old → new` for an upgrade row, `None` for a fresh install (for `show`).
@@ -265,6 +317,9 @@ pub enum ApplyOutcome {
 pub enum StageResult {
     /// The item was newly staged.
     Staged,
+    /// An item the user had dropped is back in the transaction, in place — the
+    /// undo half of [`Staging::Skipped`].
+    Restaged,
     /// The spec was already staged — re-staging is an idempotent no-op.
     AlreadyStaged,
 }
@@ -272,8 +327,11 @@ pub enum StageResult {
 /// What `drop` (`unstage`) did to the cart.
 #[derive(Debug, PartialEq, Eq)]
 pub enum UnstageResult {
-    /// A staged row was removed.
+    /// A staged item is now marked skipped — still held, out of the
+    /// transaction.
     Unstaged,
+    /// The item was already skipped; nothing changed.
+    AlreadySkipped,
     /// Nothing in the cart matched the target.
     NotStaged,
 }
@@ -342,14 +400,40 @@ pub struct Cart {
 }
 
 impl Cart {
-    /// Nothing staged on either side.
-    pub const fn is_empty(&self) -> bool {
-        self.items.is_empty() && self.remove.is_empty()
+    /// Nothing left to run: no *staged* install and no removal. Skipped items
+    /// don't count — they're a decision on screen, not work to do — so a cart
+    /// whose items were all dropped is empty to `apply` while [`Self::items`]
+    /// still holds them. Ask `items().is_empty()` for "nothing to show".
+    pub fn is_empty(&self) -> bool {
+        !self.items.iter().any(CartItem::is_staged) && self.remove.is_empty()
     }
 
-    /// The staged install rows, in staging order.
+    /// **Every** item, skipped ones included, in cart order — one row per item
+    /// is what `show` renders and what the numbered referent snapshots, so an
+    /// item keeps its number when it's dropped and `add <that number>`
+    /// restores it.
+    ///
+    /// The counterpart of [`Self::staged`]: this is what the cart *holds*,
+    /// that is what it will *run*. Nothing that resolves, gates, or installs
+    /// may read this one.
     pub fn items(&self) -> &[CartItem] {
         &self.items
+    }
+
+    /// The items still in the transaction — everything that resolves, gates
+    /// on approval, or reaches `apply`. See [`Staging`].
+    pub fn staged(&self) -> impl Iterator<Item = &CartItem> {
+        self.items.iter().filter(|i| i.is_staged())
+    }
+
+    /// How many items are in the transaction — the count the header prints.
+    pub fn staged_len(&self) -> usize {
+        self.staged().count()
+    }
+
+    /// How many items the user dropped — the header's trailing `N skipped`.
+    pub fn skipped_len(&self) -> usize {
+        self.items.len() - self.staged_len()
     }
 
     /// The staged removals, in staging order.
@@ -387,12 +471,23 @@ impl Cart {
     /// rendered rows into the referent (see `NumberedList` in the shell root),
     /// so numbers stay bound to what was printed even across a re-sort.
     pub fn add(&mut self, item: CartItem) -> StageResult {
-        if self.items.iter().any(|i| i.spec() == item.spec()) {
-            return StageResult::AlreadyStaged;
+        match self.items.iter_mut().find(|i| i.spec() == item.spec()) {
+            // Restore in place rather than replacing: the existing item may be
+            // an `upgrade`-seeded one, whose `PkgUpgrade` (the old→new pair and
+            // the partial `-Syu` routing) a freshly-built `add` item wouldn't
+            // carry. So `drop N` then `add N` is a true undo, not a re-add of
+            // a lesser item.
+            Some(row) if !row.is_staged() => {
+                row.staging = Staging::Staged;
+                StageResult::Restaged
+            }
+            Some(_) => StageResult::AlreadyStaged,
+            None => {
+                self.items.push(item);
+                self.sort_items();
+                StageResult::Staged
+            }
         }
-        self.items.push(item);
-        self.sort_items();
-        StageResult::Staged
     }
 
     /// Re-establish the cart's sort invariant: rows grouped by repo
@@ -411,15 +506,26 @@ impl Cart {
         });
     }
 
-    /// Unstage an install. Reports whether a row was removed.
+    /// Drop an install: **mark** the item skipped, keeping it (and its number)
+    /// in place. See [`Staging`] for why this isn't a removal.
     pub fn unstage(&mut self, target: &PkgTarget) -> UnstageResult {
-        let before = self.items.len();
-        self.items.retain(|i| i.spec() != target.as_str());
-        if self.items.len() == before {
-            UnstageResult::NotStaged
-        } else {
-            UnstageResult::Unstaged
+        match self.items.iter_mut().find(|i| i.spec() == target.as_str()) {
+            None => UnstageResult::NotStaged,
+            Some(row) if !row.is_staged() => UnstageResult::AlreadySkipped,
+            Some(row) => {
+                row.staging = Staging::Skipped;
+                UnstageResult::Unstaged
+            }
         }
+    }
+
+    /// Remove an item outright — the one path that still deletes.
+    ///
+    /// `apply` uses it for the items that actually landed: an installed
+    /// package is *done*, not a decision to keep showing, so it leaves the
+    /// cart while the offenders (and the user's skips) stay for the retry.
+    pub fn remove_applied(&mut self, target: &PkgTarget) {
+        self.items.retain(|i| i.spec() != target.as_str());
     }
 
     /// Keep only the staged installs whose spec is in `keep`, dropping every
@@ -436,16 +542,21 @@ impl Cart {
         // Fully typed: an item's identity (`spec()`) is a `PkgTarget`, so
         // the membership probes below never leave target space.
         let keep: HashSet<PkgTarget> = keep.into_iter().cloned().collect();
-        if !self.items.iter().any(|i| keep.contains(i.spec())) {
+        if !self.staged().any(|i| keep.contains(i.spec())) {
             return KeepResult::NoMatch;
         }
-        let dropped = self
-            .items
-            .iter()
-            .filter(|i| !keep.contains(i.spec()))
-            .map(|i| i.spec().clone())
-            .collect();
-        self.items.retain(|i| keep.contains(i.spec()));
+        let mut dropped = Vec::new();
+        for row in &mut self.items {
+            if keep.contains(row.spec()) {
+                continue;
+            }
+            // Already-skipped rows aren't dropped *again* — `keep` reports what
+            // it changed, so a second `keep` is a quiet no-op on them.
+            if row.is_staged() {
+                dropped.push(row.spec().clone());
+                row.staging = Staging::Skipped;
+            }
+        }
         KeepResult::Kept { dropped }
     }
 
@@ -483,9 +594,11 @@ impl Cart {
         self.resolution = None;
     }
 
-    /// The staged item matching `target`, if any.
+    /// The staged item matching `target`, if any. Skipped rows are invisible
+    /// here: `review`/`approve` act on the transaction, not on what's merely
+    /// still listed.
     pub fn item(&self, target: &PkgTarget) -> Option<&CartItem> {
-        self.items.iter().find(|i| i.spec() == target.as_str())
+        self.staged().find(|i| i.spec() == target.as_str())
     }
 
     /// Record that `pkgbase`'s PKGBUILD was reviewed this session.
@@ -496,7 +609,11 @@ impl Cart {
     /// Approve the staged item for `target`, reporting what changed. The caller
     /// records the pkgbase as reviewed only on [`ApproveResult::Approved`].
     pub fn approve(&mut self, target: &PkgTarget) -> ApproveResult {
-        match self.items.iter_mut().find(|i| i.spec() == target.as_str()) {
+        match self
+            .items
+            .iter_mut()
+            .find(|i| i.is_staged() && i.spec() == target.as_str())
+        {
             None => ApproveResult::NotStaged,
             Some(i) if i.approval == Approval::Approved => ApproveResult::AlreadyApproved,
             Some(i) => {
@@ -508,15 +625,14 @@ impl Cart {
 
     /// The AUR items still blocking `apply` — those that haven't been approved.
     pub fn pending_review(&self) -> Vec<&CartItem> {
-        self.items
-            .iter()
+        self.staged()
             .filter(|i| i.approval == Approval::NeedsReview)
             .collect()
     }
 
     /// Whether every staged item is cleared for `apply`.
     pub fn all_approved(&self) -> bool {
-        self.items.iter().all(|i| i.approval == Approval::Approved)
+        self.staged().all(|i| i.approval == Approval::Approved)
     }
 
     /// The targets the install/build half of `apply` resolves through the `-S`
@@ -524,8 +640,7 @@ impl Cart {
     /// *upgrades* are excluded — they go through the partial `pacman -Syu` lane
     /// ([`Self::repo_upgrades`]).
     pub fn install_targets(&self) -> Vec<Target> {
-        self.items
-            .iter()
+        self.staged()
             .filter(|i| !i.is_repo_upgrade())
             .map(|i| i.target.clone())
             .collect()
@@ -534,8 +649,7 @@ impl Cart {
     /// The staged repo *upgrade* rows, applied via `pacman -Syu` (ignoring every
     /// repo upgrade candidate the user didn't stage).
     pub fn repo_upgrades(&self) -> Vec<&PkgUpgrade> {
-        self.items
-            .iter()
+        self.staged()
             .filter(|i| i.is_repo_upgrade())
             .filter_map(|i| i.upgrade.as_ref())
             .collect()
@@ -624,19 +738,72 @@ mod tests {
         assert_eq!(cart.items().len(), 1);
     }
 
+    /// `drop` marks: the item keeps its place (and so its number) and leaves
+    /// the transaction. A second `drop` on it reports the state rather than a
+    /// miss, and `add` puts it back where it was.
     #[test]
-    fn unstage_removes_by_target() {
+    fn unstage_marks_skipped_and_keeps_the_item() {
         let mut cart = Cart::default();
         cart.add(item("foo", Source::Aur));
         cart.add(item("bar", Source::Repo));
         assert_eq!(cart.unstage(&target("foo")), UnstageResult::Unstaged);
         assert_eq!(
             cart.unstage(&target("foo")),
-            UnstageResult::NotStaged,
-            "second drop finds nothing"
+            UnstageResult::AlreadySkipped,
+            "a second drop finds the row, already skipped"
         );
-        assert_eq!(cart.items().len(), 1);
-        assert_eq!(cart.items()[0].spec(), "bar");
+        let listed: Vec<&str> = cart.items().iter().map(|i| i.spec().as_str()).collect();
+        assert_eq!(listed, vec!["bar", "foo"], "both items still held");
+        let staged: Vec<&str> = cart.staged().map(|i| i.spec().as_str()).collect();
+        assert_eq!(staged, vec!["bar"], "only `bar` is in the transaction");
+        assert_eq!(cart.staged_len(), 1);
+        assert_eq!(cart.skipped_len(), 1);
+
+        // Re-adding restores it in place — same row, not an appended one.
+        assert_eq!(cart.add(item("foo", Source::Aur)), StageResult::Restaged);
+        let staged: Vec<&str> = cart.staged().map(|i| i.spec().as_str()).collect();
+        assert_eq!(staged, vec!["bar", "foo"]);
+    }
+
+    /// An `upgrade`-seeded item survives the drop/restore round-trip *with* its
+    /// `PkgUpgrade` — the reason `add` restores in place instead of replacing
+    /// it with a freshly-built one, which would carry no old→new pair and
+    /// would lose the partial `-Syu` routing.
+    #[test]
+    fn restaging_an_upgrade_row_keeps_its_upgrade() {
+        let mut cart = Cart::default();
+        cart.add(CartItem::from_upgrade(
+            upgrade("core", "glibc"),
+            AurApproval::Review,
+        ));
+        assert_eq!(cart.unstage(&target("glibc")), UnstageResult::Unstaged);
+        assert_eq!(
+            cart.add(CartItem::new(
+                PkgTarget::new("glibc"),
+                Source::Repo,
+                None,
+                AurApproval::Review
+            )),
+            StageResult::Restaged
+        );
+        let row = &cart.items()[0];
+        assert!(row.is_staged());
+        assert!(row.upgrade.is_some(), "the old→new pair survived");
+        assert!(row.is_repo_upgrade(), "still routed through the -Syu lane");
+    }
+
+    /// A cart whose every item is skipped has nothing to run — `apply` sees it
+    /// as empty — while the items stay held for `show` to render.
+    #[test]
+    fn all_skipped_is_empty_to_apply_but_still_has_items() {
+        let mut cart = Cart::default();
+        cart.add(item("foo", Source::Aur));
+        cart.unstage(&target("foo"));
+        assert!(cart.is_empty(), "nothing staged to run");
+        assert_eq!(cart.items().len(), 1, "still on screen");
+        assert!(cart.all_approved(), "no staged item gates the transaction");
+        assert!(cart.pending_review().is_empty());
+        assert!(cart.install_targets().is_empty());
     }
 
     fn keep_targets(specs: &[&str]) -> Vec<PkgTarget> {
@@ -656,8 +823,14 @@ mod tests {
                 dropped: vec![PkgTarget::new("baz"), PkgTarget::new("foo")]
             }
         );
-        let specs: Vec<&str> = cart.items().iter().map(|i| i.spec().as_str()).collect();
-        assert_eq!(specs, vec!["bar"]);
+        let staged: Vec<&str> = cart.staged().map(|i| i.spec().as_str()).collect();
+        assert_eq!(staged, vec!["bar"], "only the kept item runs");
+        let listed: Vec<&str> = cart.items().iter().map(|i| i.spec().as_str()).collect();
+        assert_eq!(
+            listed,
+            vec!["bar", "baz", "foo"],
+            "the dropped items stay held, numbered as before"
+        );
     }
 
     #[test]

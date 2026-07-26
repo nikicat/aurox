@@ -9,7 +9,7 @@
 //! prompt — `drop` the failed row and the cart is empty, no restart needed.
 //! The `.sh` asserts the end state in localdb.
 
-use pty_harness::Pty;
+use pty_harness::{Pty, has};
 
 fn main() {
     let mut pty = Pty::spawn_aurox();
@@ -39,13 +39,16 @@ fn main() {
         s.contains("apply partly failed") && s.contains("1 installed (dropped)")
     });
 
-    // The offender is still staged; dropping it empties the cart (the drop
-    // reprints the transaction, which is now empty).
+    // The offender is still staged; dropping it takes it out of the
+    // transaction but leaves the row listed and numbered, so the status says
+    // "0 to install … 1 skipped" rather than claiming an empty cart.
     pty.send_command("drop test-fail-build");
     pty.expect("offender dropped", |s| {
         s.contains("dropped test-fail-build")
     });
-    pty.expect("cart empty after drop", |s| s.contains("cart is empty"));
+    pty.expect("nothing left to run", |s| {
+        has(s, "0 to install, 0 to remove, 1 skipped")
+    });
 
     pty.send_command("quit");
     pty.finish_clean();
