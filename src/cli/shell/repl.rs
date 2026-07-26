@@ -7,6 +7,7 @@ use super::complete::ShellHelper;
 use super::env::{RealEnv, build_universe, cart_targets};
 use super::{Flow, ShellEnv, State};
 use crate::build::DevelPolicy;
+use crate::cli::Outcome;
 use crate::config::ConfigHandle;
 use crate::error::{Error, Result};
 use crate::index::{self, AurIndexData};
@@ -17,16 +18,8 @@ use crate::ui;
 use rustyline::error::ReadlineError;
 use rustyline::history::DefaultHistory;
 use rustyline::{ColorMode as RlColorMode, Config as RlConfig, Editor};
-use signal_hook::consts::SIGINT;
 use std::rc::Rc;
 use tracing::{debug, info, instrument};
-
-/// Exit code for the Ctrl-C quit: the shell convention `128 + signal number`
-/// for SIGINT, derived from the same constant the signal handlers use rather
-/// than a re-typed 130. Scripts driving the shell can tell this interrupt
-/// quit from `quit`/Ctrl-D's 0.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-const CTRL_C_EXIT_CODE: u8 = 128 + SIGINT as u8;
 
 /// The pre-prompt banner: what this session covers. Pure so the wording is
 /// testable. Runs *after* the first-launch question, so `NotSetUp` here means
@@ -102,7 +95,11 @@ fn first_launch_setup(mut config: ConfigHandle) -> Result<ConfigHandle> {
 /// runs one `search` before the prompt loop — identical to starting the shell
 /// and typing `search <term>…`. Empty for the plain no-arg `aurox` launch.
 #[instrument(skip(config))]
-pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTerm]) -> Result<u8> {
+pub fn run(
+    config: &ConfigHandle,
+    devel: DevelPolicy,
+    initial_search: &[SearchTerm],
+) -> Result<Outcome> {
     info!(devel = ?devel, terms = initial_search.len(), "shell session start");
     // First-launch question (no-op unless the AUR is enabled-but-unsynced).
     // Owns a local handle so a "pacman-only" answer takes effect immediately.
@@ -197,7 +194,7 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
         );
     }
 
-    let code = loop {
+    let outcome = loop {
         // The prompt is recomputed per line: it carries the cart's standing
         // (counts + open review gates), so state stays ambient at the prompt
         // instead of being reprinted after every command.
@@ -227,17 +224,17 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
                         state.empty_line_hint().map(str::to_owned),
                     );
                 }
-                if let Flow::Exit(code) = flow {
-                    break code;
+                if flow == Flow::Exit {
+                    break Outcome::Done;
                 }
             }
             // Ctrl-C at the prompt leaves the shell, like Ctrl-D — during a
             // long operation it aborts back to the prompt instead (each op
             // holds its own SIGINT guard), so quitting is what an *idle* ^C
             // can still usefully mean.
-            Err(ReadlineError::Interrupted) => break CTRL_C_EXIT_CODE,
+            Err(ReadlineError::Interrupted) => break Outcome::QuitOnInterrupt,
             // Ctrl-D at the prompt exits cleanly.
-            Err(ReadlineError::Eof) => break 0,
+            Err(ReadlineError::Eof) => break Outcome::Done,
             Err(e) => return Err(Error::other(format!("shell: read line: {e}"))),
         }
     };
@@ -246,7 +243,7 @@ pub fn run(config: &ConfigHandle, devel: DevelPolicy, initial_search: &[SearchTe
     if let Err(e) = rl.save_history(&history) {
         debug!(error = %e, "shell: could not save history");
     }
-    Ok(code)
+    Ok(outcome)
 }
 
 #[cfg(test)]
@@ -255,12 +252,12 @@ mod tests {
 
     use crate::assert_contains;
 
-    /// The derived Ctrl-C quit code is the exact value the docs, the e2e
-    /// drivers, and any wrapper script rely on — an external contract, so
-    /// the concrete number is the assertion.
+    /// The Ctrl-C quit code is the exact value the docs, the e2e drivers,
+    /// and any wrapper script rely on — an external contract, so the concrete
+    /// number is the assertion.
     #[test]
     fn ctrl_c_exit_code_is_the_shell_convention() {
-        assert_eq!(CTRL_C_EXIT_CODE, 130);
+        assert_eq!(Outcome::QuitOnInterrupt.exit_code(), 130);
     }
 
     /// The pre-prompt banner: a ready session gets the one-liner, a "later"

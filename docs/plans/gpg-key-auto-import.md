@@ -31,10 +31,10 @@ currently does not. This feature adds it.
 
 ## Custom types (instead of strings)
 
-The existing config knobs (`color`, `review_default`, `privilege_escalator`)
-are all bare `String` matched at use sites. This feature introduces real
-types, honoring the typed-identifiers preference and setting a pattern those
-older knobs could later follow.
+The typed-knob pattern is already established — `color` is a `ColorMode`,
+`privilege_escalator` a `PrivilegeEscalator`, `aur_approval` an
+`AurApproval`, each validated at the deserialize boundary. This feature
+follows it rather than adding another bare `String`.
 
 ### `GpgImportPolicy` enum (replaces `gpg_auto_import: String`)
 
@@ -51,8 +51,8 @@ pub enum GpgImportPolicy {
 
 Stored directly in `Config`; serde parses the TOML string at the deserialize
 boundary (the one place a raw string is legitimate). The pipeline matches on
-the enum — exhaustive arms, no `"ask"` literals. Strictly better than the
-neighboring `color: String` / `review_default: String`.
+the enum — exhaustive arms, no `"ask"` literals; same shape as the
+neighboring `ColorMode` / `PrivilegeEscalator`.
 
 ### `PgpFingerprint` newtype (replaces `Vec<String>` of keys)
 

@@ -97,7 +97,7 @@ pub fn query_repo_upgrades_in(alpm: &Alpm) -> Vec<PkgUpgrade> {
 /// elapsed since the user's last interaction. The `noconfirm` flag (read
 /// from [`runopts`]) suppresses the prompt for non-interactive callers.
 #[instrument(skip(cfg))]
-pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
+pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<()> {
     let escalate = needs_sudo(argv);
     let (program, spawn_args) = if escalate {
         (cfg.privilege_escalator.command(), with_pacman(argv))
@@ -145,7 +145,7 @@ pub(crate) fn exec_staged_sysupgrade(
     cfg: &Config,
     staging: &SyncDbStaging,
     pacman_argv: &[String],
-) -> Result<u8> {
+) -> Result<()> {
     let program = cfg.privilege_escalator.command();
     let stage_args = staging.install_argv();
     let spawn_args = with_pacman(pacman_argv);
@@ -182,7 +182,7 @@ pub(crate) fn exec_staged_sysupgrade(
 /// Also runs the staged sysupgrade's `install` step, whose teed failure
 /// output lands under the same pacman-labelled log event — a cosmetic
 /// mislabel that isn't worth forking the (smoke-57-pinned) event over.
-fn spawn_streamed(program: &str, spawn_args: &[String]) -> Result<u8> {
+fn spawn_streamed(program: &str, spawn_args: &[String]) -> Result<()> {
     if std::io::stdout().is_terminal() {
         exec_pacman_inherited(program, spawn_args)
     } else {
@@ -192,12 +192,12 @@ fn spawn_streamed(program: &str, spawn_args: &[String]) -> Result<u8> {
 
 /// Run pacman attached to the inherited stdio — its own progress bars and native
 /// prompts, no output capture (the user is watching live). Maps the exit status
-/// to aurox's `Ok(0)` / [`Error::PacmanExit`].
-fn exec_pacman_inherited(program: &str, spawn_args: &[String]) -> Result<u8> {
+/// to aurox's `Ok(())` / [`Error::PacmanExit`].
+fn exec_pacman_inherited(program: &str, spawn_args: &[String]) -> Result<()> {
     let status = Command::new(program).args(spawn_args).status()?;
     let code = status_to_exit_code(status);
     if status.success() {
-        Ok(0)
+        Ok(())
     } else {
         Err(Error::PacmanExit(code))
     }
@@ -208,7 +208,7 @@ fn exec_pacman_inherited(program: &str, spawn_args: &[String]) -> Result<u8> {
 /// channels matter — pacman prints the "X and Y are in conflict" pair on stdout
 /// (a prompt body), while the terminal "error: ..." lines go to stderr. Used off
 /// a terminal, where pacman has no progress UI to lose to the pipe anyway.
-fn exec_pacman_teed(program: &str, spawn_args: &[String]) -> Result<u8> {
+fn exec_pacman_teed(program: &str, spawn_args: &[String]) -> Result<()> {
     let mut child = Command::new(program)
         .args(spawn_args)
         .stdout(Stdio::piped())
@@ -237,7 +237,7 @@ fn exec_pacman_teed(program: &str, spawn_args: &[String]) -> Result<u8> {
     });
     let code = status_to_exit_code(status);
     if status.success() {
-        Ok(0)
+        Ok(())
     } else {
         log_pacman_output_on_failure(&captured_out, &captured_err);
         Err(Error::PacmanExit(code))

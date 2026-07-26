@@ -14,6 +14,7 @@
 //! * **Installed Size** — localdb `isize()` for members already installed
 //!   (an AUR pkgbase has no syncdb to quote a size from before it's built).
 
+use crate::cli::Outcome;
 use crate::config::Config;
 use crate::error::Result;
 use crate::index::schema::IndexEntry;
@@ -34,20 +35,19 @@ use tracing::debug;
 ///
 /// The AUR side loads *empty* when not in play, so the lookup is uniform;
 /// only the final "nothing found" wording consults [`AurState`].
-/// Pacman-style exit code: non-zero when any requested target was nowhere
-/// to be found.
-pub fn cmd_info(cfg: &Config, targets: &[PkgTarget]) -> Result<u8> {
+/// [`Outcome::NotFound`] when any requested target was nowhere to be found.
+pub fn cmd_info(cfg: &Config, targets: &[PkgTarget]) -> Result<Outcome> {
     let data = AurIndexData::load(cfg)?;
     let missing = InfoLookup::open(&data)?.print_all(targets);
     if missing.is_empty() {
-        return Ok(0);
+        return Ok(Outcome::Done);
     }
     ui::warn(&missing_warning(
         AurState::probe(cfg),
         &missing,
         "`aurox -Sy`",
     ));
-    Ok(1)
+    Ok(Outcome::NotFound)
 }
 
 /// Word the "nothing found" warning honestly: only claim the AUR was

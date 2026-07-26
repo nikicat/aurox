@@ -69,8 +69,8 @@ pub struct StageClass {
 ///
 /// The typed config value behind the `aur_approval` knob (a named type rather
 /// than a bare bool, so a call site reads `AurApproval::Auto`, not `true`).
-/// [`from_config`](Self::from_config) resolves the effective policy, including
-/// the legacy `review_default == "skip"` fallback.
+/// The knob is `Option<Self>` on disk — an unset one resolves through
+/// [`Default`], so [`Self::Review`] is written once, here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AurApproval {
@@ -79,20 +79,6 @@ pub enum AurApproval {
     Review,
     /// AUR items stage pre-approved.
     Auto,
-}
-
-impl AurApproval {
-    /// The effective AUR approval policy. The explicit `aur_approval` config
-    /// value wins when set; when unset (`None`) it defers to the legacy
-    /// `review_default == "skip"` ⇒ [`Self::Auto`] behaviour so pre-`aur_approval`
-    /// configs keep working. Everything else means review.
-    pub fn from_config(configured: Option<Self>, review_default: &str) -> Self {
-        match configured {
-            Some(policy) => policy,
-            None if review_default == "skip" => Self::Auto,
-            None => Self::Review,
-        }
-    }
 }
 
 /// Whether a staged item still needs the user's eyes on its PKGBUILD before
@@ -678,34 +664,6 @@ mod tests {
     fn aur_auto_approve_policy_skips_review() {
         let it = CartItem::new(target("yay-bin"), Source::Aur, None, AurApproval::Auto);
         assert_eq!(it.approval, Approval::Approved);
-    }
-
-    #[test]
-    fn aur_approval_from_config_prefers_the_explicit_knob() {
-        // Explicit `aur_approval` wins, regardless of `review_default`.
-        assert_eq!(
-            AurApproval::from_config(Some(AurApproval::Auto), "prompt"),
-            AurApproval::Auto
-        );
-        assert_eq!(
-            AurApproval::from_config(Some(AurApproval::Review), "skip"),
-            AurApproval::Review
-        );
-    }
-
-    #[test]
-    fn aur_approval_from_config_falls_back_to_review_default() {
-        // Unset → legacy behaviour: `review_default == "skip"` auto-approves,
-        // anything else needs review.
-        assert_eq!(AurApproval::from_config(None, "skip"), AurApproval::Auto);
-        assert_eq!(
-            AurApproval::from_config(None, "prompt"),
-            AurApproval::Review
-        );
-        assert_eq!(
-            AurApproval::from_config(None, "always-show"),
-            AurApproval::Review
-        );
     }
 
     #[test]

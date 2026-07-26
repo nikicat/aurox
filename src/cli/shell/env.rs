@@ -231,10 +231,7 @@ impl ShellEnv for RealEnv {
     }
 
     fn aur_policy(&self) -> AurApproval {
-        // The `aur_approval` knob wins when set; unset defers to the legacy
-        // `review_default == "skip"` behaviour. Resolution + fallback live on
-        // the type so they're unit-tested next to it.
-        AurApproval::from_config(self.cfg().aur_approval, &self.cfg().review_default)
+        self.cfg().aur_approval.unwrap_or_default()
     }
 
     fn aur_state(&self) -> index::AurState {
@@ -467,8 +464,11 @@ impl ShellEnv for RealEnv {
             // Stringify only here, at pacman's argv boundary.
             let mut args = vec!["-R".to_owned()];
             args.extend(installed_removals.iter().map(|n| n.as_str().to_owned()));
-            if invoke::exec_pacman(self.cfg(), &args)? != 0 {
-                ui::warn("removal step did not complete");
+            // Deliberately *not* `?`: a failed (or declined) removal must not
+            // abort `apply`, because the install half already landed above and
+            // the cart still has to be rewritten to match reality.
+            if let Err(e) = invoke::exec_pacman(self.cfg(), &args) {
+                ui::warn(&format!("removal step did not complete: {e}"));
                 // The whole install half already landed (we passed the
                 // success gate above); only the removal failed, so drop every
                 // install row and keep the removals staged for a retry.

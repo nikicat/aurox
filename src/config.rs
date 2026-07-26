@@ -3,7 +3,7 @@
 use crate::cli::shell::cart::AurApproval;
 use crate::error::Result;
 use crate::paths;
-use crate::ui::{AgeThresholds, ColorMode, ConfigRow, SearchLayout};
+use crate::ui::{self, AgeThresholds, ColorMode, ConfigRow, SearchLayout};
 use optfield::optfield;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -143,19 +143,12 @@ pub struct Config {
     /// you keep the system db current yourself and want `-Sy` to touch the AUR
     /// mirror only.
     pub check_repo_updates: bool,
-    /// Legacy knob whose only remaining effect is the [`Self::aur_approval`]
-    /// fallback: `"skip"` auto-approves staged AUR packages when
-    /// `aur_approval` is unset (pre-`aur_approval` configs keep working).
-    /// It no longer controls the `-S` PKGBUILD review prompt — that always
-    /// asks, and only `--noconfirm` collapses it.
-    pub review_default: String,
     /// `review` | `auto` — whether staged AUR packages need review before
-    /// `apply` will run them. `review` (default) puts every AUR item behind the
-    /// shell's approval gate; `auto` stages them pre-approved. When unset (the
-    /// `None` here), the legacy `review_default == "skip"` behaviour still
-    /// auto-approves, so existing configs keep working. Repo packages always
-    /// auto-approve regardless. Resolved by
-    /// [`AurApproval::from_config`](crate::cli::shell::cart::AurApproval::from_config).
+    /// `apply` will run them. `review` (the default an unset `None` resolves
+    /// to) puts every AUR item behind the shell's approval gate; `auto` stages
+    /// them pre-approved. Repo packages always auto-approve regardless. The
+    /// `-S` PKGBUILD review prompt is *not* this knob — that always asks, and
+    /// only `--noconfirm` collapses it.
     pub aur_approval: Option<AurApproval>,
     /// Max commits `find_installed_commit` walks back through a pkgbase's
     /// history when looking for the commit that produced the installed
@@ -215,7 +208,21 @@ impl ConfigFile {
     /// empty config (every knob at its default).
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
-            Ok(text) => Ok(toml::from_str(&text)?),
+            Ok(text) => {
+                // Unknown keys parse as absent, so a config still carrying the
+                // removed `review_default` would silently lose its `"skip"`
+                // auto-approve. Say so once, here, rather than let the review
+                // gate reappear unexplained.
+                if toml::from_str::<toml::Table>(&text)
+                    .is_ok_and(|t| t.contains_key("review_default"))
+                {
+                    ui::warn(
+                        "config: `review_default` was removed — set `aur_approval = \"auto\"` \
+                         for what `\"skip\"` used to do",
+                    );
+                }
+                Ok(toml::from_str(&text)?)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(e.into()),
         }
@@ -249,9 +256,8 @@ impl ConfigFile {
     /// whose defaults are *resolved*, not stored, and so leave no trace in a
     /// sparse TOML round-trip (TOML can't spell an absent optional, and the
     /// `[ages]` section defaults empty):
-    /// - `aur_approval` defaults to `None`, deferring to the legacy
-    ///   `review_default`; its effective policy comes from
-    ///   [`AurApproval::from_config`].
+    /// - `aur_approval` defaults to `None`, which *resolves* to
+    ///   [`AurApproval::default`].
     /// - the `[ages]` bands default unset so upgrades can move them; their day
     ///   counts come from [`Config::age_thresholds`] / [`AgeThresholds`].
     ///
@@ -261,8 +267,7 @@ impl ConfigFile {
     pub(crate) fn effective_defaults() -> Self {
         let defaults = defaults::default_config();
         let (caution_days, fresh_days, stale_days) = defaults.age_thresholds().to_days();
-        let aur_approval =
-            AurApproval::from_config(defaults.aur_approval, &defaults.review_default);
+        let aur_approval = defaults.aur_approval.unwrap_or_default();
         let mut file = Self::from(defaults);
         file.aur_approval = Some(aur_approval);
         file.ages = Some(AgeConfig {

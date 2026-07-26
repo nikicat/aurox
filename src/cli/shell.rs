@@ -149,8 +149,10 @@ pub struct State {
 pub enum Flow {
     /// Keep reading commands.
     Continue,
-    /// Leave the shell with this process exit code.
-    Exit(u8),
+    /// Leave the shell — the session ended cleanly (`quit`, Ctrl-D). An
+    /// interrupted exit is the repl loop's own read error, not a dispatch
+    /// result, so this carries no code.
+    Exit,
 }
 
 /// Whether a cart edit actually changed anything — the outcome the undoable-edit

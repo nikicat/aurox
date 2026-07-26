@@ -2,6 +2,7 @@
 //! `-Syu` interactive picker. Read-only: walks alpm + the AUR index file,
 //! never shells out to `pacman -S` or asks for sudo.
 
+use crate::cli::Outcome;
 use crate::config::Config;
 use crate::error::Result;
 use crate::index::AurIndexData;
@@ -46,9 +47,9 @@ impl DevelPolicy {
 /// unprivileged (no sudo), so safe to call both as the bare `-Qu` and as a
 /// preview before `-Syu` runs.
 #[instrument]
-pub fn cmd_query_upgrades(cfg: &Config, devel: DevelPolicy) -> Result<u8> {
+pub fn cmd_query_upgrades(cfg: &Config, devel: DevelPolicy) -> Result<Outcome> {
     ui::upgrade_table(&collect_upgrade_plan(cfg, devel)?, ui::Paint::detect()).eprint_framed();
-    Ok(0)
+    Ok(Outcome::Done)
 }
 
 /// Gather the merged repo + AUR upgrade list. Shared by `-Qu` (read-only

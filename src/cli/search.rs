@@ -10,6 +10,7 @@
 //! [`ui::SearchList`] renderer are shared with the shell so every surface
 //! ranks and renders matches identically.
 
+use crate::cli::Outcome;
 use crate::config::Config;
 use crate::context;
 use crate::error::Result;
@@ -184,10 +185,10 @@ fn merged_rows<'a>(
 /// Printed in pacman's `repo/name version` format, colored per pacman's own
 /// `-Ss` palette when color is on (see [`ui::search_result`]).
 ///
-/// Pacman-parity exit codes: 0 when at least one package matched, 1 when
-/// none did (silently, like `pacman -Ss`) — so scripts can test for a hit.
+/// Pacman parity: [`Outcome::NotFound`] when nothing matched (silently, like
+/// `pacman -Ss`) — so scripts can test for a hit.
 #[instrument(skip(cfg))]
-pub fn cmd_search(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
+pub fn cmd_search(cfg: &Config, terms: &[SearchTerm]) -> Result<Outcome> {
     let regexes = compile_terms(terms)?;
     let (repo_hits, aur_data) = gather(cfg, terms)?;
     // `-Ss` shows no freshness column, but ranking still weights health, so it
@@ -196,7 +197,7 @@ pub fn cmd_search(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
     let scale = ui::AgeScale::now(cfg.age_thresholds());
     let rows = merged_rows(repo_hits, aur_data.search(&regexes), &regexes, &scale);
     if rows.is_empty() {
-        return Ok(1);
+        return Ok(Outcome::NotFound);
     }
     let pac = PacmanIndex::build(&alpm_db::open()?);
     let paint = ui::Paint::detect();
@@ -205,7 +206,7 @@ pub fn cmd_search(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
     for r in &rows {
         write_search_result(&mut out, &r.row, &pac, paint)?;
     }
-    Ok(0)
+    Ok(Outcome::Done)
 }
 
 /// Write one search hit in pacman's `-Ss` format to `out` — layout and
@@ -240,7 +241,7 @@ fn write_search_result<W: std::io::Write>(
 /// strongest hit ends nearest the prompt. Nothing is installed:
 /// auto-installing every regex hit is too dangerous without a human in the loop.
 #[instrument(skip(cfg))]
-pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
+pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<Outcome> {
     let regexes = compile_terms(terms)?;
     let (repo_hits, aur_data) = gather(cfg, terms)?;
     // One clock + thresholds for the whole render: ranking (health weight) and
@@ -257,7 +258,7 @@ pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
                 .collect::<Vec<_>>()
                 .join(" ")
         ));
-        return Ok(0);
+        return Ok(Outcome::NotFound);
     }
 
     // Render through the shared [`ui::SearchList`], the same machinery the shell
@@ -276,7 +277,7 @@ pub fn cmd_search_install(cfg: &Config, terms: &[SearchTerm]) -> Result<u8> {
     for line in table.lines() {
         println!("{line}");
     }
-    Ok(0)
+    Ok(Outcome::Done)
 }
 
 /// Resolve one ranked [`Row`] into a [`ui::SearchRow`]: its display name,

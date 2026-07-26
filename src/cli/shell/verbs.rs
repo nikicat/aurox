@@ -200,7 +200,7 @@ impl State {
     pub(crate) fn dispatch<E: ShellEnv>(&mut self, cmd: &Command, env: &mut E) -> Flow {
         match cmd {
             Command::Empty => Flow::Continue,
-            Command::Quit => Flow::Exit(0),
+            Command::Quit => Flow::Exit,
             Command::Syntax(msg) => {
                 env.print(&format!("syntax error: {msg}"));
                 Flow::Continue
@@ -938,9 +938,9 @@ mod tests {
 
     #[test]
     fn quit_and_aliases_exit_zero() {
-        assert_eq!(dispatch_one("quit").0, Flow::Exit(0));
-        assert_eq!(dispatch_one("exit").0, Flow::Exit(0));
-        assert_eq!(dispatch_one("q").0, Flow::Exit(0));
+        assert_eq!(dispatch_one("quit").0, Flow::Exit);
+        assert_eq!(dispatch_one("exit").0, Flow::Exit);
+        assert_eq!(dispatch_one("q").0, Flow::Exit);
     }
 
     #[test]
