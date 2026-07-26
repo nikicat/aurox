@@ -67,9 +67,6 @@ the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
   `format!("{}{}")` tails) — so the tail is ready for `Style`-carrying cells;
   the remaining work is making `Cell` itself carry style-as-data instead of a
   rendered string.
-- colorize the `info <pkg>` table — it renders monochrome while the
-  transaction/search surfaces are styled. Same palette question as the search
-  list above; `src/ui/tables.rs` (`install_table`) is the renderer.
 - **dropping from an upgrade cart should mark, not delete.** `drop` today
   removes the row (`Cart::unstage`, `src/cli/shell/cart.rs`), so the numbered
   list renumbers under the user and every subsequent selector means something

@@ -7,12 +7,13 @@
 
 use super::sync;
 use crate::error::{Error, Result};
-use crate::index::info::{Label, field, list_field, multiline_field};
+use crate::index::info::{self, InfoBlock, Label};
 use crate::index::schema::IndexEntry;
 use crate::names::{
     Arch, GroupName, Maintainer, OptDep, PkgDesc, PkgName, PkgTarget, RepoName, SearchTerm, Url,
     VirtualName,
 };
+use crate::ui::Paint;
 use crate::units::{ByteSize, UnixTime};
 use crate::version::{Ver, Version};
 use alpm::Alpm;
@@ -212,46 +213,47 @@ impl SyncInfo {
     /// A writer (not `println!`) for the same reason as [`crate::index`]'s
     /// `write_search_result`: the exact byte layout is testable without
     /// capturing a process's stdout.
-    pub fn write_to<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
-        field(out, Label::Repository, &self.repo)?;
-        field(out, Label::Name, &self.name)?;
-        field(out, Label::Version, &self.version)?;
+    pub fn write_to<W: std::io::Write>(&self, out: W, paint: Paint) -> std::io::Result<()> {
+        let mut b = InfoBlock::new(out, paint);
+        b.accent(Label::Repository, self.repo.as_str(), info::repo_accent)?;
+        b.field(Label::Name, &self.name)?;
+        b.accent(Label::Version, self.version.as_str(), info::version_accent)?;
         if let Some(d) = &self.desc {
-            field(out, Label::Description, d)?;
+            b.field(Label::Description, d)?;
         }
         if let Some(a) = &self.arch {
-            field(out, Label::Architecture, a)?;
+            b.field(Label::Architecture, a)?;
         }
         if let Some(u) = &self.url {
-            field(out, Label::Url, u)?;
+            b.accent(Label::Url, u.as_str(), info::url_accent)?;
         }
-        list_field(out, Label::Provides, &self.provides)?;
-        list_field(out, Label::DependsOn, &self.depends)?;
+        b.list(Label::Provides, &self.provides)?;
+        b.list(Label::DependsOn, &self.depends)?;
         let optdeps: Vec<String> = self.optdepends.iter().map(ToString::to_string).collect();
-        multiline_field(out, Label::OptionalDeps, &optdeps)?;
-        list_field(out, Label::ConflictsWith, &self.conflicts)?;
-        list_field(out, Label::Replaces, &self.replaces)?;
+        b.multiline(Label::OptionalDeps, &optdeps)?;
+        b.list(Label::ConflictsWith, &self.conflicts)?;
+        b.list(Label::Replaces, &self.replaces)?;
         if self.download_size != ByteSize::ZERO {
-            field(out, Label::DownloadSize, self.download_size)?;
+            b.field(Label::DownloadSize, self.download_size)?;
         }
         if self.installed_size != ByteSize::ZERO {
-            field(out, Label::InstalledSize, self.installed_size)?;
+            b.field(Label::InstalledSize, self.installed_size)?;
         }
         if let Some(p) = &self.packager {
-            field(out, Label::Packager, p)?;
+            b.field(Label::Packager, p)?;
         }
         if let Some(t) = self.build_date.render() {
-            field(out, Label::BuildDate, t)?;
+            b.field(Label::BuildDate, t)?;
         }
-        writeln!(out)
+        b.end()
     }
 
     /// Print the info block to stdout (the interactive `info` path). Same
     /// best-effort stance as the `println!`-based printers elsewhere: a closed
     /// stdout mid-block isn't worth failing the command over.
-    pub fn print(&self) {
+    pub fn print(&self, paint: Paint) {
         let stdout = std::io::stdout();
-        self.write_to(&mut stdout.lock()).ok();
+        self.write_to(stdout.lock(), paint).ok();
     }
 }
 
@@ -776,9 +778,11 @@ mod tests {
     use super::*;
     use crate::index::schema::Pkgname;
 
+    /// Plain paint, always: these pin the block's byte layout, and `cargo
+    /// test` under `makepkg`'s `check()` runs on a tty.
     fn render(info: &SyncInfo) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        info.write_to(&mut buf).unwrap();
+        info.write_to(&mut buf, Paint::Plain).unwrap();
         String::from_utf8(buf).unwrap()
     }
 

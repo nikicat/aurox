@@ -191,7 +191,11 @@ pub enum Paint {
 }
 
 impl Paint {
-    pub(super) const fn colored(self) -> bool {
+    /// Whether this paint emits ANSI codes — the branch every renderer takes
+    /// to pick its styled or plain form. `pub` because renderers live outside
+    /// `ui` too (the `-Si` info block writes through
+    /// [`InfoBlock`](crate::index::info::InfoBlock)).
+    pub const fn colored(self) -> bool {
         matches!(self, Self::Colored)
     }
 
