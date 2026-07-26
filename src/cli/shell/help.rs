@@ -16,7 +16,7 @@ commands:
   review [sel…]         view a PKGBUILD/diff and approve it (no sel = review all)
   approve <sel…>        approve staged AUR packages without a diff (try `approve *`)
   show                  preview the staged transaction
-  apply                 build + install the staged transaction
+  do                    build + install the staged transaction
   undo                  revert the last cart change
   redo                  reapply the last undone change
   clear                 empty the cart
@@ -99,9 +99,9 @@ const TOPICS: &[(Verb, &str)] = &[
     ),
     (
         Verb::Apply,
-        "apply   (aliases: commit, do)\n  \
+        "do   (aliases: apply, commit)\n  \
          Build + install the staged transaction in one sudo batch. Runs only when\n  \
-         every staged package is approved; an interrupted or failed apply drops back\n  \
+         every staged package is approved; an interrupted or failed run drops back\n  \
          to the shell with the cart intact so you can `drop` the offender and retry.",
     ),
     (
@@ -110,7 +110,7 @@ const TOPICS: &[(Verb, &str)] = &[
          Revert the last cart-changing command (add / drop / keep / remove /\n  \
          upgrade / approve / clear) — e.g. undo a `keep` that dropped too much.\n  \
          Steps back through the session's edits; `redo` reapplies. A run\n  \
-         (`apply`) forgets the history.",
+         (`do`) forgets the history.",
     ),
     (
         Verb::Redo,
@@ -191,7 +191,7 @@ mod tests {
         let (flow, env) = dispatch_one("help");
         assert_eq!(flow, Flow::Continue);
         let joined = env.lines.joined();
-        for verb in ["search", "info", "add", "upgrade", "apply", "quit"] {
+        for verb in ["search", "info", "add", "upgrade", "do", "quit"] {
             assert!(joined.contains(verb), "help text missing `{verb}`");
         }
     }

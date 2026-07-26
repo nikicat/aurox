@@ -82,10 +82,6 @@ the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
   package name should mean `add <name>`. Watch the ambiguity with verbs and
   with the selector vocabulary — a bare token that parses as a known verb stays
   a verb.
-- rename `apply` → `do`, demoting `apply` to an alias: `do` is what the action
-  is, and it's already accepted (`ALIASES` in `src/cli/shell/command.rs` maps
-  both `do` and `commit`). Swap the canonical name (`Verb::name`, help text,
-  completion, prompts and docs that say "apply") and keep `apply` working.
 - noticeable delay on exit: quitting takes a visible beat before the
   terminal prompt returns. Not reproducible at fixture scale — the hero
   demo cast measures quit → bash prompt at ~10 ms — so profile against a

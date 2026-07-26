@@ -125,7 +125,7 @@ pub fn exec_pacman(cfg: &Config, argv: &[String]) -> Result<u8> {
 /// The apply-time repo upgrade against the frozen store: stage the store's
 /// sync dbs into the system `DBPath`, then run a plain `pacman -Su` — both
 /// elevated, both disclosed under ONE consent prompt (the repo-half gate of
-/// the shell's `apply`).
+/// the shell's `do`).
 ///
 /// The privileged pacman deliberately never sees `--dbpath`: pointing a
 /// *writing* pacman at the private store destroys its `local` symlink
@@ -160,7 +160,7 @@ pub(crate) fn exec_staged_sysupgrade(
         // refresh rewrites) — say so instead of surfacing a bare exit code.
         return Err(Error::other(format!(
             "staging the frozen sync dbs failed ({e}); pacman was not run — \
-             retry `apply`, or upgrade directly with `sudo pacman -Syu`"
+             retry `do`, or upgrade directly with `sudo pacman -Syu`"
         )));
     }
     preflight_pacman(pacman_argv);

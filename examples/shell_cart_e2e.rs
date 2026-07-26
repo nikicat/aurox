@@ -30,22 +30,24 @@ fn main() {
     pty.send_command("add test-trivial");
     pty.expect("staged test-trivial", |s| s.contains("staged test-trivial"));
 
-    // The approval gate refuses to apply while the AUR item is unreviewed.
-    pty.send_command("apply");
+    // The approval gate refuses to run while the AUR item is unreviewed.
+    // This driver types the canonical `do`; the other shell drivers still
+    // send `apply`, which keeps the alias covered end-to-end.
+    pty.send_command("do");
     // The gate's needle must be its distinct `needs review: <names>` form —
     // the staging status line also says "needs review" (the singular hint),
     // and matching that would race the next send against rustyline's redraw
     // (buffered input is dropped at raw-mode re-entry).
-    pty.expect("apply gated on review", |s| {
+    pty.expect("run gated on review", |s| {
         s.contains("needs review: test-trivial")
     });
 
-    // Approve without opening a diff, then apply for real.
+    // Approve without opening a diff, then run it for real.
     pty.send_command("approve test-trivial");
     pty.expect("approved", |s| s.contains("approved test-trivial"));
 
-    pty.send_command("apply");
-    // The explicit `apply` is the consent — no transaction confirm. The
+    pty.send_command("do");
+    // The explicit `do` is the consent — no transaction confirm. The
     // one-line cost summary prints and the build runs; no deps are pulled in
     // (only_requested), so the first and only prompt is the sudo gate before
     // the privileged `pacman -U`.

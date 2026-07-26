@@ -375,7 +375,7 @@ impl State {
         // Approval doesn't change the install set, so `edit_cart` (no re-resolve)
         // — the frozen resolution is still valid; only the approval cell moved.
         if self.edit_cart(|s| s.approve_targets(targets, env)) == CartEdit::Changed {
-            // The status line surfaces the "all approved — run `apply`" moment
+            // The status line surfaces the "all approved — run `do`" moment
             // the instant the last gate clears (or how many gates remain).
             self.summarize(env);
         }
@@ -1026,7 +1026,7 @@ mod tests {
         env.lines.clear();
         state.dispatch(&command::parse("approve b"), &mut env);
         assert!(
-            env.lines.contains("all approved — run `apply`"),
+            env.lines.contains("all approved — run `do`"),
             "the last approval announces readiness: {:?}",
             env.lines
         );

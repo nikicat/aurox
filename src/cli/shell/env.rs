@@ -393,7 +393,7 @@ impl ShellEnv for RealEnv {
         }
 
         // No table redraw — `show` is where the user looked. No confirm either:
-        // the typed `apply` after the approval gate *is* the informed consent
+        // the typed `do` after the approval gate *is* the informed consent
         // (consent at a decision point — don't double-prompt an explicit
         // command). The one-line cost summary prints as a receipt of what the
         // run is about to do.
@@ -449,7 +449,7 @@ impl ShellEnv for RealEnv {
         }
 
         // Build + install the main AUR (and any fresh-install) half. The
-        // explicit `apply` was the consent, so `apply_plan` doesn't re-ask.
+        // explicit `do` was the consent, so `apply_plan` doesn't re-ask.
         if let Some(plan) = main_plan {
             let main_report = ctx.apply_plan(plan, opts, &mut reviewed)?;
             report.absorb(main_report);

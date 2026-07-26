@@ -78,7 +78,7 @@ impl Verb {
             Self::Review => "review",
             Self::Approve => "approve",
             Self::Show => "show",
-            Self::Apply => "apply",
+            Self::Apply => "do",
             Self::Undo => "undo",
             Self::Redo => "redo",
             Self::Clear => "clear",
@@ -107,8 +107,8 @@ pub const ALIASES: &[(&str, Verb)] = &[
     ("status", Verb::Show),
     ("ls", Verb::Show),
     ("cart", Verb::Show),
+    ("apply", Verb::Apply),
     ("commit", Verb::Apply),
-    ("do", Verb::Apply),
     ("?", Verb::Help),
     ("exit", Verb::Quit),
     ("q", Verb::Quit),
@@ -266,7 +266,7 @@ pub enum Command {
     Approve(Vec<String>),
     /// `show` — preview the staged transaction.
     Show,
-    /// `apply` — build + install the staged transaction.
+    /// `do` — build + install the staged transaction.
     Apply,
     /// `undo` — revert the last cart-changing command.
     Undo,
@@ -469,7 +469,7 @@ mod tests {
         assert_eq!(parse("only x"), Command::Keep(v(&["x"])));
         assert_eq!(parse("up"), Command::Upgrade(v(&[])));
         assert_eq!(parse("commit"), Command::Apply);
-        assert_eq!(parse("do"), Command::Apply);
+        assert_eq!(parse("apply"), Command::Apply);
         assert_eq!(parse("status"), Command::Show);
         assert_eq!(parse("ls"), Command::Show);
         assert_eq!(parse("cart"), Command::Show);
@@ -644,9 +644,9 @@ mod tests {
 
     #[test]
     fn arg_only_verbs_ignore_extra_tokens() {
-        // `show`/`apply`/`clear` take no args in phase 1.
+        // `show`/`do`/`clear` take no args in phase 1.
         assert_eq!(parse("show now please"), Command::Show);
-        assert_eq!(parse("apply"), Command::Apply);
+        assert_eq!(parse("do"), Command::Apply);
     }
 
     #[test]
