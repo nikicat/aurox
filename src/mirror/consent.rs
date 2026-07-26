@@ -42,7 +42,7 @@
 //!
 //! A decline or refusal still refreshes the official sync DBs, still records
 //! the fetch-TTL stamp (so a TTL-driven `upgrade` doesn't re-fetch within
-//! the window), and surfaces as [`RefreshOutcome::AurSkipped`] with its
+//! the window), and surfaces as [`SourceOutcome::Skipped`](super::SourceOutcome) with its
 //! [`SkipCause`] so every caller can word what was skipped.
 
 use crate::config::Config;
@@ -89,16 +89,7 @@ pub enum RefreshReason {
     InstallOffer,
 }
 
-/// What one [`super::cmd_refresh`] actually did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RefreshOutcome {
-    /// AUR mirror + index are current (bootstrap, incremental, or a no-op fetch).
-    Refreshed,
-    /// The AUR half was skipped; the official sync DBs were still refreshed.
-    AurSkipped(SkipCause),
-}
-
-/// Why the AUR half of a refresh was skipped.
+/// Why the AUR source of a refresh was skipped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipCause {
     /// `aur = false` in config.toml — pacman-only mode.

@@ -19,25 +19,52 @@ use crate::ui;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-/// Word one `refresh` outcome — the AUR half only. The repo-database half
-/// reports for itself from inside [`mirror::cmd_refresh`] (refreshed / up to
-/// date / failed) and doesn't run at all when `check_repo_updates` is off,
-/// so any claim about it here would double-report at best and lie at worst.
-/// `None` when there is nothing to say about the AUR half — `refresh pacman`
-/// scoped it out on purpose, so the repo half's own report is the whole story.
-const fn refresh_message(outcome: mirror::RefreshOutcome) -> Option<&'static str> {
-    match outcome {
-        mirror::RefreshOutcome::Refreshed => Some("mirror + index refreshed"),
-        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::NotSetUp) => {
+/// Word what one `refresh` did, a line per source — the sources that *ran*
+/// narrate themselves from inside [`mirror::cmd_refresh`] (the AUR fetch's
+/// progress rows, the sync DBs' refreshed / up-to-date / failed note), so only
+/// the ones that were **skipped** need saying here, in the shell's own
+/// vocabulary. Empty when every source ran and has already spoken for itself.
+fn refresh_messages(outcome: mirror::RefreshOutcome) -> Vec<&'static str> {
+    [aur_message(outcome.aur), repo_message(outcome.repo)]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The AUR source's line. `None` when it refreshed (its own progress said so)
+/// or when `refresh pacman` scoped it out — the user excluded it by naming
+/// another source, so repeating that back is noise.
+const fn aur_message(aur: mirror::SourceOutcome<mirror::SkipCause>) -> Option<&'static str> {
+    match aur {
+        mirror::SourceOutcome::Refreshed => Some("mirror + index refreshed"),
+        mirror::SourceOutcome::Skipped(mirror::SkipCause::NotSetUp) => {
             Some("AUR not synced — `refresh aur` runs the one-time setup")
         }
-        mirror::RefreshOutcome::AurSkipped(
+        mirror::SourceOutcome::Skipped(
             mirror::SkipCause::Declined | mirror::SkipCause::NonInteractive,
         ) => Some("AUR setup skipped — run `refresh aur` when ready"),
-        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::Disabled) => {
+        mirror::SourceOutcome::Skipped(mirror::SkipCause::Disabled) => {
             Some("AUR refresh skipped (aur = false in config.toml)")
         }
-        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::NotRequested) => None,
+        mirror::SourceOutcome::Skipped(mirror::SkipCause::NotRequested) => None,
+    }
+}
+
+/// The repo source's line — the counterpart the shell used to have no way to
+/// print. `Disabled` is worth saying whenever it bites: a `refresh` that
+/// silently left the official DBs alone is exactly the surprise this wording
+/// exists to prevent. `NotRequested` stays quiet for the same reason its AUR
+/// twin does — `refresh aur` named the source it wanted.
+const fn repo_message(repo: mirror::SourceOutcome<mirror::RepoSkip>) -> Option<&'static str> {
+    match repo {
+        mirror::SourceOutcome::Skipped(mirror::RepoSkip::Disabled) => {
+            Some("official-repo refresh skipped (check_repo_updates = false in config.toml)")
+        }
+        // `Refreshed` already narrated itself; `NotRequested` means the user
+        // named another source, so repeating it back is noise. Same silence,
+        // two reasons.
+        mirror::SourceOutcome::Refreshed
+        | mirror::SourceOutcome::Skipped(mirror::RepoSkip::NotRequested) => None,
     }
 }
 
@@ -400,7 +427,7 @@ impl State {
         match env.refresh(scope) {
             Ok(outcome) => {
                 self.drop_cart_on_reload(env);
-                if let Some(msg) = refresh_message(outcome) {
+                for msg in refresh_messages(outcome) {
                     env.print(msg);
                 }
             }
@@ -1071,15 +1098,16 @@ mod tests {
         );
     }
 
-    /// `refresh pacman` scoped the AUR half out on purpose: the repo half
+    /// `refresh pacman` scoped the AUR source out on purpose: the repo source
     /// reports for itself inside `cmd_refresh`, so the dispatch core adds no
     /// line of its own (an "AUR skipped" note would be noise).
     #[test]
     fn refresh_pacman_scope_says_nothing_about_the_aur() {
         let mut env = FakeEnv {
-            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
-                mirror::SkipCause::NotRequested,
-            )),
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Skipped(mirror::SkipCause::NotRequested),
+                repo: mirror::SourceOutcome::Refreshed,
+            }),
             ..FakeEnv::default()
         };
         State::default().dispatch(&command::parse("refresh pacman"), &mut env);
@@ -1087,14 +1115,64 @@ mod tests {
         assert!(env.lines.is_empty(), "{:?}", env.lines);
     }
 
+    /// The repo source's skip is now sayable. Before it was a `bool` consumed
+    /// at the spawn site, so a `refresh` with `check_repo_updates = false` left
+    /// the official DBs alone without a word — exactly the silent surprise the
+    /// AUR source has always been careful to avoid.
+    #[test]
+    fn refresh_words_a_skipped_repo_source() {
+        let mut env = FakeEnv {
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Refreshed,
+                repo: mirror::SourceOutcome::Skipped(mirror::RepoSkip::Disabled),
+            }),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("refresh"), &mut env);
+        // Both sources speak: the AUR one refreshed, the repo one didn't run.
+        assert!(
+            env.lines.contains("mirror + index refreshed"),
+            "{:?}",
+            env.lines
+        );
+        assert!(
+            env.lines
+                .any(|l| l.contains("official-repo refresh skipped")
+                    && l.contains("check_repo_updates")),
+            "{:?}",
+            env.lines
+        );
+    }
+
+    /// `refresh aur` scoped the repo source out by name, so its skip stays
+    /// quiet — the same courtesy `refresh pacman` gets from the AUR source.
+    #[test]
+    fn refresh_aur_says_nothing_about_the_repo_source() {
+        let mut env = FakeEnv {
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Refreshed,
+                repo: mirror::SourceOutcome::Skipped(mirror::RepoSkip::NotRequested),
+            }),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("refresh aur"), &mut env);
+        assert_eq!(
+            env.lines.joined().lines().count(),
+            1,
+            "only the AUR source's line: {:?}",
+            env.lines
+        );
+    }
+
     /// A bare `refresh` in a never-synced session stays pacman-only and
     /// points at `refresh aur` — it must never read as a full refresh.
     #[test]
     fn refresh_not_set_up_words_the_skip_with_the_aur_hint() {
         let mut env = FakeEnv {
-            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
-                mirror::SkipCause::NotSetUp,
-            )),
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Skipped(mirror::SkipCause::NotSetUp),
+                repo: mirror::SourceOutcome::Refreshed,
+            }),
             ..FakeEnv::default()
         };
         State::default().dispatch(&command::parse("refresh"), &mut env);
@@ -1112,9 +1190,10 @@ mod tests {
     #[test]
     fn refresh_decline_words_the_skip() {
         let mut env = FakeEnv {
-            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
-                mirror::SkipCause::Declined,
-            )),
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Skipped(mirror::SkipCause::Declined),
+                repo: mirror::SourceOutcome::Refreshed,
+            }),
             ..FakeEnv::default()
         };
         State::default().dispatch(&command::parse("refresh"), &mut env);
@@ -1123,14 +1202,15 @@ mod tests {
     }
 
     /// Pacman-only mode: `refresh` words the AUR skip and claims nothing
-    /// about the repo half — that half reports for itself from inside
+    /// about the repo source — that source reports for itself from inside
     /// `cmd_refresh`, and doesn't run at all with `check_repo_updates` off.
     #[test]
     fn refresh_disabled_words_the_skip_without_repo_claims() {
         let mut env = FakeEnv {
-            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
-                mirror::SkipCause::Disabled,
-            )),
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Skipped(mirror::SkipCause::Disabled),
+                repo: mirror::SourceOutcome::Refreshed,
+            }),
             ..FakeEnv::default()
         };
         State::default().dispatch(&command::parse("refresh"), &mut env);

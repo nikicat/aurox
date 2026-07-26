@@ -118,11 +118,11 @@ impl ShellEnv for RealEnv {
         // so its fetch skips an unsynced AUR — degrade to repo-only below,
         // but say so: a silent half answer reads as "nothing to upgrade in
         // the AUR". (`Disabled` is the user's standing choice: no note.)
-        if let Some(mirror::RefreshOutcome::AurSkipped(
+        if let Some(mirror::SourceOutcome::Skipped(
             mirror::SkipCause::NotSetUp
             | mirror::SkipCause::Declined
             | mirror::SkipCause::NonInteractive,
-        )) = outcome
+        )) = outcome.map(|o| o.aur)
         {
             ui::note("AUR not synced — upgrades are repo-only; `refresh aur` syncs it");
         }
@@ -136,7 +136,7 @@ impl ShellEnv for RealEnv {
         // reload always carries an outcome.
         Ok(self
             .reload(upgrade::FetchPolicy::Refresh(scope))?
-            .unwrap_or(mirror::RefreshOutcome::Refreshed))
+            .unwrap_or(mirror::RefreshOutcome::REFRESHED))
     }
 
     fn search(&mut self, terms: &[SearchTerm]) -> Result<Vec<ListItem>> {

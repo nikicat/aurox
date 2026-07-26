@@ -143,7 +143,7 @@ impl ShellEnv for FakeEnv {
         self.refresh_scopes.push(scope);
         Ok(self
             .refresh_outcome
-            .unwrap_or(mirror::RefreshOutcome::Refreshed))
+            .unwrap_or(mirror::RefreshOutcome::REFRESHED))
     }
     fn search(&mut self, _terms: &[SearchTerm]) -> Result<Vec<ListItem>> {
         // The numbered table print is RealEnv's side of the seam (like

@@ -8,7 +8,7 @@ use crate::cli::shell;
 use crate::config::{Config, ConfigHandle};
 use crate::error::{Error, Result};
 use crate::index;
-use crate::mirror::{self, RefreshOutcome, RefreshReason, RefreshScope, SkipCause};
+use crate::mirror::{self, RefreshReason, RefreshScope, SkipCause, SourceOutcome};
 use crate::names::{PkgTarget, SearchTerm};
 use crate::pacman::{invoke, sync};
 use crate::ui;
@@ -147,8 +147,8 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
     if refresh {
         // A decline is a choice, not a failure: exit 0, remind how to opt in
         // later. (`Disabled` already printed its own note in the consent plan.)
-        if let RefreshOutcome::AurSkipped(SkipCause::Declined | SkipCause::NonInteractive) =
-            mirror::cmd_refresh(cfg, reason, RefreshScope::Everything)?
+        if let SourceOutcome::Skipped(SkipCause::Declined | SkipCause::NonInteractive) =
+            mirror::cmd_refresh(cfg, reason, RefreshScope::Everything)?.aur
         {
             ui::note("AUR setup skipped — run `aurox -Sy` when ready");
             // The install half below must not re-ask the question this sync
