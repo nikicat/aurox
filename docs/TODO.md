@@ -57,11 +57,6 @@ the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
   *dropped*/skipped and excluded from apply — stable numbering, visible
   decision, trivially undoable by re-adding. Touches the cart model (a per-item
   state, not a `Vec` removal), the change-set renderer, and apply's filter.
-- **bug: adding an already-installed package stages it as new, not an
-  upgrade.** Observed after `add <installed-pkg>`: the cart row shows the
-  install shape instead of `old → new`. The upgrade path gets this right, so
-  the installed-version lookup is missing (or ignored) on the `add` staging
-  path — find the one seam both should route through.
 - bare-token shortcut after a search: entering just a number (`1`, `22`) at the
   prompt should mean `add <number>` against the last search list, and a bare
   package name should mean `add <name>`. Watch the ambiguity with verbs and
