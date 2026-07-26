@@ -231,10 +231,7 @@ impl ShellEnv for RealEnv {
     }
 
     fn aur_policy(&self) -> AurApproval {
-        // The `aur_approval` knob wins when set; unset defers to the legacy
-        // `review_default == "skip"` behaviour. Resolution + fallback live on
-        // the type so they're unit-tested next to it.
-        AurApproval::from_config(self.cfg().aur_approval, &self.cfg().review_default)
+        self.cfg().aur_approval.unwrap_or_default()
     }
 
     fn aur_state(&self) -> index::AurState {

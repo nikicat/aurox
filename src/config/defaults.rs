@@ -29,8 +29,7 @@ pub fn default_config() -> Config {
         privilege_escalator: PrivilegeEscalator::Sudo,
         devel: false,
         check_repo_updates: true,
-        review_default: "prompt".into(),
-        // Unset: `aur_policy` defers to `review_default` for back-compat. Set to
+        // Unset: resolves to `AurApproval::default()`. Set to
         // `Some(AurApproval::{Review,Auto})` in config.toml to pin the gate.
         aur_approval: None,
         // 256 covers ~2 years of dotnet-core-7.0-bin-shaped pkgs (~10

@@ -13,8 +13,7 @@
 //!   (gate)   → Enter passes the sudo `Continue?` gate; pacman -U → clean exit
 //! ```
 //!
-//! The `.sh` sets `review_default = "skip"` so the offer prompt is the only
-//! interactive stop, then asserts the package actually landed.
+//! The `.sh` then asserts the package actually landed.
 
 use pty_harness::Pty;
 

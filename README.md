@@ -126,13 +126,13 @@ makepkg_path         = "makepkg"
 makepkg_args         = ["-s", "--noconfirm", "--needed"]
 privilege_escalator  = "sudo"      # or "doas" / "run0"
 devel                = false
-review_default       = "prompt"    # legacy — only "skip" still matters (see below)
 aur_approval         = "review"    # or "auto" — auto stages AUR pkgs pre-approved
 ```
 
 The shell's approval gate: `review` (default) makes every staged AUR package
 need `review`/`approve` before `do` runs it; `auto` stages them pre-approved.
-If unset, `review_default = "skip"` still auto-approves (legacy behavior).
+(The pre-`aur_approval` `review_default` knob is gone; `review_default =
+"skip"` is now `aur_approval = "auto"`.)
 
 `aur = false` opts out of the AUR half entirely (the shell's first-launch
 question writes it for you if you answer "no"): search, info, install, and
