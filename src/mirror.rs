@@ -163,7 +163,7 @@ pub(crate) fn http_transport_options(
     // also given to the curl backend: gix's check only fires between reads /
     // during its CPU phases, so the curl transfer meter is what aborts a Ctrl+C
     // while gix is parked in a read on an idle or slow socket.
-    opts.should_interrupt = Some(should_interrupt);
+    opts.should_interrupt = Some(should_interrupt.into());
     opts
 }
 

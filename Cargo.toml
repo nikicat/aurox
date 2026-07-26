@@ -66,7 +66,11 @@ path = "src/bin/trace.rs"
 #  - a gix-transport `http::Options::should_interrupt` flag the curl backend
 #    polls in its transfer-meter callback and aborts on — lets a Ctrl+C bail a
 #    fetch parked on an idle/slow socket, which the protocol-level cooperative
-#    check can't reach (see src/mirror.rs `cancel_on_sigint`);
+#    check can't reach (see src/mirror.rs `cancel_on_sigint`). Takes an
+#    `OwnedOrStaticAtomicBool`, so an app whose flag is a `static` flipped by a
+#    signal handler passes it as-is (an `Arc::new()` copy of one would never be
+#    set); aurox's flag is per-operation, so it converts into the `Owned`
+#    variant (PR #2835);
 #  - a `mark mappings` detail span in gix-protocol that splits
 #    `mark_complete_and_common_ref`'s per-mapping loop into `find_ms`
 #    (packed-ref lookup) vs `commit_ms` (ODB/commit-graph load) — the
@@ -102,7 +106,7 @@ path = "src/bin/trace.rs"
 #    thousands-of-refs fetch stays within `ulimit -n`; any error enumerating
 #    loose names disables the snapshot so I/O errors still surface per edit
 #    rather than reading as packed-only (PR #2705).
-gix = { git = "https://github.com/nikicat/gitoxide", rev = "a19c553b7", features = [
+gix = { git = "https://github.com/nikicat/gitoxide", rev = "d2e0c2162", features = [
   # curl-rustls (over reqwest-rust-tls) so gix's low_speed_* / lowSpeedLimit
   # config actually fires — only the curl transport implements it, the
   # reqwest blocking transport silently ignores those fields. Adds libcurl
