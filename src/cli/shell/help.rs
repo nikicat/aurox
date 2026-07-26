@@ -28,7 +28,8 @@ commands:
 selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
            `aur`/`core`/… (whole repo — e.g. `drop aur`, `add extra`)
 a number names a row of the last numbered table printed — the search results
-(`search`) or the transaction (`show`, and `upgrade`/`undo` print through it)";
+(`search`) or the transaction (`show`, and `upgrade`/`undo` print through it)
+a line with no verb stages: `3`, `5-8` or `glibc` alone means `add` that";
 
 /// Per-command help shown by `help <topic>`, keyed by canonical [`Verb`] (the
 /// same order as [`Verb::ALL`]). Each body opens with a usage line (and any
@@ -52,7 +53,11 @@ const TOPICS: &[(Verb, &str)] = &[
         Verb::Add,
         "add <sel…>   (alias: install)\n  \
          Stage packages to install in the pending transaction. Resolves against the\n  \
-         last list, the AUR index, and the sync DBs — you can add anything.",
+         last list, the AUR index, and the sync DBs — you can add anything.\n  \
+         The verb is optional for the unambiguous cases: a line of bare row numbers\n  \
+         (`3`, `5-8`) or a bare package name stages them. Globs and repo words\n  \
+         (`python-*`, `aur`) always need the explicit `add` — one stray token\n  \
+         shouldn't stage a whole repo.",
     ),
     (
         Verb::Drop,

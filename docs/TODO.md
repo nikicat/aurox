@@ -77,11 +77,6 @@ the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
   *dropped*/skipped and excluded from apply — stable numbering, visible
   decision, trivially undoable by re-adding. Touches the cart model (a per-item
   state, not a `Vec` removal), the change-set renderer, and apply's filter.
-- bare-token shortcut after a search: entering just a number (`1`, `22`) at the
-  prompt should mean `add <number>` against the last search list, and a bare
-  package name should mean `add <name>`. Watch the ambiguity with verbs and
-  with the selector vocabulary — a bare token that parses as a known verb stays
-  a verb.
 - noticeable delay on exit: quitting takes a visible beat before the
   terminal prompt returns. Not reproducible at fixture scale — the hero
   demo cast measures quit → bash prompt at ~10 ms — so profile against a

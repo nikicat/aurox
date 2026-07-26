@@ -4,7 +4,7 @@
 //! cart-editing verbs live in [`super::staging`].
 
 use super::cart::{ApplyOutcome, Approval, Cart, CartItem, StageResult};
-use super::command::{Command, ConfigAction, SystemAction, unknown_note};
+use super::command::{Command, ConfigAction, SystemAction};
 use super::help::{HELP_TEXT, help_topic};
 use super::staging::prior_approval;
 use super::{
@@ -178,8 +178,8 @@ impl State {
                 env.print(&format!("syntax error: {msg}"));
                 Flow::Continue
             }
-            Command::Unknown(verb) => {
-                env.print(&unknown_note(verb));
+            Command::Unknown(tokens) => {
+                self.bare_tokens(tokens, env);
                 Flow::Continue
             }
             Command::Help(topic) => {
@@ -656,8 +656,9 @@ impl State {
 
     /// The referent's rows, or an empty slice before any numbered table was
     /// printed (repo-token expansion iterates these; number resolution itself
-    /// goes through the referent for kind-aware errors).
-    fn referent_rows(&self) -> &[ListItem] {
+    /// goes through the referent for kind-aware errors; the bare-token `add`
+    /// shortcut asks whether there's anything for a number to name).
+    pub(super) fn referent_rows(&self) -> &[ListItem] {
         self.referent.as_ref().map_or(&[], |l| &l.rows)
     }
 
