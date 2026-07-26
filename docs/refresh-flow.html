@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>aurox — refresh flow: who fetches, when, and what it costs</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- A thin styled frame around refresh-flow.svg (generated from
+     REFRESH_FLOW.md by rendering its mermaid diagram, then rounding the path
+     coordinates). Same frame as resolution-flow.html — the styles are copied
+     deliberately so the two diagrams read as one pair. Hover reads the embedded
+     SVG's nodes, which needs the page served same-origin (a local `python3 -m
+     http.server`, or GitHub Pages); opened as a bare file:// the diagram still
+     renders, just without the bubbles — the same detail is in
+     REFRESH_FLOW.md. -->
+<style>
+  :root{
+    --bg:#0d1017;--panel:#141a22;--line:#26303c;--line-2:#38465a;
+    --ink:#dbe3ee;--muted:#93a1b4;--faint:#6b7889;
+    --amber:#e6a95c;--red:#e5776f;--teal:#5fc7ba;--violet:#9d8cf5;--green:#67c98a;
+    --mono:ui-monospace,"JetBrains Mono","SF Mono",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  }
+  *{box-sizing:border-box;}
+  html{color-scheme:dark;}
+  body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);line-height:1.5;}
+  /* Twice the frame of resolution-flow.html: this diagram is far wider (four
+     trigger lanes funnelling into one), so at 1120px mermaid scaled it to ~55%
+     and the labels went unreadable. The prose blocks keep their own 74ch cap,
+     so only the board actually uses the extra width. */
+  .wrap{max-width:2240px;margin:0 auto;padding:clamp(1.4rem,3.5vw,3rem) clamp(1rem,3vw,2rem) 5rem;}
+  .eyebrow{font-family:var(--mono);font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--teal);margin:0 0 .8rem;font-weight:600;}
+  h1{font-family:var(--mono);font-weight:650;font-size:clamp(1.35rem,3.2vw,1.95rem);line-height:1.15;letter-spacing:-.01em;margin:0 0 .7rem;text-wrap:balance;}
+  .lede{color:var(--muted);max-width:74ch;margin:0;font-size:1.02rem;}
+  .lede code,.lede b{font-family:var(--mono);}
+  .lede code{font-size:.85em;color:var(--ink);background:#1a212b;padding:.06em .34em;border-radius:4px;}
+  .lede b{color:var(--ink);font-weight:600;}
+  .shift{margin:1.1rem 0 0;padding:.7rem .95rem;background:#10302d33;border:1px solid #2f5b53;border-radius:9px;font-size:.92rem;color:var(--ink);max-width:74ch;}
+  .shift b{font-family:var(--mono);color:var(--teal);}
+  .shift .old{color:var(--faint);text-decoration:line-through;text-decoration-color:#54606f;}
+  .hint{margin:1rem 0 0;font-size:.85rem;color:var(--amber);display:inline-flex;align-items:center;gap:.5rem;font-weight:500;}
+  .hint .ic{width:17px;height:17px;border-radius:50%;border:1px solid var(--amber);color:var(--amber);font-size:.68rem;display:inline-flex;align-items:center;justify-content:center;font-family:var(--mono);}
+  .legend{display:flex;flex-wrap:wrap;gap:.5rem 1.3rem;margin:1.2rem 0 0;font-family:var(--mono);font-size:.74rem;color:var(--muted);}
+  .legend span{display:inline-flex;align-items:center;gap:.5rem;}
+  .sw{width:20px;height:14px;border:1.5px solid var(--c,var(--line-2));display:inline-block;border-radius:3px;}
+  .sw.user{--c:var(--violet);border-radius:9px;}
+  .sw.dec{--c:#6b7d95;transform:skewX(-12deg);border-radius:0;}
+  .sw.eng{--c:var(--teal);}
+  .sw.act{--c:var(--amber);}
+  .sw.done{--c:var(--green);}
+  .sw.stop{--c:var(--red);}
+
+  /* The board scrolls, the page never does: a window narrower than the
+     diagram gets a horizontal scrollbar HERE rather than shrinking the chart
+     to illegibility. */
+  .board{margin:1.6rem 0 0;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:clamp(.6rem,2vw,1.4rem);overflow-x:auto;}
+  /* The diagram is resolution-flow.svg, embedded so its nodes stay reachable for
+     the hover bubbles. aspect-ratio matches the SVG viewBox so the whole chart
+     shows without an inner scrollbar. */
+  /* This diagram's own viewBox — an inherited ratio letterboxes the SVG. */
+  #flow{display:block;width:100%;min-width:2826px;aspect-ratio:2825.38 / 4448.75;border:0;background:var(--bg);}
+
+  #bubble{position:fixed;z-index:50;max-width:390px;background:#0a0d13;border:1px solid var(--line-2);border-radius:11px;padding:.85rem 1rem;box-shadow:0 14px 40px #000b;opacity:0;visibility:hidden;transform:translateY(4px);transition:opacity .12s,transform .12s;pointer-events:none;}
+  #bubble.on{opacity:1;visibility:visible;transform:translateY(0);}
+  #bubble .bt{font-family:var(--mono);font-size:.78rem;color:var(--teal);margin:0 0 .4rem;font-weight:600;}
+  #bubble p{margin:0;font-size:.86rem;color:var(--ink);line-height:1.5;}
+  #bubble p+p{margin-top:.5rem;color:var(--muted);}
+  #bubble .why{color:var(--amber);}
+  #bubble code{font-family:var(--mono);font-size:.82em;color:var(--teal);background:#10302d44;padding:.04em .3em;border-radius:4px;}
+  footer{margin-top:2.4rem;padding-top:1rem;border-top:1px solid var(--line);font-family:var(--mono);font-size:.73rem;color:var(--faint);}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <p class="eyebrow">aurox · every path that touches the network for package data</p>
+    <h1>A fetch is never silent — and <code>upgrade</code> fetches on a TTL, not every time.</h1>
+    <p class="lede">
+      What <b>you</b> type (violet), the <b>decisions</b> aurox makes (diamonds), the
+      <b>engine</b> steps (teal), the <b>network work</b> itself (amber), and every
+      <b>end state</b> — the session's package data is current (green) or the command
+      stopped (red).
+    </p>
+    <p class="shift">
+      <b>The three properties.</b> The one expensive thing here — the ~2&nbsp;GiB bootstrap
+      clone — is announced and consented to at a moment you can think about it, and
+      <b>which trigger asked</b> decides whether it may even be offered. <code>upgrade</code>
+      re-fetches only past <code>refresh_max_age_secs</code> (default 1&nbsp;h);
+      <code>refresh</code> is the always-fetch command. And the TTL stamp belongs to the
+      <b>AUR</b>, so a repo-only refresh never suppresses an AUR fetch you still need.
+    </p>
+    <p class="hint"><span class="ic">ⓘ</span> hover any diamond, engine step, or amber action for what it means + the why</p>
+    <div class="legend" aria-hidden="true">
+      <span><i class="sw user"></i> you type it</span>
+      <span><i class="sw dec"></i> decision</span>
+      <span><i class="sw eng"></i> engine step</span>
+      <span><i class="sw act"></i> network work</span>
+      <span><i class="sw done"></i> data current</span>
+      <span><i class="sw stop"></i> stopped</span>
+    </div>
+  </header>
+
+  <div class="board">
+    <object id="flow" type="image/svg+xml" data="refresh-flow.svg" aria-label="aurox refresh flow chart"></object>
+  </div>
+
+  <footer>companion to <a href="resolution-flow.html" style="color:inherit">resolution-flow</a> — this is how the data gets current, that is what happens to a cart built from it</footer>
+</div>
+
+<div id="bubble" role="tooltip"></div>
+
+<script>
+  const DESC = {
+    ttl:{t:"the TTL — the difference between upgrade and refresh",
+      b:["<code>upgrade</code> hits the network only once the mirror is older than <code>refresh_max_age_secs</code> (default 1&nbsp;h). Inside the window it reloads the index from disk — no round-trip — so back-to-back upgrades are cheap and an external <code>pacman -Sy</code> is still picked up.",
+         "<span class='why'>No stamp at all (never synced) or an unreadable one reads as stale, so a fresh session fetches. A stamp in the future — the clock moved back — reads as age zero rather than re-fetching forever.</span>"]},
+    CR:{t:"cmd_refresh — one function, six callers",
+      b:["Every path that touches package data funnels here carrying <b>who asked</b> (<code>RefreshReason</code>) and <b>how much</b> (<code>RefreshScope</code>).",
+         "<span class='why'>Consent is resolved BEFORE the progress display exists: dialoguer and indicatif both draw on the terminal, and a prompt under live progress rows gets clobbered by redraws.</span>"]},
+    pOnly:{t:"repo-only scope",
+      b:["<code>refresh pacman</code> excludes the AUR half — consent included, so it can never prompt for a bootstrap.",
+         "The skip is still typed (<code>NotRequested</code>) so callers can word it, and it deliberately does NOT stamp the TTL."]},
+    cons:{t:"consent::plan — two pure decisions",
+      b:["First what the AUR half <i>wants</i> (<code>decide</code>), then how a wanted bootstrap obtains consent (<code>consent_mode</code>). Both are pure functions with the whole table in the module doc of <code>mirror/consent.rs</code>.",
+         "<span class='why'>Complicated decision logic gets a table and parameter-injected decision functions — not availability checks scattered across call sites.</span>"]},
+    aurOff:{t:"pacman-only mode",
+      b:["<code>aur = false</code> in config.toml skips the AUR half entirely, prompts included.",
+         "<span class='why'>A standing choice is never re-litigated — the shell's first-launch question writes it for you if you answer &quot;no&quot;.</span>"]},
+    have:{t:"is there a mirror to fetch into?",
+      b:["A ready mirror takes the incremental path and <b>never prompts</b>. Absent, or interrupted (a partial clone), means a bootstrap is needed — and <code>-Syy</code> forces one over a perfectly good mirror on purpose.",
+         "<span class='why'>&quot;Interrupted&quot; is derived from the artifact itself (an empty <code>refs/heads/*</code>), not from a sidecar sentinel file.</span>"]},
+    ask:{t:"may THIS trigger spring a ~2 GiB clone?",
+      b:["The load-bearing row. <code>refresh aur</code> and a &quot;yes&quot; at the launch question are <b>pre-consented</b> — the cost was already announced, and naming the AUR after that IS the answer, so there's no second Y/n.",
+         "<code>-Sy</code> / <code>-Syy</code> and the implicit triggers announce the cost and ask.",
+         "<span class='why'>The bare <code>refresh</code> and <code>upgrade</code>'s TTL fetch refuse QUIETLY: someone who answered &quot;later&quot; at launch must not get a 10-minute clone out of an unrelated command. Consent belongs at a decision point, not at whatever call site happens to trigger it.</span>"]},
+    fork:{t:"⑂ where concurrency actually starts",
+      b:["Everything above is sequential: each source is DECIDED first — <code>consent::plan</code> for the AUR while it still has the terminal to itself, <code>RepoPlan::decide</code> for the sync DBs.",
+         "Only here does <code>context::scope</code> spawn the sync thread — and only when there is repo work to do — so the sources overlap for the duration of the real work.",
+         "<span class='why'>A prompt can never race a progress redraw, because no progress display exists until the question has been answered.</span>"]},
+    join:{t:"⑃ join — every source settled",
+      b:["The scoped thread is joined before anything downstream runs, so the stamp and the reload see a settled state.",
+         "<span class='why'>Structured concurrency: the borrow of <code>cfg</code>/<code>mp</code> can't outlive the scope, so no Arc and no detached thread.</span>"]},
+    aurRun:{t:"the AUR source — on this thread",
+      b:["Runs whatever was decided: an incremental fetch, a bootstrap (wipe → clone → full index build → seed the commit-graph), or nothing at all.",
+         "<span class='why'>It keeps the foreground thread so its progress UI stays responsive while the repo download runs beside it.</span>"]},
+    repoPlan:{t:"the repo source's decision — a value, not a branch",
+      b:["Settled beside the AUR one and <i>before</i> any work starts, so \"the repo DBs weren't refreshed, because X\" travels out with the outcome.",
+         "It used to be a bare <code>run_repo</code> bool consumed at the spawn site, which collapsed the two reasons into one flag — so a <code>refresh</code> with <code>check_repo_updates = false</code> left the official DBs alone without a word.",
+         "<span class='why'>Pure and parameter-injected, like the consent decision: the scope wins first (<code>refresh aur</code> asked for one source by name), then the config knob.</span>"]},
+    dbs:{t:"the repo source — on the spawned thread",
+      b:["libalpm's db download, drawing its own rows into the same progress display as the AUR fetch."]},
+    stamp:{t:"who gets to stamp the TTL",
+      b:["Only a run that could have moved the mirror: scope ≠ <code>Pacman</code>, and the AUR half returned <code>Ok</code>.",
+         "A <i>skip</i> stamps deliberately — a declined bootstrap must not re-prompt on every TTL-driven <code>upgrade</code> inside the window.",
+         "<span class='why'>A repo-only refresh never stamps: the mirror wasn't touched, and claiming otherwise would make the next upgrade skip a fetch you still need.</span>"]},
+    load:{t:"absent provider = empty provider",
+      b:["The index loads as an <b>empty</b> set when there's none on disk — never as an error.",
+         "<span class='why'>One uniform data path downstream; the AUR's state is consulted only to word hints, never to branch the data flow.</span>"]},
+    who:{t:"what the caller does once the data is current",
+      b:["<code>refresh</code> drops the cart — the frozen plan was resolved against DBs that just moved.",
+         "<code>upgrade</code> recomputes the candidates and <b>replaces</b> the cart: clear, seed, resolve once, so a mid-set resolver error rejects the whole seed and leaves the old cart intact."]},
+    dropc:{t:"refresh drops the cart",
+      b:["The whole cart goes — installs, removals, the frozen resolution, undo/redo — rather than apply a transaction resolved against stale data.",
+         "<span class='why'>refresh is the ONLY point the DBs move between add and apply, which is exactly what keeps the frozen plan valid the rest of the time.</span>"]},
+    ctrlc:{t:"Ctrl-C during a fetch",
+      b:["Interrupts every layer — gix, curl, and libalpm's downloader via the fetch callback — and lands you back at the prompt with the shell alive.",
+         "<span class='why'>But it abandons the WHOLE command: an interrupted <code>upgrade</code> stages nothing, even when the repo half is already current. That's the open rough edge — see the TODO.</span>"]},
+    noFetch:{t:"the cheap path",
+      b:["Inside the TTL there is no network at all — just a reload of the on-disk index, so <code>search</code> / <code>info</code> / completion still see whatever a `pacman -Sy` did outside aurox."]},
+  };
+
+  const bubble = document.getElementById('bubble');
+  const obj = document.getElementById('flow');
+
+  function show(key, nodeRect){
+    const d = DESC[key]; if(!d) return;
+    bubble.innerHTML = "<p class='bt'>"+d.t+"</p>"+d.b.map(x=>"<p>"+x+"</p>").join("");
+    bubble.classList.add('on');
+    const o = obj.getBoundingClientRect();
+    const left0 = o.left + nodeRect.left, bottom0 = o.top + nodeRect.bottom, top0v = o.top + nodeRect.top;
+    const bw = Math.min(390, window.innerWidth-24);
+    const left = Math.max(12, Math.min(left0 + nodeRect.width/2 - bw/2, window.innerWidth - bw - 12));
+    let top = bottom0 + 10;
+    if(top + bubble.offsetHeight > window.innerHeight - 12) top = top0v - bubble.offsetHeight - 10;
+    bubble.style.left = left+'px'; bubble.style.top = Math.max(12, top)+'px';
+  }
+  const hide = () => bubble.classList.remove('on');
+
+  function wire(){
+    let doc;
+    try { doc = obj.contentDocument; } catch(e) { doc = null; }
+    if(!doc) return false;                     // cross-origin (bare file://) — diagram shows, no bubbles
+    const nodes = doc.querySelectorAll('g.node');
+    if(!nodes.length) return false;
+    nodes.forEach(g=>{
+      const m = (g.id||'').match(/flowchart-([A-Za-z0-9]+?)(?:-\d+)?$/);
+      const key = m && m[1];
+      if(key && DESC[key]){
+        g.style.cursor = 'help';
+        g.addEventListener('mouseenter', ()=>show(key, g.getBoundingClientRect()));
+        g.addEventListener('mouseleave', hide);
+      }
+    });
+    return true;
+  }
+  obj.addEventListener('load', () => { let t=0; const iv=setInterval(()=>{ if(wire()||++t>60) clearInterval(iv); }, 100); });
+  window.addEventListener('scroll', hide, true);
+</script>
+</body>
+</html>
