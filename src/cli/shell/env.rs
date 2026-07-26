@@ -18,7 +18,7 @@ use crate::cli::search::{Row, rank_rows};
 use crate::config::{Config, ConfigHandle, ConfigPath};
 use crate::error::{Error, Result};
 use crate::index::info::{self, InfoLookup};
-use crate::index::{self, AurIndexData, IndexEntry};
+use crate::index::{self, AurIndexData};
 use crate::mirror::{self, MirrorRepo};
 use crate::names::{PkgBase, PkgName, PkgTarget, RepoName, SearchTerm};
 use crate::pacman::alpm_db::{self, PacmanIndex};
@@ -393,7 +393,7 @@ impl ShellEnv for RealEnv {
         }
 
         // No table redraw — `show` is where the user looked. No confirm either:
-        // the typed `apply` after the approval gate *is* the informed consent
+        // the typed `do` after the approval gate *is* the informed consent
         // (consent at a decision point — don't double-prompt an explicit
         // command). The one-line cost summary prints as a receipt of what the
         // run is about to do.
@@ -449,7 +449,7 @@ impl ShellEnv for RealEnv {
         }
 
         // Build + install the main AUR (and any fresh-install) half. The
-        // explicit `apply` was the consent, so `apply_plan` doesn't re-ask.
+        // explicit `do` was the consent, so `apply_plan` doesn't re-ask.
         if let Some(plan) = main_plan {
             let main_report = ctx.apply_plan(plan, opts, &mut reviewed)?;
             report.absorb(main_report);
@@ -926,10 +926,13 @@ fn txn_roots(cart: &Cart, aur_data: &AurIndexData, size_pac: &PacmanIndex) -> Ve
         .collect()
 }
 
-/// The `(old, new)` versions for a row: an upgrade carries both; a fresh install
-/// has no `old` and takes `new` from the AUR index (AUR rows) or the synced
-/// syncdb (repo rows). Either fresh lookup may miss → `None` (the renderer then
-/// leaves the version cell blank but aligned).
+/// The `(old, new)` versions for a row: an `upgrade`-seeded row carries both;
+/// anything else resolves the pair live — `new` from the AUR index (AUR rows)
+/// or the synced syncdb (repo rows), `old` from what pacman has installed. An
+/// `add`ed package that is already installed is an upgrade too, so it renders
+/// `old → new` rather than the fresh-install shape; `old` stays `None` only
+/// when nothing is installed. Either lookup may miss → `None` (the renderer
+/// then leaves that half of the version cell blank but aligned).
 fn row_versions(
     it: &CartItem,
     aur_data: &AurIndexData,
@@ -938,11 +941,27 @@ fn row_versions(
     if let Some(u) = &it.upgrade {
         return (Some(u.old_ver.clone()), Some(u.new_ver.clone()));
     }
-    let new = match it.source {
-        Source::Aur => aur_data.entry(it.spec()).map(IndexEntry::version),
-        Source::Repo => size_pac.sync_version(it.spec().as_str()).map(Version::from),
-    };
-    (None, new)
+    match it.source {
+        Source::Aur => {
+            let Some(entry) = aur_data.entry(it.spec()) else {
+                return (None, None);
+            };
+            // The same counterpart lookup `upgrade` makes (pkgname → replaces
+            // → provides, biased by the row's hint), so an AUR row finds the
+            // pkg it displaces even when the pkgbase isn't the installed
+            // pkgname (a split member, a rename via `provides=`).
+            let old = size_pac
+                .counterpart_with_hint(entry, it.target.hint.as_ref())
+                .map(|c| Version::from(c.version));
+            (old, Some(entry.version()))
+        }
+        Source::Repo => (
+            size_pac
+                .installed_version(&PkgName::from(it.spec().as_str()))
+                .map(Version::from),
+            size_pac.sync_version(it.spec().as_str()).map(Version::from),
+        ),
+    }
 }
 
 /// The AUR pkgbase's "last modified" age (its branch-tip commit time vs `now`),
@@ -1001,6 +1020,63 @@ mod tests {
     use super::*;
 
     use crate::cli::shell::testenv::up;
+
+    /// `add`ing a package that is already installed is an upgrade, not a fresh
+    /// install: both lanes resolve an `old` version — the repo lane straight
+    /// from localdb, the AUR lane through the counterpart walk (so a pkgbase
+    /// finds the split member it displaces). A not-installed row still has no
+    /// `old`, which is what renders the fresh-install shape.
+    #[test]
+    fn row_versions_reads_the_installed_version_for_a_plain_add() {
+        use super::super::cart::{AurApproval, Source};
+        use crate::index::schema::{IndexEntry, IndexFile, Pkgname};
+
+        let mut pac = PacmanIndex::default();
+        pac.installed.insert("vim".into(), Version::from("9.1-1"));
+        pac.installed
+            .insert("bisq-desktop".into(), Version::from("1.9.0-1"));
+        pac.sync_versions
+            .insert("vim".into(), Version::from("9.1-2"));
+        pac.sync_versions
+            .insert("htop".into(), Version::from("3.3.0-1"));
+        let aur = AurIndexData::from_index(IndexFile {
+            entries: vec![IndexEntry {
+                pkgbase: "bisq".into(),
+                pkgnames: vec![Pkgname {
+                    name: "bisq-desktop".into(),
+                    provides: Vec::new(),
+                    pkgdesc: None,
+                }],
+                pkgver: "1.9.1".into(),
+                pkgrel: "1".into(),
+                ..Default::default()
+            }],
+            ..IndexFile::empty()
+        });
+        let row = |spec: &str, source| {
+            let it = CartItem::new(PkgTarget::new(spec), source, None, AurApproval::Review);
+            let (old, new) = row_versions(&it, &aur, &pac);
+            (
+                old.map(|v| v.as_str().to_owned()),
+                new.map(|v| v.as_str().to_owned()),
+            )
+        };
+        assert_eq!(
+            row("vim", Source::Repo),
+            (Some("9.1-1".to_owned()), Some("9.1-2".to_owned())),
+            "an installed repo package renders old → new"
+        );
+        assert_eq!(
+            row("htop", Source::Repo),
+            (None, Some("3.3.0-1".to_owned())),
+            "a not-installed repo package stays a fresh install"
+        );
+        assert_eq!(
+            row("bisq", Source::Aur),
+            (Some("1.9.0-1".to_owned()), Some("1.9.1-1".to_owned())),
+            "an AUR pkgbase finds the installed member it displaces"
+        );
+    }
 
     /// The flat fallback keeps `show` alive when the resolve fails: the note
     /// names the error, every staged item renders as an aligned numbered row,

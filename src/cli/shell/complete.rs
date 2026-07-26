@@ -10,7 +10,7 @@
 //! | arg of `drop` / `keep` / `review` / `approve` / `upgrade` | names currently in the cart |
 //! | arg of `help` | command verbs |
 //! | arg of `system` / `refresh` | their sub-words (`show`/`prune`, `aur`/`pacman`) |
-//! | a numeric token, or an arg of `show`/`apply`/… | nothing |
+//! | a numeric token, or an arg of `show`/`do`/… | nothing |
 //!
 //! The active verb is recovered by parsing the line *before* the word under the
 //! cursor with the real [`command::parse`] — so aliases (`install`, `up`, …)
@@ -53,7 +53,7 @@ enum ArgKind {
     Universe,
     /// `drop`/`keep`/`review`/`approve`/`upgrade` — names currently in the cart.
     Cart,
-    /// `show`/`apply`/`clear`/`quit` — nothing to complete.
+    /// `show`/`do`/`clear`/`quit` — nothing to complete.
     None,
 }
 
@@ -158,7 +158,7 @@ pub struct ShellHelper {
     /// or `--color never` session, and every unit test).
     first_key: Option<mpsc::Sender<()>>,
     /// The ambient next-step suggestion shown dimmed at a *wholly empty* prompt
-    /// (`add <number|pkgname>`, `review`, `apply`) — the session's one obvious
+    /// (`add <number|pkgname>`, `review`, `do`) — the session's one obvious
     /// next action, computed by
     /// [`State::empty_line_hint`](super::State::empty_line_hint) and refreshed
     /// by [`sync`](Self::sync) after each command. `None` when the session has
@@ -217,7 +217,7 @@ impl ShellHelper {
             let mut cands = word_candidates(verb_names(), word);
             // On an empty prompt the dimmed hint already suggests one verb;
             // float it to the front so the first Tab completes to what the user
-            // sees (`apply`), not whatever `Verb::ALL` happens to list first
+            // sees (`do`), not whatever `Verb::ALL` happens to list first
             // (`search`). Every verb is still offered — just reordered.
             if word.is_empty() {
                 self.promote_hinted_verb(&mut cands);
@@ -244,7 +244,7 @@ impl ShellHelper {
         (start, cands)
     }
 
-    /// The canonical verb the ambient empty-line hint leads with (`apply`,
+    /// The canonical verb the ambient empty-line hint leads with (`do`,
     /// `review`, `add`), or `None` when there's no hint. The hint is a
     /// `<verb> …` template ([`State::empty_line_hint`](super::State::empty_line_hint)),
     /// so its first whitespace-delimited token is the verb.
@@ -564,8 +564,9 @@ mod tests {
         // `sea` is unique to `search`; the trailing space readies the cursor
         // for an argument.
         assert_eq!(complete(&h, "sea"), vec!["search "]);
-        // `ap` is shared, so both survivors keep the trailing space.
-        assert_eq!(complete(&h, "ap"), vec!["approve ", "apply "]);
+        // `appr` is unique now that `apply` is an alias (completion stays
+        // canonical-only), so it completes to the one survivor.
+        assert_eq!(complete(&h, "appr"), vec!["approve "]);
     }
 
     #[test]
@@ -583,14 +584,14 @@ mod tests {
 
     #[test]
     fn empty_prompt_tab_leads_with_the_hinted_verb() {
-        // The bug: the dimmed hint says `apply`, but Tab on the empty line
+        // The bug: the dimmed hint says `do`, but Tab on the empty line
         // completed `search` (the first `Verb::ALL` entry). With a hint synced
         // in, the hinted verb floats to the front so Tab agrees with what's
         // shown — while still offering every verb (order aside).
         let mut h = helper(&[], &[]);
-        h.empty_hint = Some("apply".to_owned());
+        h.empty_hint = Some("do".to_owned());
         let got = complete(&h, "");
-        assert_eq!(got.first().map(String::as_str), Some("apply "));
+        assert_eq!(got.first().map(String::as_str), Some("do "));
         assert_eq!(got.len(), Verb::ALL.len(), "every verb still offered");
 
         // The `add <number|pkgname>` hint promotes its verb (`add`) the same way.
@@ -726,7 +727,7 @@ mod tests {
     fn no_arg_verbs_complete_nothing() {
         let h = helper(&["showcase"], &[]);
         assert!(complete(&h, "show s").is_empty());
-        assert!(complete(&h, "apply x").is_empty());
+        assert!(complete(&h, "do x").is_empty());
     }
 
     #[test]
@@ -768,17 +769,18 @@ mod tests {
         // the first (VERBS order → `remove`). Trailing space rides along so
         // accepting readies the cursor for an argument.
         assert_eq!(hint(&h, "re").as_deref(), Some("move "));
-        // `app` matches both approve and apply; VERBS order puts approve first.
+        // `app` matches only `approve` — `apply` is an alias, and completion
+        // stays canonical-only.
         assert_eq!(hint(&h, "app").as_deref(), Some("rove "));
         // A prefix unique to one verb hints the rest of it.
-        assert_eq!(hint(&h, "appl").as_deref(), Some("y "));
+        assert_eq!(hint(&h, "appro").as_deref(), Some("ve "));
     }
 
     #[test]
     fn a_fully_typed_verb_hints_nothing() {
         let h = helper(&[], &[]);
         // The only remaining "completion" is the trailing space — not worth a hint.
-        assert_eq!(hint(&h, "apply"), None);
+        assert_eq!(hint(&h, "do"), None);
     }
 
     #[test]

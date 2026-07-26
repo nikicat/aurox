@@ -78,7 +78,7 @@ impl Verb {
             Self::Review => "review",
             Self::Approve => "approve",
             Self::Show => "show",
-            Self::Apply => "apply",
+            Self::Apply => "do",
             Self::Undo => "undo",
             Self::Redo => "redo",
             Self::Clear => "clear",
@@ -107,8 +107,8 @@ pub const ALIASES: &[(&str, Verb)] = &[
     ("status", Verb::Show),
     ("ls", Verb::Show),
     ("cart", Verb::Show),
+    ("apply", Verb::Apply),
     ("commit", Verb::Apply),
-    ("do", Verb::Apply),
     ("?", Verb::Help),
     ("exit", Verb::Quit),
     ("q", Verb::Quit),
@@ -266,7 +266,7 @@ pub enum Command {
     Approve(Vec<String>),
     /// `show` — preview the staged transaction.
     Show,
-    /// `apply` — build + install the staged transaction.
+    /// `do` — build + install the staged transaction.
     Apply,
     /// `undo` — revert the last cart-changing command.
     Undo,
@@ -291,8 +291,12 @@ pub enum Command {
     Quit,
     /// Blank or whitespace-only line — a no-op.
     Empty,
-    /// First token didn't match any known verb; carries the verb as typed.
-    Unknown(String),
+    /// The line doesn't open with a verb — carries every token as typed, the
+    /// first being the word that failed to match. Never empty (it is only
+    /// built from a successfully split first token). Dispatch decides what a
+    /// verbless line means: row numbers and known package names are the bare
+    /// `add` shortcut, anything else the unknown-command note.
+    Unknown(Vec<String>),
     /// The line couldn't be tokenized (e.g. an unbalanced quote); carries the
     /// tokenizer's message.
     Syntax(String),
@@ -329,9 +333,10 @@ impl Command {
 
 /// Parse one input line into a [`Command`].
 ///
-/// Never fails: tokenizer errors become [`Command::Syntax`] and an unrecognized
-/// verb becomes [`Command::Unknown`], so a bad line reports and the REPL keeps
-/// going rather than aborting the session.
+/// Never fails: tokenizer errors become [`Command::Syntax`] and a line that
+/// doesn't open with a verb becomes [`Command::Unknown`] (which dispatch may
+/// still read as the bare-token `add` shortcut), so a bad line reports and the
+/// REPL keeps going rather than aborting the session.
 pub fn parse(line: &str) -> Command {
     let tokens = match shell_words::split(line) {
         Ok(t) => t,
@@ -342,7 +347,7 @@ pub fn parse(line: &str) -> Command {
     };
     let args = args.to_vec();
     let Some(v) = verb_for(&verb.to_ascii_lowercase()) else {
-        return Command::Unknown(verb.clone());
+        return Command::Unknown(tokens);
     };
     match v {
         Verb::Search => Command::Search(args.into_iter().map(SearchTerm::from).collect()),
@@ -377,16 +382,18 @@ pub fn parse(line: &str) -> Command {
     }
 }
 
-/// The message for an unrecognized first word.
+/// The message for a first word that dispatch couldn't act on.
 ///
-/// A near-miss of a verb or alias gets "did you mean", an all-digit word gets
-/// the row-selection hint (numbers are selectors, not commands), and anything
-/// else is offered as a search — the launch shortcut (`aurox <term>`) already
-/// gives bare terms that meaning.
+/// A row-shaped word (`3`, `5-8`) only reaches here when no numbered table is
+/// on screen — with one up it stages, via the bare-token shortcut — so the
+/// note says what's missing rather than teaching selector syntax. A near-miss
+/// of a verb or alias gets "did you mean", and anything else is offered as a
+/// search — the launch shortcut (`aurox <term>`) already gives bare terms that
+/// meaning.
 pub fn unknown_note(word: &str) -> String {
-    if word.bytes().all(|b| b.is_ascii_digit()) {
+    if super::selector::is_row_token(word) {
         return format!(
-            "unknown command `{word}` — numbers select rows for a verb, e.g. `add {word}` or `info {word}`"
+            "`{word}` names a row, but no numbered list is on screen — run `search <term>` or `show` first"
         );
     }
     let lower = word.to_ascii_lowercase();
@@ -469,7 +476,7 @@ mod tests {
         assert_eq!(parse("only x"), Command::Keep(v(&["x"])));
         assert_eq!(parse("up"), Command::Upgrade(v(&[])));
         assert_eq!(parse("commit"), Command::Apply);
-        assert_eq!(parse("do"), Command::Apply);
+        assert_eq!(parse("apply"), Command::Apply);
         assert_eq!(parse("status"), Command::Show);
         assert_eq!(parse("ls"), Command::Show);
         assert_eq!(parse("cart"), Command::Show);
@@ -498,7 +505,10 @@ mod tests {
 
     #[test]
     fn unknown_verb_carries_token() {
-        assert_eq!(parse("frobnicate x"), Command::Unknown("frobnicate".into()));
+        assert_eq!(
+            parse("frobnicate x"),
+            Command::Unknown(v(&["frobnicate", "x"]))
+        );
     }
 
     #[test]
@@ -547,11 +557,18 @@ mod tests {
         );
     }
 
+    /// Row-shaped words (a number or a range) reach `unknown_note` only when
+    /// nothing numbered is on screen — otherwise the bare-token shortcut
+    /// stages them — so the note names the missing list, not the syntax.
     #[test]
-    fn unknown_note_teaches_that_numbers_are_selectors() {
+    fn unknown_note_points_at_the_missing_list_for_row_tokens() {
         assert_eq!(
             unknown_note("3"),
-            "unknown command `3` — numbers select rows for a verb, e.g. `add 3` or `info 3`"
+            "`3` names a row, but no numbered list is on screen — run `search <term>` or `show` first"
+        );
+        assert_eq!(
+            unknown_note("5-8"),
+            "`5-8` names a row, but no numbered list is on screen — run `search <term>` or `show` first"
         );
     }
 
@@ -644,9 +661,9 @@ mod tests {
 
     #[test]
     fn arg_only_verbs_ignore_extra_tokens() {
-        // `show`/`apply`/`clear` take no args in phase 1.
+        // `show`/`do`/`clear` take no args in phase 1.
         assert_eq!(parse("show now please"), Command::Show);
-        assert_eq!(parse("apply"), Command::Apply);
+        assert_eq!(parse("do"), Command::Apply);
     }
 
     #[test]

@@ -16,7 +16,7 @@ commands:
   review [sel…]         view a PKGBUILD/diff and approve it (no sel = review all)
   approve <sel…>        approve staged AUR packages without a diff (try `approve *`)
   show                  preview the staged transaction
-  apply                 build + install the staged transaction
+  do                    build + install the staged transaction
   undo                  revert the last cart change
   redo                  reapply the last undone change
   clear                 empty the cart
@@ -28,7 +28,8 @@ commands:
 selectors: `3` (row), `5-8` (range), `glibc` (name), `python-*` (glob),
            `aur`/`core`/… (whole repo — e.g. `drop aur`, `add extra`)
 a number names a row of the last numbered table printed — the search results
-(`search`) or the transaction (`show`, and `upgrade`/`undo` print through it)";
+(`search`) or the transaction (`show`, and `upgrade`/`undo` print through it)
+a line with no verb stages: `3`, `5-8` or `glibc` alone means `add` that";
 
 /// Per-command help shown by `help <topic>`, keyed by canonical [`Verb`] (the
 /// same order as [`Verb::ALL`]). Each body opens with a usage line (and any
@@ -52,7 +53,11 @@ const TOPICS: &[(Verb, &str)] = &[
         Verb::Add,
         "add <sel…>   (alias: install)\n  \
          Stage packages to install in the pending transaction. Resolves against the\n  \
-         last list, the AUR index, and the sync DBs — you can add anything.",
+         last list, the AUR index, and the sync DBs — you can add anything.\n  \
+         The verb is optional for the unambiguous cases: a line of bare row numbers\n  \
+         (`3`, `5-8`) or a bare package name stages them. Globs and repo words\n  \
+         (`python-*`, `aur`) always need the explicit `add` — one stray token\n  \
+         shouldn't stage a whole repo.",
     ),
     (
         Verb::Drop,
@@ -99,9 +104,9 @@ const TOPICS: &[(Verb, &str)] = &[
     ),
     (
         Verb::Apply,
-        "apply   (aliases: commit, do)\n  \
+        "do   (aliases: apply, commit)\n  \
          Build + install the staged transaction in one sudo batch. Runs only when\n  \
-         every staged package is approved; an interrupted or failed apply drops back\n  \
+         every staged package is approved; an interrupted or failed run drops back\n  \
          to the shell with the cart intact so you can `drop` the offender and retry.",
     ),
     (
@@ -110,7 +115,7 @@ const TOPICS: &[(Verb, &str)] = &[
          Revert the last cart-changing command (add / drop / keep / remove /\n  \
          upgrade / approve / clear) — e.g. undo a `keep` that dropped too much.\n  \
          Steps back through the session's edits; `redo` reapplies. A run\n  \
-         (`apply`) forgets the history.",
+         (`do`) forgets the history.",
     ),
     (
         Verb::Redo,
@@ -191,7 +196,7 @@ mod tests {
         let (flow, env) = dispatch_one("help");
         assert_eq!(flow, Flow::Continue);
         let joined = env.lines.joined();
-        for verb in ["search", "info", "add", "upgrade", "apply", "quit"] {
+        for verb in ["search", "info", "add", "upgrade", "do", "quit"] {
             assert!(joined.contains(verb), "help text missing `{verb}`");
         }
     }

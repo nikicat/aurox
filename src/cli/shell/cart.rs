@@ -245,7 +245,7 @@ pub struct ApplyRun {
 #[derive(Debug, PartialEq, Eq)]
 pub enum ApplyOutcome {
     /// User declined at the sysupgrade-preflight override gate — the cart is
-    /// left untouched. (The explicit `apply` command is itself the transaction
+    /// left untouched. (The explicit `do` command is itself the transaction
     /// consent; there is no general confirm to decline at.)
     Declined,
     /// Everything installed/removed cleanly — the applied rows leave the cart.

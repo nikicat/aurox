@@ -144,7 +144,7 @@ fn parse_one(tok: &str) -> Result<Selector, String> {
     if let Some(sel) = parse_range(tok)? {
         return Ok(sel);
     }
-    if tok.bytes().all(|b| b.is_ascii_digit()) {
+    if all_digits(tok) {
         return Ok(Selector::Index(parse_index(tok)?));
     }
     Ok(Selector::Name(tok.to_owned()))
@@ -155,11 +155,7 @@ fn parse_range(tok: &str) -> Result<Option<Selector>, String> {
     let Some((lhs, rhs)) = tok.split_once('-') else {
         return Ok(None);
     };
-    if lhs.is_empty()
-        || rhs.is_empty()
-        || !lhs.bytes().all(|b| b.is_ascii_digit())
-        || !rhs.bytes().all(|b| b.is_ascii_digit())
-    {
+    if !all_digits(lhs) || !all_digits(rhs) {
         return Ok(None);
     }
     let a = parse_index(lhs)?;
@@ -177,7 +173,28 @@ fn parse_index(s: &str) -> Result<RowNumber, String> {
     RowNumber::new(n).ok_or_else(|| "indices are 1-based; 0 is out of range".into())
 }
 
-fn is_glob(tok: &str) -> bool {
+/// A non-empty run of ASCII digits — the shape both row selectors are built
+/// from, defined once so [`parse_one`], [`parse_range`] and [`is_row_token`]
+/// can't drift on what counts as a number.
+fn all_digits(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Does this token *address rows* — a bare number or an `N-M` range?
+///
+/// Shape only, deliberately: it answers what the token means, not whether it
+/// resolves, so an out-of-range `9` or a backwards `5-3` still reaches the
+/// verb and gets that verb's wording. Backs the bare-token `add` shortcut
+/// ([`State::bare_tokens`](super::State::bare_tokens)), which must decide
+/// "row number or package name?" before any list lookup.
+pub(super) fn is_row_token(tok: &str) -> bool {
+    all_digits(tok)
+        || tok
+            .split_once('-')
+            .is_some_and(|(a, b)| all_digits(a) && all_digits(b))
+}
+
+pub(super) fn is_glob(tok: &str) -> bool {
     tok.contains(['*', '?'])
 }
 

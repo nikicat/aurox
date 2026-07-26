@@ -5,7 +5,7 @@
 //! install + upgrade) over the same sort/verdiff/size/build-time machinery the
 //! old upgrade-loop preview used, plus the pulled-in dependency rows, the
 //! "will remove" rows, and a batch total. `apply` no longer redraws it — it
-//! gates on the one-line [`cost_summary`] instead: the explicit `apply` after
+//! gates on the one-line [`cost_summary`] instead: the explicit `do` after
 //! the approval gate is the consent, so a second full table would be a prompt
 //! nobody answers. The renderers *return* their lines so the shell owns the output
 //! stream and the layout is unit-testable.
@@ -175,7 +175,7 @@ impl ChangeSet<'_> {
     }
 
     /// The one-line cost summary `apply` prints before running — a receipt,
-    /// not a gate (the explicit `apply` command is the consent).
+    /// not a gate (the explicit `do` command is the consent).
     ///
     /// `show` is where the user looks; `apply` no longer redraws the table. E.g.
     /// `3 install, +2 deps, 1 remove · 3.07 GiB · 22m build`. The deps / remove /

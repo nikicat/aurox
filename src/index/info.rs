@@ -21,9 +21,10 @@ use crate::index::{AurIndexData, AurState};
 use crate::names::{Maintainer, PkgName, PkgTarget};
 use crate::pacman::alpm_db;
 use crate::paths;
-use crate::ui;
+use crate::ui::{self, Paint};
 use crate::units::{ByteSize, UnixTime};
 use alpm::Alpm;
+use console::{StyledObject, style};
 use gix::ObjectId;
 use std::fmt::Display;
 use std::io::{self, Write};
@@ -82,6 +83,9 @@ pub(crate) struct InfoLookup<'a> {
     data: &'a AurIndexData,
     alpm: Alpm,
     mirror: Option<gix::Repository>,
+    /// Resolved once per lookup, not per block: every block this pass prints
+    /// goes to the same terminal.
+    paint: Paint,
 }
 
 impl<'a> InfoLookup<'a> {
@@ -94,6 +98,7 @@ impl<'a> InfoLookup<'a> {
             data,
             alpm: alpm_db::open()?,
             mirror,
+            paint: Paint::detect(),
         })
     }
 
@@ -112,12 +117,12 @@ impl<'a> InfoLookup<'a> {
     /// the caller words the miss.
     fn print_one(&self, target: &PkgTarget) -> bool {
         if let Some(info) = alpm_db::SyncInfo::lookup(&self.alpm, target.bare()) {
-            info.print();
+            info.print(self.paint);
             return true;
         }
         match self.data.entry(target) {
             Some(entry) => {
-                print_info(entry, &self.extras(entry));
+                print_info(entry, &self.extras(entry), self.paint);
                 true
             }
             None => false,
@@ -168,9 +173,9 @@ struct InstalledMember {
 /// Print the block to stdout (the interactive path). Same best-effort stance
 /// as the `println!`-based printers elsewhere: a closed stdout mid-block
 /// isn't worth failing the command over.
-fn print_info(e: &IndexEntry, x: &Extras) {
+fn print_info(e: &IndexEntry, x: &Extras, paint: Paint) {
     let stdout = io::stdout();
-    write_info(&mut stdout.lock(), e, x).ok();
+    write_info(stdout.lock(), e, x, paint).ok();
 }
 
 /// Render the block to `out` in pacman's `-Si` field order (aurox-specific
@@ -178,9 +183,10 @@ fn print_info(e: &IndexEntry, x: &Extras) {
 /// omitted, not rendered as `None` — the long-standing aurox stance. A
 /// writer (not `println!`) so the exact byte layout is testable without
 /// capturing a process's stdout.
-fn write_info<W: Write>(out: &mut W, e: &IndexEntry, x: &Extras) -> io::Result<()> {
-    field(out, Label::Repository, "aur")?;
-    field(out, Label::Name, &e.pkgbase)?;
+fn write_info<W: Write>(out: W, e: &IndexEntry, x: &Extras, paint: Paint) -> io::Result<()> {
+    let mut b = InfoBlock::new(out, paint);
+    b.accent(Label::Repository, "aur", repo_accent)?;
+    b.field(Label::Name, &e.pkgbase)?;
     // Show the split-pkg list whenever the entry actually has more than one
     // pkgname (or the single pkgname differs from pkgbase). Members carrying
     // their own pkgdesc render as `name: desc`, so split-package descriptions
@@ -195,30 +201,30 @@ fn write_info<W: Write>(out: &mut W, e: &IndexEntry, x: &Extras) -> io::Result<(
                 _ => p.name.to_string(),
             })
             .collect();
-        multiline_field(out, Label::SplitPkgs, &members)?;
+        b.multiline(Label::SplitPkgs, &members)?;
     }
-    field(out, Label::Version, e.version())?;
+    b.accent(Label::Version, e.version().as_str(), version_accent)?;
     if let Some(d) = e.display_desc() {
-        field(out, Label::Description, d)?;
+        b.field(Label::Description, d)?;
     }
-    list_field(out, Label::Architecture, &e.arch)?;
+    b.list(Label::Architecture, &e.arch)?;
     if let Some(u) = &e.url {
-        field(out, Label::Url, u)?;
+        b.accent(Label::Url, u.as_str(), url_accent)?;
     }
     // Union of pkgbase-level and pkgname-scoped provides — `-Si` users
     // want to see every virtual name the pkgbase makes available, not the
     // attribution.
     let provides: Vec<&PkgTarget> = e.all_provides().collect();
-    list_field(out, Label::Provides, &provides)?;
-    list_field(out, Label::DependsOn, &e.depends)?;
-    list_field(out, Label::MakeDeps, &e.makedepends)?;
-    list_field(out, Label::CheckDeps, &e.checkdepends)?;
+    b.list(Label::Provides, &provides)?;
+    b.list(Label::DependsOn, &e.depends)?;
+    b.list(Label::MakeDeps, &e.makedepends)?;
+    b.list(Label::CheckDeps, &e.checkdepends)?;
     // One optdep per line, pacman-style — the `: reason` halves would blur
     // together space-joined.
     let optdeps: Vec<String> = e.optdepends.iter().map(ToString::to_string).collect();
-    multiline_field(out, Label::OptionalDeps, &optdeps)?;
-    list_field(out, Label::ConflictsWith, &e.conflicts)?;
-    list_field(out, Label::Replaces, &e.replaces)?;
+    b.multiline(Label::OptionalDeps, &optdeps)?;
+    b.list(Label::ConflictsWith, &e.conflicts)?;
+    b.list(Label::Replaces, &e.replaces)?;
     // localdb sizes exist only for installed members. Split packages label
     // each member's line; the trivial single-pkgname case is just the size.
     let sizes: Vec<String> = x
@@ -232,16 +238,16 @@ fn write_info<W: Write>(out: &mut W, e: &IndexEntry, x: &Extras) -> io::Result<(
             }
         })
         .collect();
-    multiline_field(out, Label::InstalledSize, &sizes)?;
+    b.multiline(Label::InstalledSize, &sizes)?;
     let maintainers: Vec<String> = x.maintainers.iter().map(ToString::to_string).collect();
-    multiline_field(out, Label::Maintainer, &maintainers)?;
+    b.multiline(Label::Maintainer, &maintainers)?;
     if let Some(t) = x.first_submitted.and_then(UnixTime::render) {
-        field(out, Label::FirstSubmitted, t)?;
+        b.field(Label::FirstSubmitted, t)?;
     }
     if let Some(t) = e.commit_time.render() {
-        field(out, Label::LastUpdated, t)?;
+        b.field(Label::LastUpdated, t)?;
     }
-    writeln!(out)
+    b.end()
 }
 
 /// A field label of the info block — the closed vocabulary both blocks
@@ -334,46 +340,127 @@ impl Display for Label {
     }
 }
 
-/// One field line: 16-char label + `: ` + value — pacman's `-Si` alignment.
-/// `pub(crate)` with its two list siblings so the repo block
-/// ([`crate::pacman::alpm_db::SyncInfo`]) renders through the same layout
-/// and the two info blocks can't drift apart.
-pub(crate) fn field<W: Write>(out: &mut W, label: Label, value: impl Display) -> io::Result<()> {
-    writeln!(out, "{label:<16}: {value}")
+/// One info block being written: the sink plus the paint it renders under.
+///
+/// Both blocks — the AUR one here and the repo one in
+/// [`SyncInfo`](crate::pacman::alpm_db::SyncInfo) — write through this, so the
+/// [`GUTTER`], the label styling, and the value accents are decided once
+/// and the two can't drift apart. Naming the pair also keeps `paint` off every
+/// one of the twenty-odd field calls.
+///
+/// Color is **additive and identity-first**, the same doctrine the search list
+/// renders under: the label column carries pacman's bold title styling, the
+/// three cells that say *which package this is* (repo, version, URL) get an
+/// accent, and everything else stays plain so the block reads as text, not as
+/// a light show. The repo accent is the shared hashed color from
+/// [`ui::repo`](crate::ui::repo), so `extra` looks the same here as in the
+/// search list and the transaction table.
+pub(crate) struct InfoBlock<W: Write> {
+    out: W,
+    paint: Paint,
 }
 
-/// Space-joined list field, omitted when empty.
-pub(crate) fn list_field<W: Write>(
-    out: &mut W,
-    label: Label,
-    items: &[impl Display],
-) -> io::Result<()> {
-    if items.is_empty() {
-        return Ok(());
+/// The label gutter: every value starts at this column — pacman's `-Si`
+/// layout, a fixed width rather than one measured over the labels present
+/// (which would move the colon from block to block). Every [`Label`] must fit
+/// it; a test pins that.
+///
+/// This is why the block doesn't render through [`ui::Grid`](crate::ui::Grid):
+/// the grid separates columns with a fixed two blanks, so it can't place a
+/// `": "` at a fixed column, and its whole job — measuring columns over rows,
+/// padding colored cells by visible width — has nothing to do here, where the
+/// one padded cell is a plain-ASCII label of constant width.
+const GUTTER: usize = 16;
+
+/// Where a multiline field's continuation lines start: past the gutter and
+/// the `": "` that follows it. Derived, so the two can't drift.
+const CONTINUATION: usize = GUTTER + ": ".len();
+
+impl<W: Write> InfoBlock<W> {
+    pub(crate) const fn new(out: W, paint: Paint) -> Self {
+        Self { out, paint }
     }
-    let joined = items
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(" ");
-    field(out, label, joined)
-}
 
-/// One value per line, continuation lines indented to the value column —
-/// how pacman renders `Optional Deps`. Omitted when empty.
-pub(crate) fn multiline_field<W: Write>(
-    out: &mut W,
-    label: Label,
-    values: &[String],
-) -> io::Result<()> {
-    for (i, v) in values.iter().enumerate() {
-        if i == 0 {
-            field(out, label, v)?;
+    /// One field line: the label padded to [`GUTTER`] + `: ` + value —
+    /// pacman's `-Si` alignment.
+    pub(crate) fn field(&mut self, label: Label, value: impl Display) -> io::Result<()> {
+        // Pad *before* styling: ANSI escapes are zero-width but not
+        // zero-length, so styling first would make the pad measure the codes
+        // and knock the gutter out of alignment.
+        let padded = format!("{label:<GUTTER$}");
+        if self.paint.colored() {
+            writeln!(self.out, "{}: {value}", style(padded).bold())
         } else {
-            writeln!(out, "{:<18}{v}", "")?;
+            writeln!(self.out, "{padded}: {value}")
         }
     }
-    Ok(())
+
+    /// A field whose value carries an accent when color is on. Mirrors
+    /// [`ui::Cell::paint`](crate::ui::Cell) — the styling closure runs only
+    /// under [`Paint::Colored`], and the plain form is the bare value.
+    pub(crate) fn accent(
+        &mut self,
+        label: Label,
+        value: &str,
+        style: impl FnOnce(&str) -> StyledObject<String>,
+    ) -> io::Result<()> {
+        if self.paint.colored() {
+            self.field(label, style(value))
+        } else {
+            self.field(label, value)
+        }
+    }
+
+    /// Space-joined list field, omitted when empty.
+    pub(crate) fn list(&mut self, label: Label, items: &[impl Display]) -> io::Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let joined = items
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.field(label, joined)
+    }
+
+    /// One value per line, continuation lines indented to the value column —
+    /// how pacman renders `Optional Deps`. Omitted when empty.
+    pub(crate) fn multiline(&mut self, label: Label, values: &[String]) -> io::Result<()> {
+        for (i, v) in values.iter().enumerate() {
+            if i == 0 {
+                self.field(label, v)?;
+            } else {
+                writeln!(self.out, "{:<CONTINUATION$}{v}", "")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The blank line that closes a block.
+    pub(crate) fn end(&mut self) -> io::Result<()> {
+        writeln!(self.out)
+    }
+}
+
+/// The accent for a repo name — the shared hashed color, so `extra` reads the
+/// same in an info block as in the search list and the transaction table. A
+/// concrete `fn(&str)` wrapper: [`ui::repo`] is generic over `AsRef<str>`, so
+/// it can't be handed to [`InfoBlock::accent`] directly.
+pub(crate) fn repo_accent(r: &str) -> StyledObject<String> {
+    ui::repo(r)
+}
+
+/// The accent for a version cell — green, matching the install table's "this
+/// is the version you'd get".
+pub(crate) fn version_accent(v: &str) -> StyledObject<String> {
+    style(v.to_owned()).green()
+}
+
+/// The accent for a URL — cyan, the one field a reader scans for rather than
+/// reads.
+pub(crate) fn url_accent(u: &str) -> StyledObject<String> {
+    style(u.to_owned()).cyan()
 }
 
 /// `# Maintainer:` comment values from a PKGBUILD, in file order.
@@ -431,9 +518,11 @@ mod tests {
     use crate::names::{Arch, Url};
     use crate::{assert_contains, assert_not_contains};
 
+    /// Plain paint, always: the block's byte layout is what these pin, and
+    /// `cargo test` under `makepkg`'s `check()` runs on a tty.
     fn render(e: &IndexEntry, x: &Extras) -> String {
         let mut buf: Vec<u8> = Vec::new();
-        write_info(&mut buf, e, x).unwrap();
+        write_info(&mut buf, e, x, Paint::Plain).unwrap();
         String::from_utf8(buf).unwrap()
     }
 
@@ -457,6 +546,29 @@ mod tests {
             provides: Vec::new(),
             pkgdesc: desc.map(str::to_owned),
         }
+    }
+
+    /// Color is styling only: strip the ANSI from a colored block and it must
+    /// be byte-identical to the plain one. Guards the padding rule (pad the
+    /// label to the gutter *first*, style it after — the other order measures
+    /// the escape codes and shifts every value column) and any field the
+    /// colored path might drop. Real on a tty, where `console` actually emits
+    /// codes — `makepkg`'s `check()` runs there.
+    #[test]
+    fn colored_block_strips_back_to_the_plain_one() {
+        let mut e = mk("foo");
+        e.pkgdesc = Some("does foo".into());
+        e.url = Some(Url::new("https://foo.example"));
+        e.depends = vec![PkgTarget::new("glibc>=2.38")];
+        e.optdepends = vec!["cups: printing support".into(), "bash-completion".into()];
+        let x = Extras {
+            maintainers: vec![Maintainer::new("Jane Doe <jane@example.org>")],
+            ..Extras::default()
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        write_info(&mut buf, &e, &x, Paint::Colored).unwrap();
+        let colored = String::from_utf8(buf).unwrap();
+        assert_eq!(console::strip_ansi_codes(&colored), render(&e, &x));
     }
 
     #[test]
@@ -617,10 +729,10 @@ pkgname=foo
     }
 
     #[test]
-    fn every_label_fits_the_16_column_gutter() {
+    fn every_label_fits_the_gutter() {
         for l in Label::ALL {
             assert!(
-                l.text().len() <= 16,
+                l.text().len() <= GUTTER,
                 "label {l:?} ({:?}) overflows the value column",
                 l.text()
             );

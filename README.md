@@ -84,7 +84,7 @@ upgrades are repo-only, and unknown install targets say how to enable the AUR.
 
 | Command               | What it does                                                  |
 | --------------------- | ------------------------------------------------------------- |
-| `aurox`                | Open the interactive shell (search · stage · `upgrade` · `apply`) |
+| `aurox`                | Open the interactive shell (search · stage · `upgrade` · `do`) |
 | `aurox -S <pkg>...`    | Install AUR packages (recursive deps, batched sudo)           |
 | `aurox -Sy`            | Incremental fetch of the AUR mirror (first run: asks, then clones) |
 | `aurox -Syy`           | Force a full re-clone (~10 min; asks first)                  |
@@ -94,7 +94,7 @@ upgrades are repo-only, and unknown install targets say how to enable the AUR.
 | `aurox -Sc` / `-Scc`   | Remove built worktrees + pass `-Sc`/`-Scc` through to `pacman` |
 | `aurox -Rns <pkg>`     | Forwarded to `pacman` unchanged                               |
 
-AUR upgrades are an interactive flow now: run `aurox` (no args) to open the shell, then `upgrade` to stage the available AUR + repo upgrades, `review`/`approve` the AUR ones, and `apply`. The explicit `-Syu` flag is a plain `pacman -Syu` passthrough.
+AUR upgrades are an interactive flow now: run `aurox` (no args) to open the shell, then `upgrade` to stage the available AUR + repo upgrades, `review`/`approve` the AUR ones, and `do`. The explicit `-Syu` flag is a plain `pacman -Syu` passthrough.
 
 Global flags: `--devel` (include `-git`/`-svn`/`-hg`/`-bzr` when the shell's `upgrade` computes candidates), `--noconfirm`, `--asdeps`, `--color {auto,always,never}`.
 
@@ -129,7 +129,7 @@ aur_approval         = "review"    # or "auto" — auto stages AUR pkgs pre-appr
 ```
 
 The shell's approval gate: `review` (default) makes every staged AUR package
-need `review`/`approve` before `apply` runs it; `auto` stages them pre-approved.
+need `review`/`approve` before `do` runs it; `auto` stages them pre-approved.
 If unset, `review_default = "skip"` still auto-approves (legacy behavior).
 
 `aur = false` opts out of the AUR half entirely (the shell's first-launch

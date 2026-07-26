@@ -4,7 +4,7 @@
 //! cart-editing verbs live in [`super::staging`].
 
 use super::cart::{ApplyOutcome, Approval, Cart, CartItem, StageResult};
-use super::command::{Command, ConfigAction, SystemAction, unknown_note};
+use super::command::{Command, ConfigAction, SystemAction};
 use super::help::{HELP_TEXT, help_topic};
 use super::staging::prior_approval;
 use super::{
@@ -178,8 +178,8 @@ impl State {
                 env.print(&format!("syntax error: {msg}"));
                 Flow::Continue
             }
-            Command::Unknown(verb) => {
-                env.print(&unknown_note(verb));
+            Command::Unknown(tokens) => {
+                self.bare_tokens(tokens, env);
                 Flow::Continue
             }
             Command::Help(topic) => {
@@ -495,14 +495,14 @@ impl State {
     /// suggestion, not typed text.
     ///
     /// One state → one step: a staged cart points at `review` while gates are
-    /// open, else `apply`; an empty cart with search results on screen points
+    /// open, else `do`; an empty cart with search results on screen points
     /// at `add <number|pkgname>` (a placeholder, deliberately *not* a specific
     /// result). A truly empty session (fresh, or just-applied) has nothing on
     /// screen to act on and no splash to keep clear of, so it hints nothing.
     pub(super) fn empty_line_hint(&self) -> Option<&'static str> {
         if !self.cart.is_empty() {
             return Some(if self.cart.pending_review().is_empty() {
-                "apply"
+                "do"
             } else {
                 "review"
             });
@@ -531,7 +531,7 @@ impl State {
     fn approval_status(&self) -> String {
         let pending = self.cart.pending_review();
         match *pending.as_slice() {
-            [] => "all approved — run `apply`".to_owned(),
+            [] => "all approved — run `do`".to_owned(),
             [one] => {
                 let name = one.spec();
                 format!("{name} needs review — run `review {name}` (or `approve {name}`)")
@@ -543,7 +543,7 @@ impl State {
         }
     }
 
-    /// `apply`: gate on every staged item being approved, then run the
+    /// `do`: gate on every staged item being approved, then run the
     /// transaction. A clean run clears the applied rows; a declined one keeps
     /// the cart; a failed one keeps it intact so the user can `drop` the
     /// offender and retry.
@@ -564,7 +564,7 @@ impl State {
         let run = match env.apply(&self.cart) {
             Ok(run) => run,
             Err(e) => {
-                env.print(&format!("apply: {e}"));
+                env.print(&format!("do: {e}"));
                 return;
             }
         };
@@ -597,7 +597,7 @@ impl State {
                 } else {
                     env.print(&format!(
                         "apply partly failed — {landed} installed (dropped), \
-                         {} still staged; fix and `apply` again",
+                         {} still staged; fix and `do` again",
                         self.cart.items().len()
                     ));
                 }
@@ -656,8 +656,9 @@ impl State {
 
     /// The referent's rows, or an empty slice before any numbered table was
     /// printed (repo-token expansion iterates these; number resolution itself
-    /// goes through the referent for kind-aware errors).
-    fn referent_rows(&self) -> &[ListItem] {
+    /// goes through the referent for kind-aware errors; the bare-token `add`
+    /// shortcut asks whether there's anything for a number to name).
+    pub(super) fn referent_rows(&self) -> &[ListItem] {
         self.referent.as_ref().map_or(&[], |l| &l.rows)
     }
 
@@ -1467,7 +1468,7 @@ mod tests {
     }
 
     /// The ambient prompt hint is one command per session state: a search on
-    /// screen → `add`, a gated cart → `review`, a ready cart → `apply`, and a
+    /// screen → `add`, a gated cart → `review`, a ready cart → `do`, and a
     /// fresh session → nothing (no splash to disturb, nothing to act on).
     #[test]
     fn empty_line_hint_tracks_session_state() {
@@ -1478,13 +1479,13 @@ mod tests {
         let searched = state_showing(vec![li("foo")]);
         assert_eq!(searched.empty_line_hint(), Some("add <number|pkgname>"));
 
-        // A gated AUR item staged → review; approving it → apply.
+        // A gated AUR item staged → review; approving it → the run verb.
         let mut env = env_with(&[("yay-bin", Source::Aur)]);
         let mut state = State::default();
         state.dispatch(&command::parse("add yay-bin"), &mut env);
         assert_eq!(state.empty_line_hint(), Some("review"));
         state.dispatch(&command::parse("approve yay-bin"), &mut env);
-        assert_eq!(state.empty_line_hint(), Some("apply"));
+        assert_eq!(state.empty_line_hint(), Some("do"));
     }
 
     /// An empty search proposes loosening the query. With the AUR synced there

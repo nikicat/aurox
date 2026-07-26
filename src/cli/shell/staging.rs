@@ -8,7 +8,8 @@ use super::cart::{
     Approval, ApproveResult, AurApproval, CartItem, KeepResult, ReviewOutcome, Source, StageClass,
     StageResult, UnstageResult,
 };
-use super::selector::Resolved;
+use super::command::unknown_note;
+use super::selector::{self, Resolved};
 use super::{CartEdit, ListSource, ShellEnv, State};
 use crate::build::review;
 use crate::index;
@@ -100,6 +101,43 @@ impl State {
             Ok(CartEdit::Unchanged) => {}
             Err(e) => env.print(&format!("add rejected — {e}; cart unchanged")),
         }
+    }
+
+    /// A line that doesn't open with a verb: the bare-token `add` shortcut.
+    ///
+    /// After a search the row numbers are the obvious thing to type, so a line
+    /// of nothing but numbers/ranges means `add` them, and a bare package name
+    /// means `add <name>`. Anything else keeps the unknown-command note (the
+    /// near-miss verb suggestion included) — a typo'd verb must never become a
+    /// silent staging attempt, which is why an unrecognized *name* isn't
+    /// enough: only one the shell can classify counts.
+    ///
+    /// Deliberately narrow. Globs and the repo tokens (`aur`, `core`, …) are
+    /// **not** accepted bare — a stray `*` or `aur` would stage a whole
+    /// universe off one unintended word — so they stay behind an explicit
+    /// `add`. Verbs win by construction: [`command::parse`](super::command::parse)
+    /// resolves the verb table (and its aliases) before a line ever gets here.
+    pub(super) fn bare_tokens<E: ShellEnv>(&mut self, tokens: &[String], env: &mut E) {
+        // `Command::Unknown` is never empty, but the shortcut is a staging
+        // action — an empty selection stages nothing either way.
+        let Some(first) = tokens.first() else { return };
+        if tokens.iter().all(|t| self.is_bare_add_token(t, env)) {
+            self.add(tokens, env);
+        } else {
+            env.print(&unknown_note(first));
+        }
+    }
+
+    /// Whether one bare token may stand in for `add <token>`: a row number or
+    /// range while a numbered table is on screen (out-of-range numbers are
+    /// `add`'s error to word), or a name the shell can classify. Everything
+    /// else — globs, repo tokens, typos, numbers with nothing on screen —
+    /// falls through to the unknown-command note.
+    fn is_bare_add_token<E: ShellEnv>(&self, tok: &str, env: &E) -> bool {
+        if selector::is_row_token(tok) {
+            return !self.referent_rows().is_empty();
+        }
+        !selector::is_glob(tok) && env.classify(&PkgTarget::new(tok)).is_some()
     }
 
     /// `add`'s edit half: classify and stage each resolved target, acking per
@@ -375,7 +413,7 @@ impl State {
         // Approval doesn't change the install set, so `edit_cart` (no re-resolve)
         // — the frozen resolution is still valid; only the approval cell moved.
         if self.edit_cart(|s| s.approve_targets(targets, env)) == CartEdit::Changed {
-            // The status line surfaces the "all approved — run `apply`" moment
+            // The status line surfaces the "all approved — run `do`" moment
             // the instant the last gate clears (or how many gates remain).
             self.summarize(env);
         }
@@ -565,7 +603,7 @@ mod tests {
 
     use crate::build::SourcePin;
     use crate::cli::shell::testenv::{
-        FakeEnv, cart_specs, dispatch_one, env_with, li_repo, state_showing, up,
+        FakeEnv, cart_specs, dispatch_one, env_with, li, li_repo, state_showing, up,
     };
     use crate::cli::shell::{Flow, command};
     use crate::names::PkgBase;
@@ -580,6 +618,71 @@ mod tests {
         assert!(!state.cart.all_approved());
         assert_eq!(state.cart.pending_review().len(), 1);
         assert_eq!(state.cart.pending_review()[0].spec(), "yay-bin");
+    }
+
+    /// The bare-token shortcut: with a numbered table on screen, a line of
+    /// nothing but row numbers/ranges is `add` on those rows, and a bare
+    /// package name is `add <name>`.
+    #[test]
+    fn bare_row_numbers_and_names_stage_like_add() {
+        let mut env = env_with(&[
+            ("glibc", Source::Repo),
+            ("yay-bin", Source::Aur),
+            ("vim", Source::Repo),
+        ]);
+        let mut state = state_showing(vec![li("glibc"), li("yay-bin"), li("vim")]);
+
+        state.dispatch(&command::parse("1"), &mut env);
+        assert_eq!(cart_specs(&state), vec![PkgTarget::new("glibc")]);
+
+        // Several tokens work the same way — the whole line is the selection.
+        state.dispatch(&command::parse("2 3"), &mut env);
+        assert_eq!(
+            cart_specs(&state),
+            vec![
+                PkgTarget::new("glibc"),
+                PkgTarget::new("vim"),
+                PkgTarget::new("yay-bin"),
+            ],
+            "a bare `2 3` stages both rows (the cart keeps itself sorted)"
+        );
+
+        // A bare name that classifies stages without a list in play at all.
+        let mut env = env_with(&[("glibc", Source::Repo)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("glibc"), &mut env);
+        assert_eq!(cart_specs(&state), vec![PkgTarget::new("glibc")]);
+    }
+
+    /// What the shortcut deliberately refuses: a typo'd verb (which keeps its
+    /// "did you mean" note), a glob or repo token (one stray word would stage
+    /// a whole universe), and a row number with nothing numbered on screen.
+    /// Nothing stages in any of these.
+    #[test]
+    fn bare_tokens_that_are_not_rows_or_known_names_keep_the_unknown_note() {
+        let mut env = env_with(&[("glibc", Source::Repo), ("yay-bin", Source::Aur)]);
+        let mut state = state_showing(vec![li("glibc"), li("yay-bin")]);
+
+        // A near-miss verb must not become a staging attempt.
+        state.dispatch(&command::parse("aprove"), &mut env);
+        assert!(
+            env.lines
+                .contains("unknown command `aprove` — did you mean `approve`?")
+        );
+
+        // A glob is `add`-only: bare `*` would stage the entire universe.
+        state.dispatch(&command::parse("*"), &mut env);
+        // A repo token likewise — `aur` means "every AUR row" to `add`.
+        state.dispatch(&command::parse("aur"), &mut env);
+        // One unknown token poisons the whole line, even beside a valid row.
+        state.dispatch(&command::parse("1 nosuchpkg"), &mut env);
+        assert!(state.cart.is_empty(), "nothing may stage: {:?}", env.lines);
+
+        // A row number with nothing on screen says what's missing.
+        let mut state = State::default();
+        state.dispatch(&command::parse("1"), &mut env);
+        assert!(env.lines.contains("no numbered list is on screen"));
+        assert!(state.cart.is_empty());
     }
 
     #[test]
@@ -1026,7 +1129,7 @@ mod tests {
         env.lines.clear();
         state.dispatch(&command::parse("approve b"), &mut env);
         assert!(
-            env.lines.contains("all approved — run `apply`"),
+            env.lines.contains("all approved — run `do`"),
             "the last approval announces readiness: {:?}",
             env.lines
         );
