@@ -5,6 +5,31 @@ carries what changed and why, and any rationale worth keeping belongs next to
 the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
 — never in a list nobody reads on the way to the answer.
 
+## Core
+
+- **one source type, not five spellings.** "Repo or AUR?" is asked in at
+  least five different vocabularies today: `cart::Source` (`Repo`/`Aur`),
+  `build::SourcePin` (the same pair as a routing pin), the `RepoName ==
+  REPO_AUR` sentinel-string test (`CartItem::from_upgrade`,
+  `staging::stage_class_from_pick`), `RepoName::rank() == RepoRank::Aur`
+  (`ui/cost.rs`, `shell/upgrade.rs`), and `search::Row` (`Repo`/`Aur`) — plus
+  `StageClass { source, repo: Option<RepoName> }`, where the `None` encodes
+  "AUR" a *second* time alongside the `source` field that already said so.
+  Each one bottoms out in a `match { Repo => …, Aur => … }`, ~160 sites
+  crate-wide (concentrated in `cli/shell/{staging,verbs,cart}.rs`), and every
+  new surface adds another arm pair that can drift from its siblings.
+  Wanted: **one** type that answers where a package comes from, carrying the
+  concrete sync-DB *inside* the repo case (`Source::Repo(RepoName)` /
+  `Source::Aur`, or a `RepoName` that knows it may be the AUR) so the coarse
+  lane and the concrete repo stop travelling as two fields that can disagree;
+  then move the per-lane behaviour onto that type (`label`, default approval,
+  version/size lookup, install routing) so call sites read as one path.
+  **Watch:** some differences are real — an AUR row has no syncdb version and
+  no download size, a repo row never builds — so the goal is fewer matches,
+  not a uniform interface that answers `None`/`0` on half its calls. The
+  "absent provider = empty provider" convention already did this for
+  *availability*; this is the same move for *identity*.
+
 ## Shell
 
 - `upgrade` runs the AUR refresh unconditionally whenever the AUR is
@@ -14,11 +39,6 @@ the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
   (A ^C mid-refresh already aborts cleanly back to the prompt, so one option
   is to let that degrade the upgrade to repo-only rather than abandoning it
   entirely.)
-- search results should be colored — the shell's numbered list renders as a
-  dim monochrome table (`src/ui/search_table.rs`) while `-Ss` styles
-  repo/name/version. Whatever palette lands, the installed flag must stay
-  clearly visible (today it's row emphasis plus the `old → new` version
-  cell, which color alone could drown out).
 - search ranking still isn't optimal — **research it and rethink from scratch**.
   Today's formula (`src/cli/search.rs` `RankKey`: exact-name → match-tier →
   health → repo>AUR → shorter-name → freshest-commit → lexical) is a reasonable
