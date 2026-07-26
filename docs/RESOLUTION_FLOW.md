@@ -1,7 +1,8 @@
 # Resolution flow: `search` → installed
 
 A maintainer's map of the interactive shell's control flow, from the search box
-to an installed package. The load-bearing property it encodes:
+to an installed package. Companion to [REFRESH_FLOW.md](REFRESH_FLOW.md), which
+maps how that package data gets current in the first place. The load-bearing property it encodes:
 
 > **The cart holds the *resolved* transaction.** The whole cart is resolved and
 > conflict-checked the moment you `add`, and the plan is **frozen into the

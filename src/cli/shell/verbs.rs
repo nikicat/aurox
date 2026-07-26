@@ -19,25 +19,52 @@ use crate::ui;
 use std::collections::HashSet;
 use std::rc::Rc;
 
-/// Word one `refresh` outcome — the AUR half only. The repo-database half
-/// reports for itself from inside [`mirror::cmd_refresh`] (refreshed / up to
-/// date / failed) and doesn't run at all when `check_repo_updates` is off,
-/// so any claim about it here would double-report at best and lie at worst.
-/// `None` when there is nothing to say about the AUR half — `refresh pacman`
-/// scoped it out on purpose, so the repo half's own report is the whole story.
-const fn refresh_message(outcome: mirror::RefreshOutcome) -> Option<&'static str> {
-    match outcome {
-        mirror::RefreshOutcome::Refreshed => Some("mirror + index refreshed"),
-        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::NotSetUp) => {
+/// Word what one `refresh` did, a line per source — the sources that *ran*
+/// narrate themselves from inside [`mirror::cmd_refresh`] (the AUR fetch's
+/// progress rows, the sync DBs' refreshed / up-to-date / failed note), so only
+/// the ones that were **skipped** need saying here, in the shell's own
+/// vocabulary. Empty when every source ran and has already spoken for itself.
+fn refresh_messages(outcome: mirror::RefreshOutcome) -> Vec<&'static str> {
+    [aur_message(outcome.aur), repo_message(outcome.repo)]
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// The AUR source's line. `None` when it refreshed (its own progress said so)
+/// or when `refresh pacman` scoped it out — the user excluded it by naming
+/// another source, so repeating that back is noise.
+const fn aur_message(aur: mirror::SourceOutcome<mirror::SkipCause>) -> Option<&'static str> {
+    match aur {
+        mirror::SourceOutcome::Refreshed => Some("mirror + index refreshed"),
+        mirror::SourceOutcome::Skipped(mirror::SkipCause::NotSetUp) => {
             Some("AUR not synced — `refresh aur` runs the one-time setup")
         }
-        mirror::RefreshOutcome::AurSkipped(
+        mirror::SourceOutcome::Skipped(
             mirror::SkipCause::Declined | mirror::SkipCause::NonInteractive,
         ) => Some("AUR setup skipped — run `refresh aur` when ready"),
-        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::Disabled) => {
+        mirror::SourceOutcome::Skipped(mirror::SkipCause::Disabled) => {
             Some("AUR refresh skipped (aur = false in config.toml)")
         }
-        mirror::RefreshOutcome::AurSkipped(mirror::SkipCause::NotRequested) => None,
+        mirror::SourceOutcome::Skipped(mirror::SkipCause::NotRequested) => None,
+    }
+}
+
+/// The repo source's line — the counterpart the shell used to have no way to
+/// print. `Disabled` is worth saying whenever it bites: a `refresh` that
+/// silently left the official DBs alone is exactly the surprise this wording
+/// exists to prevent. `NotRequested` stays quiet for the same reason its AUR
+/// twin does — `refresh aur` named the source it wanted.
+const fn repo_message(repo: mirror::SourceOutcome<mirror::RepoSkip>) -> Option<&'static str> {
+    match repo {
+        mirror::SourceOutcome::Skipped(mirror::RepoSkip::Disabled) => {
+            Some("official-repo refresh skipped (check_repo_updates = false in config.toml)")
+        }
+        // `Refreshed` already narrated itself; `NotRequested` means the user
+        // named another source, so repeating it back is noise. Same silence,
+        // two reasons.
+        mirror::SourceOutcome::Refreshed
+        | mirror::SourceOutcome::Skipped(mirror::RepoSkip::NotRequested) => None,
     }
 }
 
@@ -400,7 +427,7 @@ impl State {
         match env.refresh(scope) {
             Ok(outcome) => {
                 self.drop_cart_on_reload(env);
-                if let Some(msg) = refresh_message(outcome) {
+                for msg in refresh_messages(outcome) {
                     env.print(msg);
                 }
             }
@@ -441,7 +468,10 @@ impl State {
     /// transaction prints *numbered*, so it is the one place the referent flips
     /// to it — render and capture can't drift.
     pub(super) fn show<E: ShellEnv>(&mut self, env: &mut E) {
-        if self.cart.is_empty() {
+        // Rows, not *staged* rows: a cart the user dropped everything from
+        // still has something to render — that's what marking is for — and it
+        // still numbers, so `add 2` can put a row back.
+        if self.cart.items().is_empty() && self.cart.removals().is_empty() {
             env.print("cart is empty — `add <pkg>` to stage an install");
             return;
         }
@@ -460,7 +490,11 @@ impl State {
     /// so the cart's standing is always on screen without a table dump — and
     /// without printing row numbers that aren't addressable.
     pub(super) fn summarize<E: ShellEnv>(&self, env: &mut E) {
-        if self.cart.is_empty() {
+        // "Empty" means nothing left on screen. A cart holding only skipped
+        // rows has nothing to run, but saying "cart is empty" would contradict
+        // the rows a `show` still lists — the header's `N skipped` says it
+        // exactly.
+        if self.cart.items().is_empty() && self.cart.removals().is_empty() {
             env.print("cart is empty");
             return;
         }
@@ -477,7 +511,7 @@ impl State {
         if self.cart.is_empty() {
             return "aurox> ".to_owned();
         }
-        let staged = self.cart.items().len() + self.cart.removals().len();
+        let staged = self.cart.staged_len() + self.cart.removals().len();
         let pending = self.cart.pending_review().len();
         if pending == 0 {
             format!("aurox [{staged} staged]> ")
@@ -516,10 +550,17 @@ impl State {
     /// The transaction header line, shared by `show` and [`Self::summarize`]
     /// so the two can't drift apart in wording.
     fn txn_header(&self) -> String {
+        // Skipped rows are still on screen and still numbered, so without
+        // their count the header wouldn't add up to the rows below. Named only
+        // when there are any — a cart nobody dropped from says nothing of it.
+        let skipped = match self.cart.skipped_len() {
+            0 => String::new(),
+            n => format!(", {n} skipped"),
+        };
         format!(
-            "transaction — {} to install, {} to remove",
-            self.cart.items().len(),
-            self.cart.removals().len()
+            "transaction — {} to install, {} to remove{skipped}",
+            self.cart.staged_len(),
+            self.cart.removals().len(),
         )
     }
 
@@ -529,6 +570,12 @@ impl State {
     /// have to substitute a `<sel>` placeholder; the plural points at bare
     /// `review`, which walks every pending item.
     fn approval_status(&self) -> String {
+        // Nothing staged (the user dropped it all, or dropped down to bare
+        // skips): "all approved — run `do`" would be true and useless. Point
+        // at the way back instead — the rows are still numbered.
+        if self.cart.staged_len() == 0 && self.cart.removals().is_empty() {
+            return "nothing staged — `add <number>` restores a skipped row".to_owned();
+        }
         let pending = self.cart.pending_review();
         match *pending.as_slice() {
             [] => "all approved — run `do`".to_owned(),
@@ -583,12 +630,15 @@ impl State {
                 env.print("done");
             }
             ApplyOutcome::Failed { installed } => {
-                // Drop the rows that actually landed so a retry doesn't reinstall
-                // them; keep the offenders (and any staged removals, which don't
-                // run once a build fails) staged for `drop`/fix + `apply` again.
+                // Remove — not mark — the rows that actually landed: an
+                // installed package is done, not a decision worth keeping on
+                // screen, and a retry must not reinstall it. The offenders
+                // (and any staged removals, which don't run once a build
+                // fails) stay for `drop`/fix + `do` again, as do the user's
+                // own skips.
                 let landed = installed.len();
                 for t in &installed {
-                    self.cart.unstage(t);
+                    self.cart.remove_applied(t);
                 }
                 // A run happened — old undo snapshots reference a pre-apply world.
                 self.clear_undo_history();
@@ -598,7 +648,7 @@ impl State {
                     env.print(&format!(
                         "apply partly failed — {landed} installed (dropped), \
                          {} still staged; fix and `do` again",
-                        self.cart.items().len()
+                        self.cart.staged_len()
                     ));
                 }
                 // Reprint what's left so the failures are on screen to act on.
@@ -1048,15 +1098,16 @@ mod tests {
         );
     }
 
-    /// `refresh pacman` scoped the AUR half out on purpose: the repo half
+    /// `refresh pacman` scoped the AUR source out on purpose: the repo source
     /// reports for itself inside `cmd_refresh`, so the dispatch core adds no
     /// line of its own (an "AUR skipped" note would be noise).
     #[test]
     fn refresh_pacman_scope_says_nothing_about_the_aur() {
         let mut env = FakeEnv {
-            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
-                mirror::SkipCause::NotRequested,
-            )),
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Skipped(mirror::SkipCause::NotRequested),
+                repo: mirror::SourceOutcome::Refreshed,
+            }),
             ..FakeEnv::default()
         };
         State::default().dispatch(&command::parse("refresh pacman"), &mut env);
@@ -1064,14 +1115,64 @@ mod tests {
         assert!(env.lines.is_empty(), "{:?}", env.lines);
     }
 
+    /// The repo source's skip is now sayable. Before it was a `bool` consumed
+    /// at the spawn site, so a `refresh` with `check_repo_updates = false` left
+    /// the official DBs alone without a word — exactly the silent surprise the
+    /// AUR source has always been careful to avoid.
+    #[test]
+    fn refresh_words_a_skipped_repo_source() {
+        let mut env = FakeEnv {
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Refreshed,
+                repo: mirror::SourceOutcome::Skipped(mirror::RepoSkip::Disabled),
+            }),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("refresh"), &mut env);
+        // Both sources speak: the AUR one refreshed, the repo one didn't run.
+        assert!(
+            env.lines.contains("mirror + index refreshed"),
+            "{:?}",
+            env.lines
+        );
+        assert!(
+            env.lines
+                .any(|l| l.contains("official-repo refresh skipped")
+                    && l.contains("check_repo_updates")),
+            "{:?}",
+            env.lines
+        );
+    }
+
+    /// `refresh aur` scoped the repo source out by name, so its skip stays
+    /// quiet — the same courtesy `refresh pacman` gets from the AUR source.
+    #[test]
+    fn refresh_aur_says_nothing_about_the_repo_source() {
+        let mut env = FakeEnv {
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Refreshed,
+                repo: mirror::SourceOutcome::Skipped(mirror::RepoSkip::NotRequested),
+            }),
+            ..FakeEnv::default()
+        };
+        State::default().dispatch(&command::parse("refresh aur"), &mut env);
+        assert_eq!(
+            env.lines.joined().lines().count(),
+            1,
+            "only the AUR source's line: {:?}",
+            env.lines
+        );
+    }
+
     /// A bare `refresh` in a never-synced session stays pacman-only and
     /// points at `refresh aur` — it must never read as a full refresh.
     #[test]
     fn refresh_not_set_up_words_the_skip_with_the_aur_hint() {
         let mut env = FakeEnv {
-            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
-                mirror::SkipCause::NotSetUp,
-            )),
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Skipped(mirror::SkipCause::NotSetUp),
+                repo: mirror::SourceOutcome::Refreshed,
+            }),
             ..FakeEnv::default()
         };
         State::default().dispatch(&command::parse("refresh"), &mut env);
@@ -1089,9 +1190,10 @@ mod tests {
     #[test]
     fn refresh_decline_words_the_skip() {
         let mut env = FakeEnv {
-            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
-                mirror::SkipCause::Declined,
-            )),
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Skipped(mirror::SkipCause::Declined),
+                repo: mirror::SourceOutcome::Refreshed,
+            }),
             ..FakeEnv::default()
         };
         State::default().dispatch(&command::parse("refresh"), &mut env);
@@ -1100,14 +1202,15 @@ mod tests {
     }
 
     /// Pacman-only mode: `refresh` words the AUR skip and claims nothing
-    /// about the repo half — that half reports for itself from inside
+    /// about the repo source — that source reports for itself from inside
     /// `cmd_refresh`, and doesn't run at all with `check_repo_updates` off.
     #[test]
     fn refresh_disabled_words_the_skip_without_repo_claims() {
         let mut env = FakeEnv {
-            refresh_outcome: Some(mirror::RefreshOutcome::AurSkipped(
-                mirror::SkipCause::Disabled,
-            )),
+            refresh_outcome: Some(mirror::RefreshOutcome {
+                aur: mirror::SourceOutcome::Skipped(mirror::SkipCause::Disabled),
+                repo: mirror::SourceOutcome::Refreshed,
+            }),
             ..FakeEnv::default()
         };
         State::default().dispatch(&command::parse("refresh"), &mut env);
@@ -1725,10 +1828,13 @@ mod tests {
         );
     }
 
+    /// Dropping twice can no longer slide onto a neighbour: the row stays
+    /// where it was printed, so the second `drop 1` finds the same package and
+    /// reports it already skipped. (Before rows were marked instead of
+    /// deleted, this was the stale-snapshot hazard — index 1 pointing at
+    /// whatever had shuffled up into it.)
     #[test]
-    fn stale_snapshot_row_is_a_clean_miss() {
-        // A number whose package already left the cart misses by name — it
-        // must never slide onto whatever occupies that index now.
+    fn dropping_the_same_row_twice_stays_on_that_row() {
         let mut env = FakeEnv {
             upgrade_candidates: vec![up("aur", "bar"), up("aur", "foo")],
             ..FakeEnv::default()
@@ -1736,6 +1842,29 @@ mod tests {
         let mut state = State::default();
         state.dispatch(&command::parse("upgrade"), &mut env); // shows [bar, foo]
         state.dispatch(&command::parse("drop 1"), &mut env);
+        env.lines.clear();
+        state.dispatch(&command::parse("drop 1"), &mut env);
+        assert!(
+            env.lines.contains("bar is already skipped"),
+            "row 1 is still bar: {:?}",
+            env.lines
+        );
+        assert_eq!(cart_specs(&state), vec!["foo"], "foo must not be hit");
+    }
+
+    /// A row *can* still leave the cart outright — `clear` empties it, and a
+    /// failed apply removes what landed — so a number held over from an older
+    /// table must miss by the name printed there, never slide onto whatever
+    /// occupies that index now. The surviving stale-snapshot path now that
+    /// `drop` marks instead of deleting.
+    #[test]
+    fn a_number_from_a_stale_table_misses_by_name() {
+        let mut env = env_with(&[("bar", Source::Repo), ("foo", Source::Repo)]);
+        let mut state = State::default();
+        state.dispatch(&command::parse("add bar foo"), &mut env);
+        state.dispatch(&command::parse("show"), &mut env); // referent = [bar, foo]
+        state.dispatch(&command::parse("clear"), &mut env);
+        state.dispatch(&command::parse("add foo"), &mut env); // foo is live row 1 now
         env.lines.clear();
         state.dispatch(&command::parse("drop 1"), &mut env);
         assert!(

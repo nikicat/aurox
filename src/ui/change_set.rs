@@ -41,6 +41,10 @@ use std::time::Duration;
 pub enum ApprovalCell {
     Approved,
     NeedsReview,
+    /// The user dropped this row: it keeps its place and its number, but it
+    /// isn't in the transaction. Renders instead of the approval state — a
+    /// skipped row's approval is moot until it's restaged.
+    Skipped,
 }
 
 impl ApprovalCell {
@@ -49,15 +53,18 @@ impl ApprovalCell {
         match self {
             Self::Approved => "approved",
             Self::NeedsReview => "review",
+            Self::Skipped => "skipped",
         }
     }
 
-    /// The aligned cell: green when approved, yellow when pending; plain when
-    /// color is off.
+    /// The aligned cell: green when approved, yellow when pending, dimmed
+    /// when skipped (it recedes — the row is on screen for reference, not for
+    /// action); plain when color is off.
     fn cell(self, paint: Paint) -> Cell {
         Cell::paint(self.label(), paint, |s| match self {
             Self::Approved => style(s).green().to_string(),
             Self::NeedsReview => style(s).yellow().to_string(),
+            Self::Skipped => dim(s).to_string(),
         })
     }
 }
@@ -849,6 +856,31 @@ mod tests {
         let roots = vec![root("aur", "newthing", None, Some("1.0-1"))];
         let s = cs(&roots, &[], &[], &[], &pac, &PreviewMetrics::empty()).summary();
         assert_eq!(s, "1 install", "unknown size and build terms are dropped");
+    }
+
+    /// A dropped row keeps its number and its place — that's the whole point
+    /// of marking rather than deleting — and says `skipped` where a staged row
+    /// says `approved`/`review`. Its figures still render: the row is on
+    /// screen precisely so the user can see what they're passing up.
+    #[test]
+    fn skipped_rows_keep_their_number_and_say_so() {
+        let mut pac = PacmanIndex::default();
+        pac.sync_download_size.insert("glibc".into(), mib(12));
+        pac.sync_download_size.insert("vim".into(), mib(5));
+        pac.sync_download_size.insert("zlib".into(), mib(1));
+
+        let mut roots = vec![
+            root("core", "glibc", Some("2.40-1"), Some("2.41-1")),
+            root("extra", "vim", Some("9.1-1"), Some("9.1-2")),
+            root("core", "zlib", None, Some("1.3-1")),
+        ];
+        roots[1].approval = ApprovalCell::Skipped;
+
+        let table = cs(&roots, &[], &[], &[], &pac, &PreviewMetrics::empty()).table(Paint::Plain);
+        let lines = table.lines();
+        assert_regex!(lines[0], r"^1  core\s+approved\s+glibc\b");
+        assert_regex!(lines[1], r"^2  extra\s+skipped\s+vim\b");
+        assert_regex!(lines[2], r"^3  core\s+approved\s+zlib\b");
     }
 
     /// One numbered row per root, in the given order; a fresh install (no `old`)

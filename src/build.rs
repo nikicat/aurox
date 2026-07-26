@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::context;
 use crate::error::{Error, Result};
 use crate::index::{self, AurIndexData};
-use crate::mirror::{self, MirrorRepo, RefreshOutcome, RefreshReason};
+use crate::mirror::{self, MirrorRepo, RefreshReason, SourceOutcome};
 use crate::names::{PkgBase, PkgName, PkgTarget, PkgTargetSetExt};
 use crate::pacman::alpm_db::{self, PacmanIndex};
 use crate::pacman::invoke;
@@ -295,9 +295,11 @@ fn offer_aur_setup(
         cfg,
         RefreshReason::InstallOffer,
         mirror::RefreshScope::Everything,
-    )? {
-        RefreshOutcome::Refreshed => Ok(Some(AurIndexData::load(cfg)?)),
-        RefreshOutcome::AurSkipped(_) => Ok(None),
+    )?
+    .aur
+    {
+        SourceOutcome::Refreshed => Ok(Some(AurIndexData::load(cfg)?)),
+        SourceOutcome::Skipped(_) => Ok(None),
     }
 }
 

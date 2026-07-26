@@ -6,7 +6,7 @@
 
 use super::cart::{
     ApplyOutcome, ApplyRun, Approval, AurApproval, Cart, CartItem, ReviewOutcome, Source,
-    StageClass,
+    StageClass, Staging,
 };
 use super::resolved::{FrozenPreflight, PreflightGate, ResolvedCart};
 use super::upgrade;
@@ -81,12 +81,7 @@ pub(super) fn build_universe(aur_data: &AurIndexData) -> NameCaches {
 /// verbs (`drop`/`review`/`approve`). Recomputed after each command since the
 /// cart is tiny.
 pub(super) fn cart_targets(state: &State) -> Vec<PkgTarget> {
-    state
-        .cart
-        .items()
-        .iter()
-        .map(|it| it.spec().clone())
-        .collect()
+    state.cart.staged().map(|it| it.spec().clone()).collect()
 }
 
 /// Production [`ShellEnv`]: the loaded AUR data + stdout, bridging `upgrade` to
@@ -123,11 +118,11 @@ impl ShellEnv for RealEnv {
         // so its fetch skips an unsynced AUR — degrade to repo-only below,
         // but say so: a silent half answer reads as "nothing to upgrade in
         // the AUR". (`Disabled` is the user's standing choice: no note.)
-        if let Some(mirror::RefreshOutcome::AurSkipped(
+        if let Some(mirror::SourceOutcome::Skipped(
             mirror::SkipCause::NotSetUp
             | mirror::SkipCause::Declined
             | mirror::SkipCause::NonInteractive,
-        )) = outcome
+        )) = outcome.map(|o| o.aur)
         {
             ui::note("AUR not synced — upgrades are repo-only; `refresh aur` syncs it");
         }
@@ -141,7 +136,7 @@ impl ShellEnv for RealEnv {
         // reload always carries an outcome.
         Ok(self
             .reload(upgrade::FetchPolicy::Refresh(scope))?
-            .unwrap_or(mirror::RefreshOutcome::Refreshed))
+            .unwrap_or(mirror::RefreshOutcome::REFRESHED))
     }
 
     fn search(&mut self, terms: &[SearchTerm]) -> Result<Vec<ListItem>> {
@@ -477,7 +472,7 @@ impl ShellEnv for RealEnv {
                 // The whole install half already landed (we passed the
                 // success gate above); only the removal failed, so drop every
                 // install row and keep the removals staged for a retry.
-                let installed = cart.items().iter().map(|it| it.spec().clone()).collect();
+                let installed = cart.staged().map(|it| it.spec().clone()).collect();
                 return Ok(ApplyRun {
                     outcome: ApplyOutcome::Failed { installed },
                     reviewed,
@@ -733,8 +728,7 @@ fn landed_install_specs(
     repo_landed: bool,
     pkgbase_of: impl Fn(&CartItem) -> Option<PkgBase>,
 ) -> Vec<PkgTarget> {
-    cart.items()
-        .iter()
+    cart.staged()
         .filter(|it| match it.source {
             Source::Repo => repo_landed,
             Source::Aur => pkgbase_of(it).is_some_and(|pb| installed.contains(&pb)),
@@ -898,10 +892,15 @@ fn merged_dep_rows(main: Option<&Plan>, blocker: Option<&Plan>) -> (Vec<PkgName>
 
 /// Map the cart's [`Approval`] to the renderer's presentation enum — the seam
 /// that keeps `ui::change_set` from depending on `cli::shell`.
-const fn approval_cell(approval: Approval) -> ui::ApprovalCell {
-    match approval {
-        Approval::Approved => ui::ApprovalCell::Approved,
-        Approval::NeedsReview => ui::ApprovalCell::NeedsReview,
+const fn approval_cell(it: &CartItem) -> ui::ApprovalCell {
+    // A skipped row's approval is moot until it's restaged, so the state the
+    // user acted on wins the column.
+    match it.staging {
+        Staging::Skipped => ui::ApprovalCell::Skipped,
+        Staging::Staged => match it.approval {
+            Approval::Approved => ui::ApprovalCell::Approved,
+            Approval::NeedsReview => ui::ApprovalCell::NeedsReview,
+        },
     }
 }
 
@@ -916,7 +915,7 @@ fn txn_roots(cart: &Cart, aur_data: &AurIndexData, size_pac: &PacmanIndex) -> Ve
             let (old_ver, new_ver) = row_versions(it, aur_data, size_pac);
             ui::TxnRoot {
                 repo: it.repo_label(),
-                approval: approval_cell(it.approval),
+                approval: approval_cell(it),
                 name: PkgName::from(it.spec().as_str()),
                 old_ver,
                 new_ver,

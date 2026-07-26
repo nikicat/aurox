@@ -29,12 +29,12 @@ pub mod sideband;
 pub mod worktree;
 
 use consent::AurAction;
-pub use consent::{RefreshOutcome, RefreshReason, SkipCause};
+pub use consent::{RefreshReason, SkipCause};
 
-/// Which halves of the package data one [`cmd_refresh`] covers.
+/// Which package sources one [`cmd_refresh`] covers.
 ///
 /// The CLI (`-Sy`) and the shell's bare `refresh` cover everything; the
-/// shell's `refresh aur` / `refresh pacman` narrow it to one half. Scope is
+/// shell's `refresh aur` / `refresh pacman` narrow it to one source. Scope is
 /// orthogonal to [`RefreshReason`], which picks how a needed AUR bootstrap
 /// obtains consent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +47,95 @@ pub enum RefreshScope {
     /// Only the official-repo sync DBs; the AUR mirror is left alone —
     /// consent included, so this can never prompt for a bootstrap.
     Pacman,
+}
+
+/// What **one package source** did in a refresh.
+///
+/// Every source reports the same way, and that rule is the type: a source that
+/// **refreshed** narrates itself as it goes (the AUR fetch's progress rows, the
+/// sync DBs' "refreshed / up to date / failed" note), and one that **didn't**
+/// carries a typed cause out to the caller, who alone knows how to word it in
+/// its own vocabulary. So a skip is data everywhere, never a `bool` that
+/// decides control flow and prints its explanation at the decision site.
+///
+/// Generic over the cause because the *shape* is shared while the *reasons*
+/// aren't: the AUR source can be skipped by a consent answer, which has no
+/// counterpart for the sync DBs, and `Disabled` names a different config knob
+/// on each side. Sharing one cause enum would let a source claim a reason that
+/// cannot apply to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceOutcome<C> {
+    /// The source ran; it reported its own result as it went.
+    Refreshed,
+    /// It didn't run, for this reason.
+    Skipped(C),
+}
+
+/// What one refresh did, source by source.
+///
+/// Two named sources today. A **third** source is a new field — every `match`
+/// on this struct is then a compile error until it's handled, which is the
+/// point of naming them rather than keying a map. Letting the user refresh
+/// *part* of pacman (`refresh core extra`) doesn't add a field either: it adds
+/// detail inside [`Self::repo`]'s `Refreshed`, where the per-db results
+/// already live (today they're only printed). See docs/TODO.md's
+/// one-source-type item — when that lands, these fields are what it keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RefreshOutcome {
+    pub aur: SourceOutcome<SkipCause>,
+    pub repo: SourceOutcome<RepoSkip>,
+}
+
+impl RefreshOutcome {
+    /// Every source refreshed — the shape a test or a caller wants when
+    /// nothing was skipped.
+    pub const REFRESHED: Self = Self {
+        aur: SourceOutcome::Refreshed,
+        repo: SourceOutcome::Refreshed,
+    };
+}
+
+/// Why the official-repo source was skipped — the counterpart of
+/// [`SkipCause`], kept separate because the two are skipped for genuinely
+/// different reasons (no consent question exists here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoSkip {
+    /// `check_repo_updates = false` in config.toml.
+    Disabled,
+    /// The command's [`RefreshScope`] excluded it (`refresh aur`).
+    NotRequested,
+}
+
+impl std::fmt::Display for RepoSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Disabled => "check_repo_updates = false in config",
+            Self::NotRequested => "not requested",
+        })
+    }
+}
+
+/// What the repo source was asked to do — decided before any work starts, so
+/// the skip is a value rather than a branch taken at the spawn site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RepoPlan {
+    Sync,
+    Skip(RepoSkip),
+}
+
+impl RepoPlan {
+    /// Pure decision, parameters injected (like [`consent::decide`]): the
+    /// scope wins first — `refresh aur` asked for the AUR and nothing else —
+    /// then the config knob.
+    const fn decide(check_repo_updates: bool, scope: RefreshScope) -> Self {
+        match scope {
+            RefreshScope::Aur => Self::Skip(RepoSkip::NotRequested),
+            RefreshScope::Everything | RefreshScope::Pacman if !check_repo_updates => {
+                Self::Skip(RepoSkip::Disabled)
+            }
+            _ => Self::Sync,
+        }
+    }
 }
 
 /// Build the `http::Options` payload gix's curl transport downcasts in its
@@ -131,7 +220,7 @@ impl MirrorRepo {
 /// the per-repo db-download rows line up in a single display. The repo sync is
 /// best-effort: a failure there is reported as a warning and never fails the
 /// AUR refresh (whose result is what this returns). A scope that excludes the
-/// AUR half returns [`SkipCause::NotRequested`] without ever consulting the
+/// AUR source returns [`SkipCause::NotRequested`] without ever consulting the
 /// consent gate.
 ///
 /// `reason` says who asked (see [`RefreshReason`]): [`RefreshReason::ForceReclone`]
@@ -139,7 +228,7 @@ impl MirrorRepo {
 /// scratch, and the reason also picks how consent for a needed bootstrap is
 /// obtained — the ~2 GiB clone never starts without a yes. A decline (or
 /// `aur = false` in config.toml) still refreshes the sync DBs and returns
-/// [`RefreshOutcome::AurSkipped`] so callers can hint at what was skipped.
+/// [`SourceOutcome::Skipped`] so callers can hint at what was skipped.
 pub fn cmd_refresh(
     cfg: &Config,
     reason: RefreshReason,
@@ -153,25 +242,27 @@ pub fn cmd_refresh(
     } else {
         consent::plan(cfg, reason)?
     };
-    let run_repo = cfg.check_repo_updates && scope != RefreshScope::Aur;
-    if scope == RefreshScope::Pacman && !run_repo {
-        // The explicitly-repo-scoped refresh would otherwise do nothing,
-        // silently — say why.
-        ui::note("official-repo refresh is disabled (check_repo_updates = false in config.toml)");
-    }
+    // Decided next to the AUR source and *as a value*, so "the repo DBs weren't
+    // refreshed, because X" travels out with the outcome instead of being
+    // printed at the branch that skipped them.
+    let repo_plan = RepoPlan::decide(cfg.check_repo_updates, scope);
     let mp = MultiProgress::new();
-    let aur = if run_repo {
+    let (aur, repo) = match repo_plan {
         // Scoped thread: the official-repo db sync (libalpm download) overlaps
         // the network-bound AUR fetch. It borrows `cfg`/`mp` for the scope and
         // draws its own rows into the shared display.
-        context::scope(|s| {
-            let repo = s.spawn(|| sync::refresh_sync_db(&mp));
+        RepoPlan::Sync => context::scope(|s| {
+            let handle = s.spawn(|| sync::refresh_sync_db(&mp));
             let aur = run_aur_action(cfg, action, &mp);
-            report_repo_sync(repo.join());
-            aur
-        })
-    } else {
-        run_aur_action(cfg, action, &mp)
+            report_repo_sync(handle.join());
+            (aur, SourceOutcome::Refreshed)
+        }),
+        // No thread for work that isn't happening — but the *outcome* is the
+        // same shape either way.
+        RepoPlan::Skip(cause) => (
+            run_aur_action(cfg, action, &mp),
+            SourceOutcome::Skipped(cause),
+        ),
     };
     // Backstop: wipe any progress rows a mid-download error may have left
     // (each row normally clears itself on completion).
@@ -184,7 +275,7 @@ pub fn cmd_refresh(
     if scope != RefreshScope::Pacman && aur.is_ok() {
         record_fetch_stamp();
     }
-    aur
+    Ok(RefreshOutcome { aur: aur?, repo })
 }
 
 /// Record "the mirror was fetched just now" so the shell's `upgrade` can skip a
@@ -233,18 +324,22 @@ fn report_repo_sync(joined: std::thread::Result<Result<SyncOutcome>>) {
     }
 }
 
-/// Execute the consented AUR half of one refresh, drawing progress into the
+/// Execute the consented AUR source of one refresh, drawing progress into the
 /// shared `mp`.
-fn run_aur_action(cfg: &Config, action: AurAction, mp: &MultiProgress) -> Result<RefreshOutcome> {
+fn run_aur_action(
+    cfg: &Config,
+    action: AurAction,
+    mp: &MultiProgress,
+) -> Result<SourceOutcome<SkipCause>> {
     match action {
-        AurAction::Skip(cause) => Ok(RefreshOutcome::AurSkipped(cause)),
+        AurAction::Skip(cause) => Ok(SourceOutcome::Skipped(cause)),
         AurAction::Bootstrap(_) => {
             bootstrap_aur(cfg, mp)?;
-            Ok(RefreshOutcome::Refreshed)
+            Ok(SourceOutcome::Refreshed)
         }
         AurAction::Fetch => {
             fetch_aur(cfg, mp)?;
-            Ok(RefreshOutcome::Refreshed)
+            Ok(SourceOutcome::Refreshed)
         }
     }
 }
@@ -357,4 +452,38 @@ fn is_bootstrapped(path: &Path) -> bool {
         return false;
     };
     iter.next().is_some()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RefreshScope, RepoPlan, RepoSkip};
+
+    /// The repo source's decision, over the whole (scope × knob) matrix. Pure and
+    /// parameter-injected like `consent::decide`, so the table *is* the test —
+    /// and the two skip reasons stay distinguishable, which is the whole point
+    /// of it being a value rather than a `bool`.
+    #[test]
+    fn repo_plan_decides_by_scope_then_knob() {
+        use RefreshScope::{Aur, Everything, Pacman};
+        let cases = [
+            // (check_repo_updates, scope, expected)
+            (true, Everything, RepoPlan::Sync),
+            (true, Pacman, RepoPlan::Sync),
+            // Naming the AUR excludes the repo source whatever the knob says.
+            (true, Aur, RepoPlan::Skip(RepoSkip::NotRequested)),
+            (false, Aur, RepoPlan::Skip(RepoSkip::NotRequested)),
+            // The knob is what's left, and it keeps its own reason — an
+            // explicitly repo-scoped refresh with the knob off must be able to
+            // say *why* nothing happened.
+            (false, Everything, RepoPlan::Skip(RepoSkip::Disabled)),
+            (false, Pacman, RepoPlan::Skip(RepoSkip::Disabled)),
+        ];
+        for (knob, scope, want) in cases {
+            assert_eq!(
+                RepoPlan::decide(knob, scope),
+                want,
+                "check_repo_updates = {knob}, scope = {scope:?}"
+            );
+        }
+    }
 }

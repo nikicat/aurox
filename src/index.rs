@@ -125,14 +125,16 @@ pub fn load_or_resync(cfg: &Config, path: &Path) -> Result<IndexFile> {
                 cfg,
                 mirror::RefreshReason::IndexResync,
                 mirror::RefreshScope::Everything,
-            )? {
-                mirror::RefreshOutcome::Refreshed => load(path),
+            )?
+            .aur
+            {
+                mirror::SourceOutcome::Refreshed => load(path),
                 // The refresh left the mirror alone (AUR disabled, bootstrap
                 // declined, or no terminal to ask on), so the incompatible
                 // index is still there — report why instead of retrying.
-                mirror::RefreshOutcome::AurSkipped(cause) => Err(Error::IndexIncompatible(
-                    format!("{reason}; AUR refresh skipped ({cause}) — run `aurox -Sy` to rebuild"),
-                )),
+                mirror::SourceOutcome::Skipped(cause) => Err(Error::IndexIncompatible(format!(
+                    "{reason}; AUR refresh skipped ({cause}) — run `aurox -Sy` to rebuild"
+                ))),
             }
         }
         other => other,
