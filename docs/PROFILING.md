@@ -1,9 +1,9 @@
 # Profiling aurox refreshes
 
-A plain `aurox -Sy` against the AUR mirror takes ~10 s on a warm cache;
-most of that is gix-internal time on a ref store with 154k branches.
-`scripts/profile-refresh.sh` captures a samply CPU profile and prints a
-flat self/total time table so you can see which gix functions dominate.
+How to capture a CPU profile of a refresh. `scripts/profile-refresh.sh` runs
+samply and prints a flat self/total time table, so you can see which gix
+functions dominate a run whose time is mostly gix-internal work over the
+mirror's ~155k refs.
 
 ## One-time setup
 
@@ -30,40 +30,15 @@ with `samply load profile.json.gz`.
 
 ## What to look for
 
-Two silent gaps inside `gix::Prepare::receive()` dominate:
+Which phases cost what, why they're O(155k refs), and which are already
+optimized away is [`FETCH_OPTIMIZATION.md`](FETCH_OPTIMIZATION.md)'s subject —
+read its "Where the time goes" table before interpreting a profile, or you'll
+re-discover a hotspot the gix fork already fixed. That doc also carries the
+fork-patching workflow (`[patch."https://github.com/nikicat/gitoxide"]`, the
+gix test matrix, re-pinning), the one known dead end, and the remaining
+candidates.
 
-1. **have-set build** (between `prepare_fetch returned` and the first
-   `negotiate (round N)` log line) — gix walks local refs to populate
-   the wire-protocol "have" list. Surfaces in samply under
-   `Negotiate::mark_complete` and its descendants.
-2. **post-pack ref update** (between the last `read pack done` and
-   `receive returned`) — gix rewrites refs by calling
-   `repo.try_find_reference()` once per advertised mapping. Surfaces
-   under `gix::remote::connection::fetch::refs::update`.
-
-Both phases bottom out in
-`gix_ref::store_impl::packed::find::binary_search_by`, which calls
-`packed::decode::reference` ~17× per query, and each decode runs
-`gix_validate::tag::name_inner`. On a 154k-ref store the validation
-re-cost is the single largest CPU sink.
-
-## Testing a gix patch locally
-
-The repo at `../gitoxide` can be plugged in via `[patch.crates-io]`
-in `Cargo.toml`:
-
-```toml
-[patch.crates-io]
-gix     = { path = "../gitoxide/gix" }
-gix-ref = { path = "../gitoxide/gix-ref" }
-```
-
-Add only the crates you're actively patching — cargo will rebuild the
-whole gix graph against the path versions.
-
-## What's already been optimized
-
-The two phases above have been heavily reworked in the gix fork. See
-[`FETCH_OPTIMIZATION.md`](FETCH_OPTIMIZATION.md) for the full record —
-every change with before/after numbers, the one known dead end, and the
-remaining candidates.
+What samply adds over the span trace is *sub-span* attribution: the trace says
+`update_refs()` spent 400 ms in `find_ms`, the profile says which gix function
+inside it burned the samples. Reach for it when a span's own fields stop
+explaining the number.

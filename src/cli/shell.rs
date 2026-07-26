@@ -2,8 +2,9 @@
 //!
 //! A persistent prompt the user drives with word-commands (`search`, `add`,
 //! `upgrade`, `apply`, …) against long-lived session state, replacing the
-//! wizard-style `dialoguer` flows. See `docs/plans/shell-ui.md` for the full
-//! design and phasing.
+//! wizard-style `dialoguer` flows. `docs/RESOLUTION_FLOW.md` maps the control
+//! flow end to end — resolve-at-`add`, the frozen plan, the approval gate,
+//! what `apply` executes.
 //!
 //! **Phase 4 status:** the session is hoisted at start (the AUR index +
 //! lookup maps via [`AurIndexData`](crate::index::AurIndexData), a sorted name universe for

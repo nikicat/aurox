@@ -26,14 +26,15 @@ pty-harness spawn ──► asciicast v2 (.cast, ~15 KB)
   (debug failed runs)  (README, PR review)
 ```
 
-- **Recorder** (phase 1, done): `pty-harness/src/cast.rs` tees the reader
-  thread's raw PTY bytes into an asciicast v2 file when `PTY_CAST_DIR` is
-  set. Timing is captured at read time; a carry buffer keeps UTF-8 valid
-  across the 8 KiB read boundary (a split emoji would otherwise corrupt two
-  events). Best-effort by contract: recording failure warns and disables
-  itself, never fails a scenario. `run.sh --record` wires it per test;
-  `scripts/coverage.sh` passes `--record` so CI uploads `target/casts/` as
-  the `pty-casts` artifact (`if: always()` — failures are when it matters).
+- **Recorder** (phase 1, done): `pty-harness/src/cast.rs`. Using it —
+  `run.sh --record`, where the casts land, how to watch one — is
+  [TESTING.md's "Session recordings"](../TESTING.md#session-recordings---record).
+  The two decisions behind it: timing is captured at *read* time (so events
+  reflect when output appeared, not when the driver got around to it), with a
+  carry buffer keeping UTF-8 valid across the 8 KiB read boundary — a split
+  emoji would otherwise corrupt two events; and recording is best-effort **by
+  contract**, warning and disabling itself rather than ever failing a scenario,
+  because a debugging aid must not become a source of red runs.
 - **Demo drivers** (phase 2): dedicated `examples/demo_*.rs` reusing
   `pty_harness` — not the assert-heavy test drivers — with two pacing
   helpers: `send_human` (char-by-char with small seeded jitter; rustyline's

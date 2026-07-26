@@ -25,7 +25,7 @@ fn main() {
     pty.expect("shell banner", |s| s.contains("aurox shell"));
 
     // The base AUR package resolves + freezes fine on its own.
-    pty.send(b"add test-xconflict\r");
+    pty.send_command("add test-xconflict");
     pty.expect("base staged from the AUR", |s| {
         has(s, "staged test-xconflict (aur)")
     });
@@ -33,7 +33,7 @@ fn main() {
     // The `-bin` declares `conflicts=test-xconflict`, which is co-staged. The
     // whole-cart resolve at `add` runs the conflict check and rejects — the
     // cart rolls back, so nothing new stages.
-    pty.send(b"add test-xconflict-bin\r");
+    pty.send_command("add test-xconflict-bin");
     pty.expect("conflict rejected at add", |s| {
         has(s, "add rejected") && has(s, "conflicts with")
     });
@@ -45,12 +45,12 @@ fn main() {
     // so matching it acks nothing and the `quit` below races rustyline
     // re-arming (the 6h CI hang of run 29876293421). Don't test for the
     // -bin's absence either — the reject line still names it.
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("only the base survived", |s| {
         has(s, "1 aur review test-xconflict")
     });
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_CONFLICT_E2E_OK");
 }

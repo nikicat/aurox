@@ -211,7 +211,7 @@ pub fn set(
     let old = node(&tree, key).map_or_else(|| render_value(leaf), render_value);
     insert_path(
         tree.as_table_mut()
-            .expect("a ConfigFile serializes to a table"),
+            .expect("a ConfigFile should serialize to a TOML table"),
         key,
         coerced.clone(),
     );
@@ -232,7 +232,7 @@ pub fn reset(file: &ConfigFile, path: &ConfigPath) -> Result<ConfigEdit, ConfigE
     let mut tree = to_value(file);
     let was_set = remove_path(
         tree.as_table_mut()
-            .expect("a ConfigFile serializes to a table"),
+            .expect("a ConfigFile should serialize to a TOML table"),
         key,
     );
     let new_file: ConfigFile = tree.try_into().map_err(|e| invalid(key, &e))?;
@@ -259,7 +259,7 @@ fn template() -> Value {
 /// Serialize a [`ConfigFile`] to a TOML [`Value::Table`]. Infallible: the schema
 /// holds only TOML-representable types.
 fn to_value(file: &ConfigFile) -> Value {
-    Value::try_from(file).expect("a ConfigFile always serializes to TOML")
+    Value::try_from(file).expect("a ConfigFile should always serialize to TOML")
 }
 
 /// Resolve a dotted path to the leaf a `set`/`reset` acts on, rejecting a

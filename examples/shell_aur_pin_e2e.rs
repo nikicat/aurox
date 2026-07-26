@@ -55,22 +55,22 @@ fn main() {
 
     // Pick the AUR row by its number — that is what pins the choice to the AUR.
     let n = aur_row_number(&pty.screen()).expect("aur row must be on screen");
-    pty.send(format!("add {n}\r").as_bytes());
+    pty.send_command(&format!("add {n}"));
     // The staged label proves the pin took: the row's `aur` source, not the
     // repo namesake that classifying the bare name would have chosen.
     pty.expect("staged from the AUR row", |s| has(s, "staged aurpin (aur)"));
 
     // Clear the review gate, then apply. The explicit `apply` is the consent;
     // no deps are pulled in, so the only prompt is the sudo gate.
-    pty.send(b"approve aurpin\r");
+    pty.send_command("approve aurpin");
     pty.expect("approved", |s| has(s, "approved aurpin"));
 
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     pty.expect("sudo gate", |s| s.contains("Continue?"));
     pty.send(b"\r");
     pty.expect("apply finished", |s| s.contains("done"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_AUR_PIN_E2E_OK");
 }

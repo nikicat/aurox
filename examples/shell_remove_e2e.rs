@@ -14,15 +14,15 @@ fn main() {
     let mut pty = Pty::spawn_aurox();
     pty.expect("shell banner", |s| s.contains("aurox shell"));
 
-    pty.send(b"remove test-trivial\r");
+    pty.send_command("remove test-trivial");
     pty.expect("removal staged", |s| {
         s.contains("staged removal of test-trivial")
     });
     pty.expect("status counts the removal", |s| s.contains("1 to remove"));
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("will-remove block", |s| s.contains("will remove"));
 
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     pty.expect("sudo gate for pacman -R", |s| s.contains("Continue?"));
     pty.send(b"\r");
     // The removal lane runs pacman interactively (the shell has no
@@ -33,10 +33,10 @@ fn main() {
     pty.send(b"\r");
     pty.expect("apply finished", |s| s.contains("done"));
 
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("cart cleared after apply", |s| s.contains("cart is empty"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_REMOVE_E2E_OK");
 }

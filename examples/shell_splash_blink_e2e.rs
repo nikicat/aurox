@@ -26,7 +26,7 @@ fn main() {
 
     // A keystroke ends both the blink and the session; the eyes reopen on the
     // way out and aurox exits clean.
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_SPLASH_BLINK_E2E_OK");
 }

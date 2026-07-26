@@ -25,6 +25,18 @@ binary that links the aurox lib. `tests/testing.rs` (re-exported via
 `git` CLI for fixture setup, since gix doesn't expose every plumbing
 operation we need.
 
+A third, rarer shape lives beside the pure-data tests: a **source
+tripwire** — a test that walks `src/` and fails on a banned token, for
+conventions the compiler can't express. Today: `units.rs` bans
+`Instant::now()` outside itself (measure with `Stopwatch`), `context.rs`
+bans bare thread-local declarations outside itself (use `context_local!`).
+Reach for one only when the convention is a *single grep-able token* and
+drift is silent; anything with real structure belongs in the type system
+instead. Two consequences worth knowing: the scan reads every `.rs` under
+`src/`, so a doc comment that spells the banned token trips its own
+tripwire, and the failure message must name the replacement — the reader
+hitting it is usually meeting the rule for the first time.
+
 **When to add a cargo test:**
 - The function is pure data → put the test in the same file under
   `#[cfg(test)] mod tests`.
@@ -174,18 +186,32 @@ reset_state                   # wipe ~/.local/state/aurox between phases
 The `examples/*_e2e.rs` drivers script a real interactive session through
 `pty_harness::Pty`. Two rules, each learned from a CI hang:
 
-- **Every `send` is preceded by an `expect` that proves the *reading*
-  prompt is armed, with a needle unique to that moment.** A needle already
-  on screen from an earlier step acks nothing: the txn header
-  (`… 1 to install`) is printed by every cart mutation, so it can never
-  identify `show` — expect the numbered table row instead. The
-  `shell_conflict_e2e` stale-needle race sent `quit` into a not-yet-armed
-  rustyline and held CI to the 6h runner kill (run 29876293421).
-- **Answer every prompt the scenario reaches.** Trace aurox's real prompt
-  sequence for the flow (PKGBUILD review selector, the sudo `Continue?`
-  gate before elevated pacman, per-lane pacman prompts) and pair each with
-  an expect+send. `install_offer_e2e` never answered the sudo gate and
-  passed for weeks only while a stray buffered newline happened to feed it.
+- **Every `send` is preceded by proof the *reading* prompt is armed.**
+  Input that lands before the reader re-enters raw mode is discarded, so
+  the scenario then waits forever on a reply to something aurox never read
+  — the `shell_conflict_e2e` stale-needle race held CI to the 6h runner
+  kill (run 29876293421). For REPL commands the proof is structural: use
+  **`send_command("add foo")`**, which blocks on `at_prompt` (the `aurox>`
+  line, last non-blank) before typing. Demo drivers that type with
+  `send_human` call `wait_for_prompt()` first — a `dwell` is pacing, never
+  an ack. Content `expect`s stay *assertions*; they make poor barriers,
+  since a cart mutation still has a transaction table to print after
+  "staged foo" (and the txn header `… 1 to install` is printed by every
+  mutation, so it can never identify `show`).
+- **Answer every prompt the scenario reaches, and prove *that* prompt is
+  the one on screen.** Trace aurox's real sequence for the flow (PKGBUILD
+  review selector, the sudo `Continue?` gate before each elevation,
+  per-lane pacman prompts) and pair each with an expect+send.
+  `install_offer_e2e` never answered the sudo gate and passed for weeks
+  only while a stray buffered newline happened to feed it. For a prompt
+  whose text *repeats*, neither half of the obvious needle works alone:
+  the answered gate's `Continue?` is still on screen, and the elevation
+  preview (`sudo pacman -U …`) prints *before* dialoguer arms. Use
+  **`armed_after(s, "pacman -U", "Continue?")`** — the prompt rendered
+  since that preview. Which prompts need it: the review selector prints
+  its own line and reads with a plain line-buffered `read_line` (nothing
+  to drop), while dialoguer gates (`Continue?`, the first-launch question)
+  read in raw mode and do drop early input.
 
 A driver bug now costs 45 seconds, not 6 hours — hangs are contained in
 layers, each with a diagnostic: pty-harness panics after `PATIENCE` (45s)
@@ -234,14 +260,15 @@ cast to see the session up to the exact hang. Render one to a GIF with
 
 ### Common pitfalls
 
-- **`makepkg` refuses root.** The image's `builder` user owns
-  `/srv/local-repo` and `/srv/mock-aur` so `setup-fixtures.sh` can run
-  as builder. Don't `sudo` setup scripts.
-- **Refs land under `refs/remotes/origin/*` by default.** gix's
-  `prepare_clone_bare` matches non-bare `git clone` semantics, not
-  `git clone --bare`. `src/mirror/clone.rs` overrides this — if you ever
-  touch the clone path, run `cargo test --test clone_refs_layout` to
-  confirm the regression test still catches it.
+- **`makepkg` refuses root** (see ARCHITECTURE.md's gotcha list). In the
+  image that means the `builder` user owns `/srv/local-repo` and
+  `/srv/mock-aur` so `setup-fixtures.sh` can run as builder — don't `sudo`
+  setup scripts.
+- **The clone's refspec is overridden**, because gix would otherwise put
+  refs under `refs/remotes/origin/*` (ARCHITECTURE.md, "Why gix instead of
+  libgit2"). If you touch the clone path, run
+  `cargo test --test clone_refs_layout` to confirm the regression test still
+  catches it.
 - **alpm sync DBs are empty by default.** `Alpm::new` doesn't register
   syncdbs from `pacman.conf` — `pacman::alpm_db::open` uses
   `alpm-utils::alpm_with_conf` to do that. If you reach for `Alpm::new`
@@ -361,18 +388,8 @@ Per project rule (`memory/feedback_*`):
   real aurox bugs surfacing for the first time, not test setup issues.
   Don't assume the test is wrong before checking the binary's behaviour.
 
-## Future work for the container suite
+## Planned tests
 
-The `extended/` tier is mostly empty stubs in `.scope`. The next ones
-worth adding (in roughly priority order):
-
-- `epoch_dominates_version.sh`
-- `vcs_pkg_skipped_without_devel.sh` / `…picked_up_with_devel.sh`
-- `install_hook_runs.sh`
-- `provides_virtual_resolves.sh`
-- `cycle_in_aur_deps_errors.sh` (we have one for cycle-makedep already)
-- `rebuild_cached_skips.sh` (artifact-cache idempotency — a pkgbase whose
-  `.pkg.tar.*` is already on disk at the index version skips makepkg)
-- `mirror_unreachable.sh` (rm /srv/mock-aur mid-test)
-
-Pick from `tests/container/extended/.scope` for the full backlog.
+`tests/container/extended/.scope` is the backlog, and the only place a planned
+test is written down — it sits next to the tests so a landed one can't linger
+in a list somewhere else. It also carries the convention for adding one.

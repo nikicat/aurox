@@ -50,7 +50,7 @@ macro_rules! assert_not_contains {
 macro_rules! assert_regex {
     ($haystack:expr, $pattern:expr $(,)?) => {{
         let (h, p) = (&$haystack, $pattern);
-        let re = ::regex::Regex::new(p).expect("test regex must compile");
+        let re = ::regex::Regex::new(p).expect("the test regex should compile");
         assert!(re.is_match(h), "expected {h:?} to match /{p}/");
     }};
 }
@@ -100,7 +100,7 @@ pub fn git(args: &[&str], cwd: &Path) {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .status()
-        .expect("git available");
+        .expect("git should be installed and on PATH");
     assert!(status.success(), "git {args:?} failed in {}", cwd.display());
 }
 
@@ -116,11 +116,11 @@ pub fn git_stdout(args: &[&str], cwd: &Path) -> String {
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_SYSTEM", "/dev/null")
         .output()
-        .expect("git available");
+        .expect("git should be installed and on PATH");
     assert!(
         out.status.success(),
         "git {args:?} failed in {}",
         cwd.display()
     );
-    String::from_utf8(out.stdout).expect("git stdout utf8")
+    String::from_utf8(out.stdout).expect("git stdout should be valid UTF-8")
 }

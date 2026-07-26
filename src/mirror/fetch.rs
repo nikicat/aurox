@@ -8,6 +8,7 @@ use crate::error::{Error, Result};
 use crate::interrupt::cancel_on_sigint;
 use crate::mirror::{MirrorRepo, boxed_http_options};
 use crate::ui::{GixProgress, Operation};
+use crate::units::Stopwatch;
 use gix::ObjectId;
 use gix::bstr::ByteSlice;
 use gix::refs::TargetRef;
@@ -16,7 +17,6 @@ use gix::remote::fetch::{Status, refmap::Mapping};
 use gix::remote::{Direction, ref_map::Options as RefMapOptions};
 use indicatif::MultiProgress;
 use std::sync::Arc;
-use std::time::Instant;
 use tracing::{debug, info, info_span, instrument};
 
 /// One refname change reported by the fetch.
@@ -65,7 +65,7 @@ pub fn incremental_fetch(
         let prepared = {
             let _span = info_span!("prepare_fetch").entered();
             debug!("preparing fetch: handshake + list refs against remote");
-            let t_prepare = Instant::now();
+            let t_prepare = Stopwatch::start();
             // Write ref updates straight into packed-refs instead of one loose
             // file per changed branch. On a ~155k-ref mirror a fetch after hours
             // of AUR churn updates thousands of branches; a single packed-refs
@@ -79,7 +79,7 @@ pub fn incremental_fetch(
                 .map_err(|e| Error::gix("prepare_fetch", e))?
                 .with_write_packed_refs_only(true);
             debug!(
-                elapsed_ms = u64::try_from(t_prepare.elapsed().as_millis()).unwrap_or(u64::MAX),
+                elapsed_ms = t_prepare.ms(),
                 "prepare_fetch returned (ref advertisement complete)"
             );
             prepared
@@ -94,12 +94,12 @@ pub fn incremental_fetch(
         // prelude (1) shows as the gap before gix's first `negotiate` sub-span.
         let _span = info_span!("receive").entered();
         debug!("entering receive: build have-set, negotiate, fetch pack, update refs");
-        let t_receive = Instant::now();
+        let t_receive = Stopwatch::start();
         let outcome = prepared
             .receive(&mut progress, interrupt)
             .map_err(|e| Error::gix("receive", e))?;
         debug!(
-            elapsed_ms = u64::try_from(t_receive.elapsed().as_millis()).unwrap_or(u64::MAX),
+            elapsed_ms = t_receive.ms(),
             "receive returned (pack written, refs negotiated)"
         );
         Ok(outcome)
@@ -111,7 +111,7 @@ pub fn incremental_fetch(
         mappings = outcome.ref_map.mappings.len(),
         "extracting ref deltas from fetch outcome"
     );
-    let t_extract = Instant::now();
+    let t_extract = Stopwatch::start();
     let update_refs = match &outcome.status {
         Status::Change { update_refs, .. } | Status::NoPackReceived { update_refs, .. } => {
             update_refs
@@ -120,7 +120,7 @@ pub fn incremental_fetch(
     let updates = extract_branch_updates(&outcome.ref_map.mappings, update_refs);
     debug!(
         updates = updates.len(),
-        elapsed_ms = u64::try_from(t_extract.elapsed().as_millis()).unwrap_or(u64::MAX),
+        elapsed_ms = t_extract.ms(),
         "extracted ref deltas"
     );
 

@@ -108,7 +108,9 @@ src/
 ├── git.rs           centralized, instrumented system-`git` invocation
 ├── names.rs         typed PkgName / PkgBase / PkgTarget / VirtualName
 ├── version.rs       typed [epoch:]pkgver-pkgrel with vercmp baked in
+├── units.rs         typed quantities: ByteSize / UnixTime / Stopwatch
 ├── paths.rs         XDG-aware state/config path helpers
+├── context.rs       context_local! — thread-locals that reach spawned workers
 ├── rotate.rs        per-run file creation + retention (logs, traces)
 ├── runopts.rs       per-invocation CLI options via a thread-local
 ├── trace.rs         read-side span-trace analysis (shared by bin/trace.rs)
@@ -255,9 +257,9 @@ displace?** The label on the review screen ("install" / "reinstall" /
 "upgrade"), the choice of a diff base for the PKGBUILD review, and the
 fallback note all hinge on it. There are four independent pacman/AUR
 mechanisms by which a build can displace an installed pkg, and conflating
-them produced [the dotnet-runtime regression](#dotnet-runtime-case): a
-provides-substitution upgrade was rendered as a fresh install with no diff.
-The fix is one helper that classifies the answer by provenance.
+them turns a provides-substitution upgrade into what reads as a fresh install
+with no diff (see [the dotnet case](#dotnet-runtime-case)). One helper
+classifies the answer by provenance.
 
 #### Provenance hierarchy
 
@@ -374,11 +376,6 @@ walk        = miss (different lineage)
             → full PKGBUILD shown
 ```
 
-Before the counterpart helper landed, this scenario rendered as
-`install: dotnet-core-7.0-bin 7.0.20.sdk410-2` with the full PKGBUILD and
-no upgrade context — leaving the user to guess whether they were doing a
-fresh install or an upgrade.
-
 **Explicit `replaces=`.** Maintainer renamed a pkg and declared
 `replaces=old-foo` in the new PKGBUILD. User still has `old-foo`.
 
@@ -449,7 +446,7 @@ that's the counterpart with the appropriate provenance. Otherwise it
 falls back to the unhinted walk — so a stale or unmatched hint doesn't
 silently nullify a real counterpart.
 
-#### Worked example: `dotnet-runtime-7.0` regression
+#### Worked example: why the hint exists
 
 ```
 AUR pkgbase = dotnet-core-7.0-bin
@@ -458,10 +455,11 @@ localdb     = { aspnet-runtime@10.0-1, dotnet-runtime-7.0@7.0.20-1 }
 -Syu row    = PkgUpgrade { name: "dotnet-runtime-7.0", … }
 ```
 
-Without a hint, the unhinted walk picks `aspnet-runtime` (first
-declared) — the screen shows "install: dotnet-core-7.0-bin 7.0.20.sdk410-2"
-with no diff, because the new pkgbase's history doesn't carry a commit
-matching aspnet-runtime's 10.0-1.
+Without a hint the unhinted walk picks `aspnet-runtime` (first declared),
+and the screen reads "install: dotnet-core-7.0-bin 7.0.20.sdk410-2" with no
+diff — the new pkgbase's history carries no commit matching aspnet-runtime's
+10.0-1. Declaration order decided which of two installed packages the user
+was told about.
 
 With the hint plumbed through:
 
@@ -512,10 +510,9 @@ Notation:
   `alpm_db::tests` and `resolver::pkgbase_expand::tests`) but no
   end-to-end fixture yet. Every row had a Smoke entry; when adding new
   behaviour, keep it that way.
-- `†` marks a row whose smoke test drove the old `-Syu` *flag* upgrade path,
-  which is now a plain `pacman -Syu` passthrough — the behaviour moved to the
-  shell's `upgrade`, and its e2e coverage is pending a shell-flow (PTY) port.
-  The underlying logic stays unit-tested.
+- `†` marks the one row with **no** end-to-end coverage: reaching it needs a
+  shell `upgrade` PTY driver nobody has written yet. The logic stays
+  unit-tested; a driver for it is worth adding.
 
 | #   | User's localdb                                          | `P` declares                                 | Command + hint origin                | Provenance               | Review header                                          | Smoke |
 | --- | ------------------------------------------------------- | -------------------------------------------- | ------------------------------------ | ------------------------ | ------------------------------------------------------ | ----- |
@@ -527,7 +524,7 @@ Notation:
 | 6   | `X @ v_old` (foreign), P ≠ X                            | pkgbase-level `provides = (X)`               | `-S X` · hint derived (X via provides) | `Provides` (pkgbase)   | `upgrade: P v_old → v_new  [provides X]`               | 38    |
 | 7   | `X @ v_old` (foreign), only X installed                 | `provides = (X, Y)`                          | `-S X` · hint derived (X)            | `Provides` (single hit)  | `upgrade: P v_old → v_new  [provides X]`               | 37    |
 | 8a  | `X @ v_alt`, `Y @ v_old` both foreign                   | `provides = (X, Y)` (X first)                | `-S Y` · hint = Y                    | `Provides` (hint → Y)    | `upgrade: P v_old → v_new  [provides Y]`               | 32    |
-| 8b  | `X @ v_new`, `Y @ v_old` both foreign                   | `provides = (X, Y)` (X first)                | shell `upgrade` → hint = Y           | `Provides` (hint → Y)    | `upgrade: P v_old → v_new  [provides Y]`               | 33† (retired) |
+| 8b  | `X @ v_new`, `Y @ v_old` both foreign                   | `provides = (X, Y)` (X first)                | shell `upgrade` → hint = Y           | `Provides` (hint → Y)    | `upgrade: P v_old → v_new  [provides Y]`               | †     |
 | 9   | `X @ v_old` (foreign)                                   | pkgbase-level `provides = (X)`               | `-S P` · hint none (user typed pkgbase) | `Provides` (pkgbase)  | `upgrade: P v_old → v_new  [provides X]`               | 39    |
 | 10  | one sibling X of split P (canonical)                    | split `P` with pkgnames X, Y, Z              | `-S X` · hint = X                    | `Pkgname` (X)            | `upgrade: P v_old → v_new`                             | 06    |
 | 11  | `X @ v_old` (canonical, P = X)                          | pkgname = X **and** `replaces = (X)` (stale) | `-S X` · hint = X                    | `Pkgname` beats stale Replaces | `upgrade: P v_old → v_new` (no `[replaces …]`)   | 35    |
@@ -552,9 +549,7 @@ Rules the matrix encodes:
   upgrade transition and shows as `upgrade:` plus the `[…]` annotation.
 - **The shell's `upgrade` is the only place a hint comes from outside the
   spec string** (case 8b): each `PkgUpgrade` carries `name`, which
-  `CartItem::from_upgrade` wraps as `Target::with_hint(spec, name)`. (The
-  retired `-Syu` flag picker used to be this source; the flag is now a plain
-  `pacman -Syu` passthrough.)
+  `CartItem::from_upgrade` wraps as `Target::with_hint(spec, name)`.
 
 The matrix is intentionally scoped to *counterpart resolution* (the
 `prepare_one` → `counterpart_with_hint` decision). Sibling concerns like
@@ -585,18 +580,14 @@ branches feed it:
 | `-Syu` row → spec is foreign-installed pkgname X    | **pacman shortcut**               | yes — same `[X]` + deps as by_name rewrite |
 | `-S X` where X is also in a sync repo               | pacman shortcut                   | yes when X is also an AUR split pkgname    |
 
-The pacman-shortcut row was the regression target for the
-google-cloud-cli-bq bug (old smoke 44, retired with the `-Syu` flag's
-upgrade path — the scenario is reached via the shell's `upgrade` now, and
-its e2e port is pending). The `pac.is_installed(bare) || pac.in_sync(bare)`
-short-circuit was originally a pure "let pacman handle this" lane, but
-it also fires for foreign-installed pkgnames that happen to be siblings
-of an AUR split pkgbase. Without recording the selection there too,
-`install_stratum` had no filter and `pacman -U`'d every sibling
-makepkg packaged from the same PKGBUILD. Twin to the
-`record_target_hint` fix (whose old regression was smoke 33): both
-bookkeeping passes (hint, selection) must run on the shortcut path, not
-only on the rewrite path.
+The pacman-shortcut row is the subtle one. The
+`pac.is_installed(bare) || pac.in_sync(bare)` short-circuit reads like a pure
+"let pacman handle this" lane, but it also fires for foreign-installed
+pkgnames that happen to be siblings of an AUR split pkgbase — and without a
+recorded selection there, `install_stratum` has no filter and `pacman -U`s
+every sibling makepkg packaged from the same PKGBUILD. **Both bookkeeping
+passes (hint, selection) must run on the shortcut path, not only on the
+rewrite path.**
 
 `select_outputs` enforces the selection by `(pkgname, version)` rather
 than pkgname alone. The version gate also kills a separate hazard:
@@ -770,8 +761,9 @@ to plumb it through both.
   hold their own clone (see `full_build` and its `WORKER_REPO_OPENS`
   regression seam). Never `gix::open` inside a per-branch worker closure.
 - **`gix` refs under `refs/remotes/origin/*`**: only the bootstrap clone
-  is affected (see custom refspec in `clone.rs`). Subsequent fetches
-  write to `refs/heads/*` because that's what the bare config records.
+  is affected — see the refspec override under "Why gix instead of
+  libgit2 / shelling out to `git`?" above. Subsequent fetches write to
+  `refs/heads/*` because that's what the bare config records.
 - **makepkg refuses to run as root**: the build worktree must be owned
   by a non-root user. In CI / containers this means an unprivileged
   `builder` user with passwordless sudo for the pacman calls.
@@ -781,3 +773,11 @@ to plumb it through both.
 - **Don't add `aur_order: Vec<String>`**: it was replaced by
   `aur_strata: Vec<Vec<String>>`. Use `plan.aur_order()` for a flat
   view; the strata structure is load-bearing for the build pipeline.
+- **Two source-scanning tripwires guard conventions the compiler can't**,
+  and both fail with the offending file listed: `units.rs` forbids
+  `Instant::now()` outside itself (measure with `Stopwatch` — needing a
+  *duration* is not a reason to name a point in time), and `context.rs`
+  forbids bare thread-local declarations outside itself (use
+  `context_local!`, or the value won't reach spawned/rayon workers). They
+  grep the whole `src/` tree, so a doc comment that merely *spells* a
+  banned token trips them — say "bare thread-local", not the macro name.

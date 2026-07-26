@@ -100,7 +100,7 @@ fn eye_column() -> usize {
     ART[EYE_ROW]
         .0
         .find(OPEN_EYES)
-        .expect("the eye row carries the open eyes")
+        .expect("the eye row should carry the open eyes")
 }
 
 /// The eyes' on-screen position and colour — all a blink frame needs to draw.

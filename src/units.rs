@@ -1,4 +1,4 @@
-//! Typed quantity values: byte sizes and unix timestamps.
+//! Typed quantity values: byte sizes, unix timestamps, elapsed durations.
 //!
 //! Same rationale as the name wrappers in [`crate::names`]: a bare `u64`
 //! byte count and a bare `i64` timestamp are both "just integers" to the
@@ -10,7 +10,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use rkyv::{Archive, Deserialize, Serialize};
 use std::fmt;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// A size in bytes (a package's `isize`, a download size).
 ///
@@ -129,9 +129,78 @@ impl UnixTime {
     }
 }
 
+/// A running duration measurement — aurox's only monotonic clock read.
+///
+/// Code that needs "how long did this take" or "has this long passed yet"
+/// needs a *duration*, not a point in time, and an `Instant::now()` at the
+/// call site buries that behind clock arithmetic every reader re-derives
+/// (CLAUDE.md "Time enters as a duration, never a clock read"). Start one of
+/// these instead and ask it for the elapsed span; the `Instant` never
+/// escapes. Decision logic takes the `Duration` as a *parameter* — see
+/// `ui::gix_progress::IdleTracker`, whose tests feed it synthetic spans with
+/// no clock in sight — and bounded waits belong on a timer channel, not on a
+/// deadline computed here.
+///
+/// [`Self::ms`] exists because every tracing span records the same
+/// `elapsed_ms` field, and the saturating `u128 → u64` narrowing is a fact
+/// about that field, not something six call sites should each retype.
+#[derive(Debug, Clone, Copy)]
+pub struct Stopwatch(Instant);
+
+impl Stopwatch {
+    /// Start measuring now.
+    pub fn start() -> Self {
+        Self(Instant::now())
+    }
+
+    /// The span since [`Self::start`].
+    pub fn elapsed(self) -> Duration {
+        self.0.elapsed()
+    }
+
+    /// The span since [`Self::start`] in whole milliseconds, saturating at
+    /// `u64::MAX` — the shape tracing's `elapsed_ms` field wants.
+    pub fn ms(self) -> u64 {
+        u64::try_from(self.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The convention only holds if it holds everywhere: a clock read at a
+    /// call site is exactly the thing [`Stopwatch`] exists to remove, and it
+    /// re-appears one "just this once" at a time. Same shape as the
+    /// bare-thread-local tripwire in `context.rs` — which, note, greps for
+    /// its own banned token, so don't spell that token here.
+    #[test]
+    fn no_bare_instant_now_outside_units() {
+        fn scan(dir: &std::path::Path, offenders: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, offenders);
+                } else if path.extension().is_some_and(|e| e == "rs")
+                    && path.file_name().is_some_and(|n| n != "units.rs")
+                    && std::fs::read_to_string(&path)
+                        .unwrap()
+                        .contains("Instant::now()")
+                {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        scan(&src, &mut offenders);
+        assert!(
+            offenders.is_empty(),
+            "measure with `units::Stopwatch` (src/units.rs), not a bare \
+             `Instant::now()`: code that only needs a duration shouldn't name \
+             a point in time. Offenders: {offenders:?}",
+        );
+    }
 
     #[test]
     fn byte_size_picks_unit_and_precision() {

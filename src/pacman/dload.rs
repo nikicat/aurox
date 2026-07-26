@@ -241,12 +241,13 @@ mod tests {
     use super::{FetchOutcome, FetchSpec};
     use crate::context;
     use crate::error::Error;
+    use crate::units::Stopwatch;
     use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    use std::time::{Duration, Instant, SystemTime};
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
 
     /// Serve exactly one HTTP request on a fresh localhost port, answering
@@ -420,7 +421,7 @@ mod tests {
                 force: false,
                 interrupt: &interrupt,
             };
-            let started = Instant::now();
+            let started = Stopwatch::start();
             // The "user" hits Ctrl+C once the first bytes have arrived.
             let err = spec
                 .run(|p| {

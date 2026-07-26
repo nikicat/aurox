@@ -5,8 +5,9 @@
 //! install + upgrade) over the same sort/verdiff/size/build-time machinery the
 //! old upgrade-loop preview used, plus the pulled-in dependency rows, the
 //! "will remove" rows, and a batch total. `apply` no longer redraws it — it
-//! gates on the one-line [`cost_summary`] instead (`docs/plans/shell-ui.md`,
-//! phase 5a). The renderers *return* their lines so the shell owns the output
+//! gates on the one-line [`cost_summary`] instead: the explicit `apply` after
+//! the approval gate is the consent, so a second full table would be a prompt
+//! nobody answers. The renderers *return* their lines so the shell owns the output
 //! stream and the layout is unit-testable.
 //!
 //! Two cost figures live here:
@@ -826,7 +827,7 @@ mod tests {
         );
     }
 
-    /// Regression (docs/TODO.md): a single never-built AUR package has an
+    /// Regression: a single never-built AUR package has an
     /// `Unknown` build time. The summary must never fake a summed `0s build`;
     /// since the screencast review (docs/plans/screencasts.md) the unknown
     /// term is dropped outright — `? build` was noise on top of the per-row

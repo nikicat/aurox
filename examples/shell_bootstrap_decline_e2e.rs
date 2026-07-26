@@ -22,7 +22,7 @@ fn main() {
     pty.expect("pacman-only banner", |s| {
         s.contains("aurox shell (pacman-only)")
     });
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
 
     // Launch 2: the choice sticks — marked banner, no question, no nag.
@@ -35,7 +35,7 @@ fn main() {
         !screen.contains("sync the AUR now?"),
         "second launch must not re-ask:\n{screen}"
     );
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_BOOTSTRAP_DECLINE_E2E_OK");
 }

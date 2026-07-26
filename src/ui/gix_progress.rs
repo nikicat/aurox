@@ -13,16 +13,17 @@ use super::progress::{
     promote_count_bar, resume_byte_bar, tick,
 };
 use crate::context;
+use crate::units::Stopwatch;
 
 use gix::progress::prodash::progress::Step;
 use gix::progress::{Count as GixCount, Id, MessageLevel, Unit};
 use gix::{NestedProgress, Progress as GixProgressTrait};
 use indicatif::{MultiProgress, ProgressBar};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Adapter implementing [`gix::Progress`] / [`gix::NestedProgress`] on top of
 /// our indicatif bars.
@@ -69,11 +70,20 @@ struct NetMeter {
     counter: Arc<AtomicU64>,
     /// The `network` row in the [`Shared::multi`].
     bar: ProgressBar,
-    /// Set to stop the pump thread.
-    stop: Arc<AtomicBool>,
+    /// Stop signal. The pump spends its rest between samples blocked on the
+    /// receiving end, so a teardown lands immediately instead of up to one
+    /// sample interval late — and the send is what ends the thread, not a
+    /// flag it happens to notice next time it wakes.
+    stop: mpsc::Sender<()>,
     /// Pump handle; `take`n by the first [`NetMeter::stop_and_clear`].
     handle: Mutex<Option<JoinHandle<()>>>,
 }
+
+/// How often the pump samples [`NetMeter::counter`] into its bar. The sample
+/// itself can't be event-driven — the curl backend just bumps an atomic, with
+/// nothing to subscribe to — so this cadence is a genuine forced poll, and
+/// the only one in the meter: stopping is an event (see [`NetMeter::stop`]).
+const NET_SAMPLE_INTERVAL: Duration = Duration::from_millis(120);
 
 /// Trailing window over which wire activity is judged: the `network` row is
 /// parked in its idle style once fewer than [`NET_ACTIVE_BYTES`] arrived
@@ -108,26 +118,33 @@ enum WireState {
 /// their own cadence. The wire counts as [`WireState::Active`] only while at
 /// least [`NET_ACTIVE_BYTES`] arrived within the trailing [`NET_IDLE_AFTER`]
 /// window; each crossing of that line is reported exactly once.
+///
+/// Samples arrive stamped with the age of the pump, not a clock reading: the
+/// window logic only ever asks "how far apart are these two samples", so the
+/// tracker is exercised with plain [`Duration`]s and never observes time
+/// passing on its own.
 struct IdleTracker {
-    /// `(sample instant, cumulative byte count)`, newest at the back. The
-    /// front entry is kept just outside the window as the baseline, so the
-    /// byte delta always spans at least [`NET_IDLE_AFTER`].
-    samples: VecDeque<(Instant, u64)>,
+    /// `(sample age, cumulative byte count)`, newest at the back — ages
+    /// measured from the pump's start. The front entry is kept just outside
+    /// the window as the baseline, so the byte delta always spans at least
+    /// [`NET_IDLE_AFTER`].
+    samples: VecDeque<(Duration, u64)>,
     idle: bool,
 }
 
 impl IdleTracker {
-    fn new(now: Instant) -> Self {
+    fn new() -> Self {
         Self {
-            samples: VecDeque::from([(now, 0)]),
+            samples: VecDeque::from([(Duration::ZERO, 0)]),
             idle: false,
         }
     }
 
-    /// Digest one pump sample; returns the new state when it flipped.
-    fn observe(&mut self, pos: u64, now: Instant) -> Option<WireState> {
-        self.samples.push_back((now, pos));
-        while self.samples.len() > 1 && now.duration_since(self.samples[1].0) >= NET_IDLE_AFTER {
+    /// Digest one pump sample, `age` being how long the pump has been running.
+    /// Returns the new state when it flipped.
+    fn observe(&mut self, pos: u64, age: Duration) -> Option<WireState> {
+        self.samples.push_back((age, pos));
+        while self.samples.len() > 1 && age.saturating_sub(self.samples[1].0) >= NET_IDLE_AFTER {
             self.samples.pop_front();
         }
         let baseline = self.samples[0].1;
@@ -154,22 +171,26 @@ impl NetMeter {
         let counter = Arc::new(AtomicU64::new(0));
         let bar = multi.add(bar_bytes_streaming("network"));
         tick(&bar);
-        let stop = Arc::new(AtomicBool::new(false));
+        let (stop, stopped) = mpsc::channel();
         let handle = context::spawn({
             let counter = Arc::clone(&counter);
             let bar = bar.clone();
-            let stop = Arc::clone(&stop);
             move || {
-                let mut wire = IdleTracker::new(Instant::now());
-                while !stop.load(Ordering::Relaxed) {
+                let running = Stopwatch::start();
+                let mut wire = IdleTracker::new();
+                // Rest on the stop channel rather than sleeping through it: a
+                // timeout is the next sample, anything else (a ping, or the
+                // meter dropping its sender) ends the pump at once.
+                while stopped.recv_timeout(NET_SAMPLE_INTERVAL)
+                    == Err(mpsc::RecvTimeoutError::Timeout)
+                {
                     let pos = counter.load(Ordering::Relaxed);
-                    match wire.observe(pos, Instant::now()) {
+                    match wire.observe(pos, running.elapsed()) {
                         Some(WireState::Idle) => idle_byte_bar(&bar),
                         Some(WireState::Active) => resume_byte_bar(&bar),
                         None => {}
                     }
                     bar.set_position(pos);
-                    std::thread::sleep(Duration::from_millis(120));
                 }
             }
         });
@@ -184,7 +205,8 @@ impl NetMeter {
     /// Stop the pump, join it, and clear the row. Idempotent: the handle is
     /// taken once, so a later call (e.g. from `Drop`) is a no-op.
     fn stop_and_clear(&self) {
-        self.stop.store(true, Ordering::Relaxed);
+        // A failed send means the pump already returned — nothing to stop.
+        self.stop.send(()).ok();
         // Bind the `take` out of the guard first so the lock isn't held across
         // the `join` (matches the leaf-clearing idiom in `finish`/`Drop`).
         let handle = self.handle.lock().unwrap().take();
@@ -594,14 +616,18 @@ impl NestedProgress for GixProgress {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     /// Wait (bounded) for the pump to mirror `counter` into `bar`. Returns the
     /// observed position so callers can assert; bounded so a slow box can't
     /// hang the suite if the pump is broken.
+    ///
+    /// A poll forced by the API: indicatif publishes no change signal, so the
+    /// only way to observe the pump is to re-read the bar — there is no event
+    /// to block on. The bound is absolute (computed once, before the loop),
+    /// not a per-iteration budget that a slow tick could keep re-arming.
     fn wait_for_position(bar: &ProgressBar, want: u64) -> u64 {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while bar.position() != want && Instant::now() < deadline {
+        let waited = Stopwatch::start();
+        while bar.position() != want && waited.elapsed() < Duration::from_secs(2) {
             std::thread::sleep(Duration::from_millis(20));
         }
         bar.position()
@@ -635,9 +661,8 @@ mod tests {
     /// each transition exactly once.
     #[test]
     fn idle_tracker_flips_on_silence_and_back_on_bytes() {
-        let t0 = Instant::now();
-        let ms = |n| t0 + Duration::from_millis(n);
-        let mut wire = IdleTracker::new(t0);
+        let ms = Duration::from_millis;
+        let mut wire = IdleTracker::new();
         assert_eq!(
             wire.observe(NET_ACTIVE_BYTES, ms(120)),
             None,
@@ -675,10 +700,9 @@ mod tests {
     /// show a zero rate.
     #[test]
     fn idle_tracker_parks_before_first_byte() {
-        let t0 = Instant::now();
-        let mut wire = IdleTracker::new(t0);
+        let mut wire = IdleTracker::new();
         assert_eq!(
-            wire.observe(0, t0 + Duration::from_millis(120)),
+            wire.observe(0, Duration::from_millis(120)),
             Some(WireState::Idle)
         );
     }
@@ -690,9 +714,8 @@ mod tests {
     /// only the real pack stream may un-park the row.
     #[test]
     fn idle_tracker_ignores_sideband_trickle() {
-        let t0 = Instant::now();
-        let s = |n| t0 + Duration::from_secs(n);
-        let mut wire = IdleTracker::new(t0);
+        let s = Duration::from_secs;
+        let mut wire = IdleTracker::new();
         assert_eq!(wire.observe(0, s(2)), Some(WireState::Idle));
         for i in 1..30 {
             assert_eq!(
@@ -713,9 +736,8 @@ mod tests {
     /// moving (the old any-byte logic would have kept it active forever).
     #[test]
     fn idle_tracker_parks_when_stream_degrades_to_trickle() {
-        let t0 = Instant::now();
-        let ms = |n| t0 + Duration::from_millis(n);
-        let mut wire = IdleTracker::new(t0);
+        let ms = Duration::from_millis;
+        let mut wire = IdleTracker::new();
         assert_eq!(wire.observe(NET_ACTIVE_BYTES, ms(120)), None, "streaming");
         assert_eq!(
             wire.observe(NET_ACTIVE_BYTES + 60, ms(1_200)),

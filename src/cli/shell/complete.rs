@@ -1,7 +1,7 @@
 //! Tab-completion for the interactive shell.
 //!
 //! A rustyline [`Helper`] whose [`Completer`] is **context-aware** and
-//! **positional** (see the "Tab completion" section of `docs/plans/shell-ui.md`):
+//! **positional**:
 //!
 //! | Cursor position | Completes to |
 //! | --- | --- |

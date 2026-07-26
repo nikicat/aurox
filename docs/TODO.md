@@ -1,14 +1,19 @@
 # TODO
 
+Open work only. A finished item is *deleted*, not archived here: the commit
+carries what changed and why, and any rationale worth keeping belongs next to
+the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
+— never in a list nobody reads on the way to the answer.
+
 ## Shell
 
 - `upgrade` runs the AUR refresh unconditionally whenever the AUR is
   enabled in config: there is no way to upgrade just pacman packages
   without sitting through the AUR fetch first — bad UX on a slow-mirror
   day. The repo half should be reachable without (or before) the AUR half.
-  (A ^C mid-refresh now aborts cleanly back to the prompt — see the Done
-  note below — so one option is to let it degrade the upgrade to repo-only
-  rather than abandoning it entirely.)
+  (A ^C mid-refresh already aborts cleanly back to the prompt, so one option
+  is to let that degrade the upgrade to repo-only rather than abandoning it
+  entirely.)
 - search results should be colored — the shell's numbered list renders as a
   dim monochrome table (`src/ui/search_table.rs`) while `-Ss` styles
   repo/name/version. Whatever palette lands, the installed flag must stay
@@ -42,6 +47,30 @@
   `format!("{}{}")` tails) — so the tail is ready for `Style`-carrying cells;
   the remaining work is making `Cell` itself carry style-as-data instead of a
   rendered string.
+- colorize the `info <pkg>` table — it renders monochrome while the
+  transaction/search surfaces are styled. Same palette question as the search
+  list above; `src/ui/tables.rs` (`install_table`) is the renderer.
+- **dropping from an upgrade cart should mark, not delete.** `drop` today
+  removes the row (`Cart::unstage`, `src/cli/shell/cart.rs`), so the numbered
+  list renumbers under the user and every subsequent selector means something
+  different than it did a line ago. A dropped row should stay in place, marked
+  *dropped*/skipped and excluded from apply — stable numbering, visible
+  decision, trivially undoable by re-adding. Touches the cart model (a per-item
+  state, not a `Vec` removal), the change-set renderer, and apply's filter.
+- **bug: adding an already-installed package stages it as new, not an
+  upgrade.** Observed after `add <installed-pkg>`: the cart row shows the
+  install shape instead of `old → new`. The upgrade path gets this right, so
+  the installed-version lookup is missing (or ignored) on the `add` staging
+  path — find the one seam both should route through.
+- bare-token shortcut after a search: entering just a number (`1`, `22`) at the
+  prompt should mean `add <number>` against the last search list, and a bare
+  package name should mean `add <name>`. Watch the ambiguity with verbs and
+  with the selector vocabulary — a bare token that parses as a known verb stays
+  a verb.
+- rename `apply` → `do`, demoting `apply` to an alias: `do` is what the action
+  is, and it's already accepted (`ALIASES` in `src/cli/shell/command.rs` maps
+  both `do` and `commit`). Swap the canonical name (`Verb::name`, help text,
+  completion, prompts and docs that say "apply") and keep `apply` working.
 - noticeable delay on exit: quitting takes a visible beat before the
   terminal prompt returns. Not reproducible at fixture scale — the hero
   demo cast measures quit → bash prompt at ~10 ms — so profile against a
@@ -93,118 +122,3 @@
 ## AUR
 
 - account for already downloaded sources when printing download sizes in tables
-
-## Code health — 2026-07-25 harness-refactor follow-ups
-
-The pty-harness rewrite (funnel channel + waiter thread, `pump_one` single
-decode site, crossbeam `after()` timer channels, silence-vs-absolute bounds,
-"should"-style expect messages) established conventions now recorded in
-CLAUDE.md ("Time enters as a duration…", "Block on events…", "Panics state
-the violated expectation"). Sweep the rest of the tree up to them:
-
-- **`.expect()` messages in `src/`** — convert runtime expects from terse
-  operation labels to the std "should" phrasing (`.expect("git available")`
-  → `.expect("git should be installed and on PATH")`). Known offenders in
-  `src/git.rs` ("git available" ×2, "git stdout utf8"); grep `\.expect\("`
-  for the rest. `#[cfg(test)]` scaffolding may stay terse; invariant
-  statements ("writing to a String never fails") just need phrase-checking.
-- **`Instant::now()` audit in `src/`** — `pacman/dload.rs`, `build.rs`,
-  `index/build.rs`, `git.rs`, `mirror/fetch.rs`, `ui/gix_progress.rs`.
-  Classify each: genuine *measurement* (elapsed metrics, progress rates)
-  keeps the clock; *control-flow* deadline/remaining arithmetic converts to
-  a `Duration` budget turned into a crossbeam `after()` timer selected
-  beside the data channel, choosing absolute vs silence semantics per site
-  (absolute where continuous redraws would reset a per-recv timeout;
-  silence where the only legitimate wake is an event). Exemplar:
-  `pty-harness/src/lib.rs` (`Timer`, `pump_one`, `try_expect` vs `finish`).
-- **sleep/poll loops in `src/`** — `build/makepkg.rs`, `ui/gix_progress.rs`,
-  `ui/banner.rs`, `pacman/sync.rs`, `logging/chrome.rs`. Sleep-and-check
-  loops become blocking waits on the actual event; an API that only blocks
-  gets the sentinel-thread pattern (blocking call owned by a thread,
-  completion becomes a channel message, out-of-band cancel handle). Where a
-  poll is genuinely forced, keep it with a comment naming the API constraint
-  that forces it. Pure pacing sleeps (animation frames, demo dwell) are not
-  polls — leave them.
-- **PTY driver ack-discipline audit** — every `examples/*_e2e.rs` and
-  `demo_*.rs` against the two failure classes from the 2026-07-25 CI hang
-  post-mortem (see docs/TESTING.md "Writing PTY e2e drivers"): needles that
-  stale-match earlier screen content instead of proving the reading prompt
-  is armed (the `1 to install` txn-header trap, run 29876293421's 6h hang),
-  and prompts reached but never answered (`install_offer_e2e` passed for
-  weeks only because a stray buffered newline fed the sudo `Continue?`
-  gate). For each driver: trace the scenario's real prompt sequence, verify
-  each prompt has an expect+answer pair with an arming-proof needle;
-  flake-hunt with the test listed several times in one `run.sh` call.
-
-<!-- Done:
-- search ranking weights freshness (health), not just tie-breaks on it
-  (`src/cli/search.rs` `RankKey`): the chain is now exact-name → match-tier →
-  health → repo-before-AUR → shorter-name → freshest-commit → lexical. An
-  abandoned AUR row (a *non-VCS* PKGBUILD past the stale threshold) sinks to the
-  bottom of its tier via a 2-bucket `Health {Healthy, Stale}` weight, so a fresh
-  maintained package outranks a stale one it would beat on name length alone.
-  Decisions: an **exact-name** hit is its own top tier and can't be demoted by
-  freshness (you typed it → you get it, stale-badged); the too-fresh *caution*
-  band stays a color warning only, not a sort demotion; and a **VCS** pkgbase
-  (`PkgBase::is_vcs`) never reads stale — its old PKGBUILD is stable packaging,
-  not abandonment, so `AgeScale::badge`/`FreshnessBand::vcs_clamped` clamp stale →
-  maturing for both the ranking health and the displayed badge. `rank_rows` now
-  threads the `AgeScale` so every surface (shell, pipe, `-Ss`) ranks identically.
-- config-selectable two-line search rows, pacman-style (`№ repo/name version
-  [installed] [age]` headline + indented description line): a typed
-  `SearchLayout` knob (`auto`/`single`/`double`, default `auto`) resolved by
-  `ui::SearchList`, which renders best-first rows best-last at *row* granularity
-  (a two-line row's headline + desc stay paired, unlike the old flat
-  `Table::reversed`). `auto` measures the single-line layout against the terminal
-  width (`ui::term_width`) and flips to two-line when a row would wrap; a pipe
-  (no width) stays dense single-line. `-Ss` stays two-line for pacman parity.
-  The two-line renderer + the knob live in `ui/search_layout.rs`; the
-  `[installed]`/`[installed: X]` marker text is shared with `-Ss`
-  (`installed_marker_text`) so the two can't drift.
-- Ctrl-C at the *idle* shell prompt exits aurox (130 = 128+SIGINT), like
-  Ctrl-D — mid-operation ^C still bails to the prompt, but an idle ^C now
-  means "leave the shell" instead of being swallowed. Demoed by
-  examples/demo_ctrlc_quit.rs (a bash-visible `echo $?` shows the 130);
-  pinned by extended/38.
-- Ctrl-C during the *official-repo* DB refresh aborts the download promptly
-  instead of waiting the transfer out: libalpm's internal downloader can't be
-  interrupted from outside (pacman _Exits on ^C), so the refresh handle now
-  registers aurox's own fetch callback (src/pacman/dload.rs, curl) whose
-  progress meter watches the SIGINT flag; `refresh_sync_db` runs under
-  `interrupt::cancel_on_sigint` (moved out of mirror.rs), which also stops a
-  repo-only refresh from dying to the default SIGINT disposition. Same
-  If-Modified-Since/mtime semantics as libalpm's downloader, `file://`
-  included. Demoed by examples/demo_ctrlc_repo_refresh.rs (against
-  hung_mirror); pinned by extended/39 + smoke/55.
-- save review approvals for concrete versions persistently: consented
-  approvals (diff answered at the prompt, explicit `approve`) land in
-  `reviews.db` keyed by (pkgbase, PKGBUILD commit) — src/build/reviews.rs.
-  The pipeline skips re-review at the same commit; the shell stages
-  previously-approved versions pre-approved. `--noconfirm` and the unseen
-  tail of an "approve all" never persist.
-- Ctrl-C during a shell repo/AUR *refresh* now bails back to the prompt instead
-  of taking aurox down: `mirror::cancel_on_sigint` wraps the gix fetch/clone in
-  a SIGINT guard (the build path's `signal_hook` pattern), and a new
-  gix-transport `http::Options::should_interrupt` lets the curl backend abort a
-  fetch parked on an idle/slow socket that the cooperative check can't reach.
-  Demoed by examples/demo_ctrlc_refresh.rs against examples/hung_mirror.rs (a
-  server that answers headers then stalls); pinned by extended/37.
-- show time since last commit for AUR packages: the transaction table renders
-  a dimmed `(Xd ago)` age cell per AUR row (from the pkgbase's branch-tip
-  commit time), and search ranks AUR ties freshest-first.
-- remove ~ before times/sizes: the approximate prefix is gone everywhere
-  (per-cell + totals + search list); an estimate now reads as the bare figure.
-  A *summed* total that under-counts because a row's figure is unknown is a
-  lower bound, rendered `>XXhYYm` / `>N MiB` instead. (src/ui/cost.rs +
-  src/ui/change_set.rs)
-- never-built build-time no longer renders `~0s build`: an all-unknown build
-  total is `? build`; TimeEst/SizeEst totals collapse to their own figure kind.
--->
-
-## Related design note
-
-The build-time figure is a real `TimeEst` (`Estimate(Duration)` / `Unknown` /
-`None`) and its per-batch *total* is a `TimeTotal` (`Measured{total,bound}` /
-`Unknown` / `None`); size mirrors it (`SizeEst` cell, `SizeTotal` total). The
-`bound: Bound::{Exact,Lower}` on a total is what prints the `>` lower-bound
-marker when an unknown row drags the sum below the true value.

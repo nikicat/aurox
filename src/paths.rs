@@ -26,14 +26,22 @@ pub fn state_dir() -> PathBuf {
         return root;
     }
     dirs::state_dir()
-        .unwrap_or_else(|| dirs::home_dir().expect("home dir").join(".local/state"))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .expect("the home directory should be discoverable")
+                .join(".local/state")
+        })
         .join("aurox")
 }
 
 /// Root for per-user config (e.g. `$XDG_CONFIG_HOME/aurox`).
 pub fn config_dir() -> PathBuf {
     dirs::config_dir()
-        .unwrap_or_else(|| dirs::home_dir().expect("home dir").join(".config"))
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .expect("the home directory should be discoverable")
+                .join(".config")
+        })
         .join("aurox")
 }
 

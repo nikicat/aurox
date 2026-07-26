@@ -21,13 +21,13 @@ fn main() {
     // real core/extra upgrades the image carries. The `.sh` ran `-Sy` moments
     // ago, so the TTL check skips the fetch and the staged row renders from
     // the fresh index.
-    pty.send(b"upgrade test-trivial\r");
+    pty.send_command("upgrade test-trivial");
     pty.expect("staged upgrade row", |s| {
         has(s, "test-trivial 1.0-1 → 2.0-1")
     });
     pty.expect("built tag on the pre-built row", |s| s.contains("built"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_BUILT_TAG_E2E_OK");
 }

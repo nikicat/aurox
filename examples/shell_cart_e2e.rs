@@ -27,11 +27,11 @@ fn main() {
     pty.expect("shell banner", |s| s.contains("aurox shell"));
 
     // Stage the AUR fixture — it lands needing review (review_default=prompt).
-    pty.send(b"add test-trivial\r");
+    pty.send_command("add test-trivial");
     pty.expect("staged test-trivial", |s| s.contains("staged test-trivial"));
 
     // The approval gate refuses to apply while the AUR item is unreviewed.
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     // The gate's needle must be its distinct `needs review: <names>` form —
     // the staging status line also says "needs review" (the singular hint),
     // and matching that would race the next send against rustyline's redraw
@@ -41,10 +41,10 @@ fn main() {
     });
 
     // Approve without opening a diff, then apply for real.
-    pty.send(b"approve test-trivial\r");
+    pty.send_command("approve test-trivial");
     pty.expect("approved", |s| s.contains("approved test-trivial"));
 
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     // The explicit `apply` is the consent — no transaction confirm. The
     // one-line cost summary prints and the build runs; no deps are pulled in
     // (only_requested), so the first and only prompt is the sudo gate before
@@ -59,10 +59,10 @@ fn main() {
     pty.expect("apply finished", |s| s.contains("done"));
     // `show` then reports the cart empty — the shell-side proof the build +
     // install succeeded (a failure would keep the cart and this would time out).
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("cart cleared after apply", |s| s.contains("cart is empty"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_CART_E2E_OK");
 }

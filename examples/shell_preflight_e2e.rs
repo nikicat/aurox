@@ -19,16 +19,7 @@
 //!      `pacman -U` ahead of the `pacman -Syu` lane, and the whole
 //!      transaction lands.
 
-use pty_harness::Pty;
-
-/// Whitespace-insensitive containment: the preflight's warning/note lines run
-/// past the 100-col PTY and wrap on the vt100 grid, splitting any long needle
-/// with an injected row boundary. Compacting both sides makes the match
-/// immune to where the wrap lands.
-fn has(screen: &str, needle: &str) -> bool {
-    let compact = |s: &str| -> String { s.chars().filter(|c| !c.is_whitespace()).collect() };
-    compact(screen).contains(&compact(needle))
-}
+use pty_harness::{Pty, armed_after, has};
 
 fn main() {
     // The rebuild fix lives in the AUR, so this scenario needs the index:
@@ -46,7 +37,7 @@ fn main() {
     // the AUR rebuild — so the preflight already sees its fix staged and
     // renders the informational note, not a blocking warning. (The unstaged
     // real candidates land in `--ignore`, which the preflight mirrors.)
-    pty.send(b"upgrade test-jpeg-provider test-breaks-dep\r");
+    pty.send_command("upgrade test-jpeg-provider test-breaks-dep");
     pty.expect("repo upgrade staged", |s| {
         // Column padding varies with the widest row, so match compacted.
         has(s, "test-jpeg-provider 1.0-1 → 2.0-1")
@@ -61,16 +52,16 @@ fn main() {
     // 2. Un-stage the rebuild: the same issue must now surface as a warning
     // with the AUR-aware `add` remediation hint. `drop` is quiet (no table,
     // so no preview notes) — `show` renders the warning.
-    pty.send(b"drop test-breaks-dep\r");
+    pty.send_command("drop test-breaks-dep");
     pty.expect("rebuild dropped", |s| has(s, "dropped test-breaks-dep"));
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("preview warns with the add hint", |s| {
         has(s, "`add test-breaks-dep` stages a rebuild")
     });
 
     // 3. `apply` gates on the preflight before the cost summary / confirm /
     // sudo. Bare Enter takes the default — no — and the cart survives.
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     pty.expect("override prompt", |s| {
         has(s, "Repo upgrade expected to fail")
     });
@@ -92,17 +83,17 @@ fn main() {
     // 4. Follow the hint: stage + approve the rebuild, apply for real. Every
     // command waits for its acknowledgement — input sent while output is
     // still streaming is dropped when rustyline re-enters raw mode.
-    pty.send(b"add test-breaks-dep\r");
+    pty.send_command("add test-breaks-dep");
     pty.expect("rebuild staged", |s| has(s, "staged test-breaks-dep"));
-    pty.send(b"approve test-breaks-dep\r");
+    pty.send_command("approve test-breaks-dep");
     pty.expect("rebuild approved", |s| has(s, "approved test-breaks-dep"));
-    pty.send(b"apply\r");
+    pty.send_command("apply");
 
     // Blocker phase first (no transaction confirm — the explicit `apply` is
     // the consent): the rebuild's `pacman -U` must be elevated before any
     // `pacman -Syu` appears.
     pty.expect("blocker install sudo gate", |s| {
-        s.contains("pacman -U") && s.contains("Continue?")
+        armed_after(s, "pacman -U", "Continue?")
     });
     assert!(
         !pty.screen().contains("pacman -Syu"),
@@ -111,19 +102,21 @@ fn main() {
     );
     pty.send(b"\r");
 
-    // Then the repo lane, now unblocked.
+    // Then the repo lane, now unblocked. `Continue?` alone would match the
+    // answered blocker gate still on screen, and `pacman -Syu` alone matches
+    // its own elevation preview — printed before dialoguer arms the confirm.
     pty.expect("repo lane sudo gate", |s| {
-        s.contains("pacman -Syu") && s.contains("Continue?")
+        armed_after(s, "pacman -Syu", "Continue?")
     });
     pty.send(b"\r");
 
     // Wait for the apply to finish before driving `show` (buffered input is
     // dropped when rustyline re-enters raw mode — see the PTY e2e notes).
     pty.expect("apply finished", |s| s.contains("done"));
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("cart cleared after apply", |s| s.contains("cart is empty"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_PREFLIGHT_E2E_OK");
 }

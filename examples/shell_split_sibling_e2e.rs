@@ -16,25 +16,25 @@ fn main() {
     let mut pty = Pty::spawn_aurox();
     pty.expect("shell banner", |s| s.contains("aurox shell"));
 
-    pty.send(b"upgrade test-syu-split-foreign-cli\r");
+    pty.send_command("upgrade test-syu-split-foreign-cli");
     pty.expect("foreign sibling staged", |s| {
         has(s, "test-syu-split-foreign-cli 1.0-1 → 2.0-1")
     });
 
-    pty.send(b"approve *\r");
+    pty.send_command("approve *");
     pty.expect("approved", |s| {
         s.contains("approved test-syu-split-foreign-cli")
     });
 
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     pty.expect("sudo gate", |s| s.contains("Continue?"));
     pty.send(b"\r");
     pty.expect("apply finished", |s| s.contains("done"));
 
-    pty.send(b"show\r");
+    pty.send_command("show");
     pty.expect("cart cleared after apply", |s| s.contains("cart is empty"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_SPLIT_SIBLING_E2E_OK");
 }

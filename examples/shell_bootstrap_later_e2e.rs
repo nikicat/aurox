@@ -26,14 +26,14 @@ fn main() {
 
     // A bare `refresh` after "Later" must NOT spring the ~2 GiB clone: it
     // skips the AUR half and points at the explicit scope word instead.
-    pty.send(b"refresh\r");
+    pty.send_command("refresh");
     pty.expect("bare refresh skips the AUR", |s| {
         s.contains("AUR not synced — `refresh aur` runs the one-time setup")
     });
 
     // `refresh aur` after the launch question IS the consent — a one-line
     // heads-up instead of a second Y/n, then the bootstrap runs.
-    pty.send(b"refresh aur\r");
+    pty.send_command("refresh aur");
     pty.expect("pre-consented heads-up", |s| {
         s.contains("syncing the AUR — one-time")
     });
@@ -44,13 +44,13 @@ fn main() {
     // The session reloaded the fresh index: an AUR-only name resolves now.
     // Match the result row (repo bucket + name on one line), not the echo of
     // the typed command — that line contains "search", the row doesn't.
-    pty.send(b"search ^test-trivial$\r");
+    pty.send_command("search ^test-trivial$");
     pty.expect("aur row", |s| {
         s.lines()
             .any(|l| l.contains("test-trivial") && l.contains("aur") && !l.contains("search"))
     });
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_BOOTSTRAP_LATER_E2E_OK");
 }

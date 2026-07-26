@@ -15,19 +15,19 @@ fn main() {
     let mut pty = Pty::spawn_aurox();
     pty.expect("shell banner", |s| s.contains("aurox shell"));
 
-    pty.send(b"add test-fail-build\r");
+    pty.send_command("add test-fail-build");
     pty.expect("staged test-fail-build", |s| {
         s.contains("staged test-fail-build")
     });
-    pty.send(b"add test-trivial\r");
+    pty.send_command("add test-trivial");
     pty.expect("staged test-trivial", |s| s.contains("staged test-trivial"));
 
-    pty.send(b"approve *\r");
+    pty.send_command("approve *");
     pty.expect("both approved", |s| {
         s.contains("approved test-fail-build") && s.contains("approved test-trivial")
     });
 
-    pty.send(b"apply\r");
+    pty.send_command("apply");
     // The stratum builds both: the failure is reported, then the survivor's
     // batched install fires the sudo gate.
     pty.expect("build failure reported", |s| {
@@ -41,13 +41,13 @@ fn main() {
 
     // The offender is still staged; dropping it empties the cart (the drop
     // reprints the transaction, which is now empty).
-    pty.send(b"drop test-fail-build\r");
+    pty.send_command("drop test-fail-build");
     pty.expect("offender dropped", |s| {
         s.contains("dropped test-fail-build")
     });
     pty.expect("cart empty after drop", |s| s.contains("cart is empty"));
 
-    pty.send(b"quit\r");
+    pty.send_command("quit");
     pty.finish_clean();
     println!("SHELL_APPLY_FAILURE_E2E_OK");
 }

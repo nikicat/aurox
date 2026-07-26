@@ -214,8 +214,14 @@ fn exec_pacman_teed(program: &str, spawn_args: &[String]) -> Result<u8> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
-    let out_pipe = child.stdout.take().expect("stdout piped above");
-    let err_pipe = child.stderr.take().expect("stderr piped above");
+    let out_pipe = child
+        .stdout
+        .take()
+        .expect("pacman stdout should be piped, as configured above");
+    let err_pipe = child
+        .stderr
+        .take()
+        .expect("pacman stderr should be piped, as configured above");
     let tee_out = context::spawn(move || tee_pipe(out_pipe, std::io::stdout()));
     let tee_err = context::spawn(move || tee_pipe(err_pipe, std::io::stderr()));
     let status = child.wait()?;
@@ -315,7 +321,8 @@ fn escalation_preview(program: &str, commands: &[&[String]]) -> String {
     use std::fmt::Write;
     let mut out = format!("about to elevate via {program}:");
     for args in commands {
-        write!(out, "\n   {program} {}", args.join(" ")).expect("write! to String");
+        write!(out, "\n   {program} {}", args.join(" "))
+            .expect("writing to a String should never fail");
     }
     out
 }

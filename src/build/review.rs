@@ -139,7 +139,9 @@ impl ReviewRequest<'_> {
                 Action::ViewDiff => show_diff(
                     mirror,
                     wt,
-                    base.expect("only present when a diff base was found"),
+                    base.expect(
+                        "the view-diff action should be offered only when a diff base was found",
+                    ),
                     Some(FULL_DIFF_CONTEXT),
                 )?,
                 Action::Edit => edit_pkgbuild(wt)?,
@@ -177,7 +179,7 @@ fn show(
         }
         outcome => {
             let c =
-                counterpart.expect("upgrade_base_version is Some only when counterpart is Some");
+                counterpart.expect("counterpart should be Some whenever upgrade_base_version is");
             ui::note(&fallback_note(pkgbase, c, outcome));
             show_pkgbuild(wt)?;
             Ok(None)
@@ -1024,7 +1026,7 @@ mod highlight {
             theme: ThemeSet::load_defaults()
                 .themes
                 .remove("base16-ocean.dark")
-                .expect("syntect ships base16-ocean.dark"),
+                .expect("syntect should ship the base16-ocean.dark theme"),
         })
     }
 
