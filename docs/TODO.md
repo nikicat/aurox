@@ -111,12 +111,25 @@ the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
 
 ## Demos (docs/plans/screencasts.md)
 
+*Both postponed (2026-07-26) — a priority call, not a blocker: the seven
+demos already in `demos/demos.json` cover the flows a newcomer needs, and the
+product items above come first.*
+
 - initial AUR mirror clone, sped up: the one-time ~2 GiB clone with its
   progress UI, time-compressed to ~15 s. The mock mirror clones instantly
-  (nothing to show) and a live recording is non-hermetic — the pragmatic
-  path is a hand-recorded real clone whose cast timestamps are rescaled
-  (asciicast times are trivially editable), with the `.cast` checked in as
-  the source so the GIF still renders reproducibly.
+  (70 one-commit branches — no byte stream, no ref-writing tail), so the
+  obvious path is a hand-recorded real clone whose cast timestamps are
+  rescaled (asciicast times are trivially editable), with the `.cast` checked
+  in as the source so the GIF still renders reproducibly. **But check the
+  cheaper option first:** the two things worth filming — the 155k figure and
+  the long silent "finalizing — writing refs" phase with its idle note
+  (`ui/gix_progress.rs`) — are driven by *ref count*, not payload, and refs
+  are cheap. A synthetic mirror of 155k one-commit branches via `git
+  fast-import` should reproduce both hermetically for tens of MB of image and
+  a minute or two of bake (unmeasured — that's the thing to check). Only the
+  byte counter would understate. If it holds, this is a normal hermetic
+  recording like the other seven, repeatable in CI, and the non-hermetic
+  hand-recording is unnecessary.
 - incremental refresh: `-Sy` after a branch moves on the mirror — reuse
   extended/18's hermetic bump mechanics (clone the mock-AUR branch, commit
   a pkgver bump, fetch it back) to show "no ref updates" vs
@@ -124,4 +137,19 @@ the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
 
 ## AUR
 
-- account for already downloaded sources when printing download sizes in tables
+- **an AUR row's download figure should be its `source=` files, minus what's
+  already fetched** — *postponed until deeper PKGBUILD analysis lands; the
+  note is here so the intent isn't re-derived from scratch.* Today the 📥
+  column tells the truth only for repo rows (`sync_download_size` is alpm's
+  `download_size()`, already 0 for a cached archive); an AUR row instead
+  shows `SizeEst::Estimate(installed_size)` — its *installed footprint*, a
+  different quantity summed into the same total (`ui/cost.rs` `size_of`).
+  What it should be is the bytes makepkg will actually fetch: the `source=`
+  entries not already in the build worktree / `SRCDEST`.
+  **Why it waits:** nothing in the index knows a pkgbase's sources —
+  [`IndexEntry`](../src/index/schema.rs) has no `source` field and
+  `index::srcinfo` drops those lines — and even with them, a size needs a
+  HEAD request per http source and a non-trivial fetch to size a `git+`
+  one, per row, at *preview* time. That's a network round-trip storm and a
+  new failure mode for an advisory number. So it rides along with whatever
+  brings real source analysis into the index, not before.
