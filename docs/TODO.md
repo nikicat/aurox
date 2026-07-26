@@ -30,26 +30,6 @@ the code it constrains (a module doc, CLAUDE.md's conventions, docs/TESTING.md)
   "absent provider = empty provider" convention already did this for
   *availability*; this is the same move for *identity*.
 
-- **`cmd_*` returns a bare `u8`, which says nothing.** Every command entry
-  point (`cmd_search`, `cmd_search_install`, `cmd_info`, `cmd_install`,
-  `cmd_clean`, `cmd_query_upgrades`, `cmd_refresh`, `cmd_get`, `shell::run`)
-  is `Result<u8>`, and the number means something different at each one:
-  `cmd_info`'s 1 is "a target was in neither source", `cmd_install`'s is
-  "a build failed *or* the user Ctrl-C'd" (`Ok(u8::from(had_failures ||
-  !interrupted.is_empty()))`), the shell's 130 is "quit via SIGINT", and
-  everywhere else 0 is the only value ever returned. Nothing at any call
-  site can tell those apart, `Ok(0)` and `Ok(1)` are equally well-typed at
-  every `return`, and the one real consumer is `main`'s
-  `ExitCode::from(code)` — so the u8 is a *presentation* concern that has
-  leaked all the way down into the commands. Wanted: an outcome type the
-  commands actually mean (`Outcome::{Done, NotFound, Failed, Interrupted}`
-  or a per-family equivalent) whose sole `exit_code()` lives next to `main`,
-  so a command names its result and the mapping to POSIX numbers exists
-  once. **Watch:** `Error::PacmanExit` already carries pacman's own status
-  through a *different* channel — folding that in (or deliberately not) is
-  part of the design, not an afterthought; and `u8::from(bool)` sites are
-  the tell that the current type can't say *which* failure happened.
-
 ## Shell
 
 - `upgrade` runs the AUR refresh unconditionally whenever the AUR is

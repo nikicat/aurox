@@ -13,12 +13,71 @@ use crate::paths;
 use crate::runopts::{self, RunOpts};
 use crate::ui;
 use clap::Parser;
+use signal_hook::consts::SIGINT;
 
 pub mod dispatch;
 pub mod flags;
 pub mod getpkgbuild;
 pub mod search;
 pub mod shell;
+
+/// What a command accomplished — the return type of every `cmd_*` entry point.
+///
+/// A command says what *happened*; only [`Self::exit_code`] knows what POSIX
+/// number that is, and it is the one site that does. The alternative (every
+/// command returning a bare `u8`) made `Ok(0)` and `Ok(1)` equally well-typed
+/// at every `return` while meaning something different in each command, and
+/// left the caller unable to tell a missing package from a failed build.
+///
+/// Not every failure lives here: a command that can't proceed at all returns
+/// `Err` — including [`Error::PacmanExit`](crate::error::Error::PacmanExit),
+/// which carries pacman's own status through the error channel because pacman,
+/// not aurox, decided it. These variants are the outcomes aurox itself reaches
+/// *after* doing the work it was asked to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// The command did what was asked.
+    Done,
+    /// A requested package was in neither the sync repos nor the AUR (or a
+    /// search matched nothing) — pacman's own convention for "no results".
+    NotFound,
+    /// The work ran and something in it failed (a build, most often), with the
+    /// failure already reported.
+    Failed,
+    /// A Ctrl-C cut the work short — aurox *caught* the signal, stopped the
+    /// batch cleanly and said so, so the run is reported incomplete like any
+    /// other failure. Deliberately **not** `128 + SIGINT`: that code is what a
+    /// default-disposition kill produces, and
+    /// `tests/container/extended/02_sigint_bails_build.sh` uses exactly that
+    /// difference to prove the handler ran at all.
+    Interrupted,
+    /// The user left an interactive session with Ctrl-C instead of `quit` /
+    /// Ctrl-D. Nothing was cut short — the session simply ended that way — so
+    /// this reports the shell convention `128 + SIGINT`, letting a script
+    /// driving the shell tell the two exits apart
+    /// (`tests/container/extended/38_demo_ctrlc_quit.sh`).
+    QuitOnInterrupt,
+}
+
+impl Outcome {
+    /// The process exit code. The **only** place an outcome becomes a number:
+    /// `NotFound`, `Failed` and `Interrupted` deliberately share pacman's 1 —
+    /// each means "aurox did not do what you asked" — while a session the user
+    /// quit with `^C` reports `128 + SIGINT`.
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            Self::Done => 0,
+            Self::NotFound | Self::Failed | Self::Interrupted => 1,
+            Self::QuitOnInterrupt => CTRL_C_EXIT_CODE,
+        }
+    }
+}
+
+/// Exit code for an interrupted run: the shell convention `128 + signal
+/// number` for SIGINT, derived from the same constant the signal handlers use
+/// rather than a re-typed 130.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+const CTRL_C_EXIT_CODE: u8 = 128 + SIGINT as u8;
 
 /// yay-like AUR helper backed by the github.com/archlinux/aur mirror.
 ///
@@ -95,8 +154,9 @@ ENVIRONMENT:\n\
 Execution logs (debug level, last 10 runs): $XDG_STATE_HOME/aurox/logs/\n\
 Persistent settings: ~/.config/aurox/config.toml";
 
-/// Top-level entry. Returns the desired process exit code.
-pub fn run() -> Result<u8> {
+/// Top-level entry. Returns what the invocation accomplished; `main` turns
+/// that into the process exit code.
+pub fn run() -> Result<Outcome> {
     let config = ConfigHandle::load()?;
     let cfg = config.cfg();
     paths::ensure_state_dir()?;
@@ -120,13 +180,11 @@ pub fn run() -> Result<u8> {
     // flags like `-Rns`). `-Qu` is the one Q-family op aurox owns — it
     // augments `pacman -Qu` with AUR upgrade candidates, so we let it fall
     // through to clap + dispatch.
-    if let Some(op) = first_op_letter(&raw_argv) {
-        if matches!(op, 'R' | 'T' | 'D' | 'F' | 'U') {
-            return invoke::exec_pacman(cfg, &raw_argv);
-        }
-        if op == 'Q' && !is_plain_qu(&raw_argv) {
-            return invoke::exec_pacman(cfg, &raw_argv);
-        }
+    if let Some(op) = first_op_letter(&raw_argv)
+        && (matches!(op, 'R' | 'T' | 'D' | 'F' | 'U') || (op == 'Q' && !is_plain_qu(&raw_argv)))
+    {
+        invoke::exec_pacman(cfg, &raw_argv)?;
+        return Ok(Outcome::Done);
     }
 
     let cli = Cli::parse();

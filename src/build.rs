@@ -8,6 +8,7 @@
 //! VCS pkgbases never hit this cache (their static pkgver is overridden by
 //! `pkgver()`), which is the right thing — they're rebuilt on demand.
 
+use crate::cli::Outcome;
 use crate::config::Config;
 use crate::context;
 use crate::error::{Error, Result};
@@ -208,7 +209,7 @@ pub fn cmd_install(
     targets: &[Target],
     opts: InstallOpts,
     offer: SetupOffer,
-) -> Result<u8> {
+) -> Result<Outcome> {
     // Probed once: drives only the unknown-target wording below. The data
     // flow is uniform — an unavailable AUR loads as empty AUR data.
     let aur_state = index::AurState::probe(cfg);
@@ -265,11 +266,16 @@ pub fn cmd_install(
         }
         other => other?,
     };
-    // A Ctrl+C'd build exits non-zero too: the user aborted, so `||` chains and
-    // scripts should see the run didn't complete.
-    Ok(u8::from(
-        report.had_failures() || !report.interrupted.is_empty(),
-    ))
+    // A Ctrl+C'd build is non-zero too: the user aborted, so `||` chains and
+    // scripts should see the run didn't complete — but as its own outcome, so
+    // "^C" and "the build broke" aren't the same number.
+    Ok(if report.had_failures() {
+        Outcome::Failed
+    } else if report.interrupted.is_empty() {
+        Outcome::Done
+    } else {
+        Outcome::Interrupted
+    })
 }
 
 /// After `-S` hit unknown targets with the AUR enabled-but-unsynced: the
@@ -1337,7 +1343,7 @@ fn covers_all(selected: &[PathBuf], required: &[PkgName]) -> bool {
 /// aurox just wipes its per-pkgbase worktrees (idempotency cache lives
 /// entirely inside them as the produced `.pkg.tar.{zst,xz}` files).
 #[instrument(skip(cfg, argv))]
-pub fn cmd_clean(cfg: &Config, argv: &[String]) -> Result<u8> {
+pub fn cmd_clean(cfg: &Config, argv: &[String]) -> Result<Outcome> {
     invoke::exec_pacman(cfg, argv)?;
 
     let pkgs_root = paths::state_dir().join("pkgs");
@@ -1350,7 +1356,7 @@ pub fn cmd_clean(cfg: &Config, argv: &[String]) -> Result<u8> {
             warn!(error = %e, "could not recreate pkgs dir");
         }
     }
-    Ok(0)
+    Ok(Outcome::Done)
 }
 
 #[cfg(test)]

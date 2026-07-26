@@ -26,6 +26,7 @@
 //! a custom refspec — no worktree, no checkout — so none of it is reusable
 //! here. Same split, same reason, as `mirror/worktree.rs`.
 
+use crate::cli::Outcome;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::git;
@@ -57,10 +58,10 @@ pub enum GetMode {
 /// `aurox -G <pkg>…` / `aurox -Gp <pkg>…`.
 ///
 /// Targets resolve the way `-Si`'s do (pkgname / provides / pkgbase), so
-/// `-G <pkgname>` lands the split-package *base* that builds it. Pacman-style
-/// exit code: non-zero when some target wasn't in the AUR.
+/// `-G <pkgname>` lands the split-package *base* that builds it.
+/// [`Outcome::NotFound`] when some target wasn't in the AUR.
 #[instrument(skip(cfg))]
-pub fn cmd_get(cfg: &Config, targets: &[PkgTarget], mode: GetMode) -> Result<u8> {
+pub fn cmd_get(cfg: &Config, targets: &[PkgTarget], mode: GetMode) -> Result<Outcome> {
     if targets.is_empty() {
         return Err(Error::other("no targets specified"));
     }
@@ -90,10 +91,10 @@ pub fn cmd_get(cfg: &Config, targets: &[PkgTarget], mode: GetMode) -> Result<u8>
         }
     }
     if missing.is_empty() {
-        return Ok(0);
+        return Ok(Outcome::Done);
     }
     ui::warn(&format!("not in the AUR: {}", missing.join(", ")));
-    Ok(1)
+    Ok(Outcome::NotFound)
 }
 
 /// Clone `pkgbase`'s branch out of the local `mirror` into `dest`, then point

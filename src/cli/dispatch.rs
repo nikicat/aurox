@@ -1,11 +1,11 @@
 //! Decide whether to handle an operation natively or pass through to pacman.
 
 use crate::build;
-use crate::cli::Cli;
 use crate::cli::flags::{self, PacFlags};
 use crate::cli::getpkgbuild;
 use crate::cli::search;
 use crate::cli::shell;
+use crate::cli::{Cli, Outcome};
 use crate::config::{Config, ConfigHandle};
 use crate::error::{Error, Result};
 use crate::index;
@@ -19,7 +19,7 @@ use tracing::{debug, warn};
 /// Top-level routing entry — clap already pre-scanned for pacman-owned ops,
 /// so by this point `cli.args` is aurox's responsibility (`-S` family,
 /// the bare-arg yay shortcuts, or none-at-all).
-pub fn dispatch(config: &ConfigHandle, cli: &Cli) -> Result<u8> {
+pub fn dispatch(config: &ConfigHandle, cli: &Cli) -> Result<Outcome> {
     let cfg = config.cfg();
     let argv = &cli.args;
     let f = flags::parse(argv);
@@ -44,7 +44,8 @@ pub fn dispatch(config: &ConfigHandle, cli: &Cli) -> Result<u8> {
         // `pacman -Syu --noconfirm` — there's no human to answer pacman's
         // prompts, so `--noconfirm` is required (the explicit `-Su` flag keeps
         // the user's own flags instead).
-        return invoke::exec_pacman(cfg, &["-Syu".to_owned(), "--noconfirm".to_owned()]);
+        invoke::exec_pacman(cfg, &["-Syu".to_owned(), "--noconfirm".to_owned()])?;
+        return Ok(Outcome::Done);
     }
 
     match f.op {
@@ -107,7 +108,7 @@ fn pkg_targets(positional: &[String]) -> Vec<PkgTarget> {
 }
 
 /// Handle the `-S` family (`-S`, `-Sy`, `-Syu`, `-Ss`, `-Si`, `-Sc`).
-fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<u8> {
+fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> Result<Outcome> {
     let cfg = config.cfg();
     // `--noconfirm` / `--asdeps` / `--devel` may appear before *or* after the
     // operation (`aurox --noconfirm -S foo` vs `aurox -S --noconfirm foo`).
@@ -123,7 +124,7 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
         use clap::CommandFactory;
         Cli::command().print_help().ok();
         println!();
-        return Ok(0);
+        return Ok(Outcome::Done);
     }
 
     if f.has('s') {
@@ -143,7 +144,8 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
     // run here — `pacman -Sy` syncs its own DBs; refresh the AUR mirror with a
     // standalone `aurox -Sy` or via the shell.
     if f.has('u') {
-        return invoke::exec_pacman(cfg, argv);
+        invoke::exec_pacman(cfg, argv)?;
+        return Ok(Outcome::Done);
     }
 
     let refresh = f.has('y');
@@ -170,10 +172,10 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
     }
 
     if !f.positional.is_empty() {
-        // cmd_install returns 1 when the AUR pipeline finished with at
-        // least one build failure or dep-block — the summary already
-        // explains what happened, so we just propagate the exit code so
-        // shells / `||` chains see the failure.
+        // cmd_install reports `Failed`/`Interrupted` when the AUR pipeline
+        // finished with a build failure, a dep-block, or a ^C — the summary
+        // already explains what happened, so we just propagate the outcome so
+        // shells / `||` chains see it.
         // Direct `-S` argv has no per-target hint — expand will derive one
         // from the spec when it rewrites (pkgname / provides paths).
         let targets: Vec<build::Target> = f
@@ -192,7 +194,7 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
         return Err(Error::other("no targets specified"));
     }
 
-    Ok(0)
+    Ok(Outcome::Done)
 }
 
 /// Drive `pacman -Su` for the selected repo packages, **with aurox's rootless
@@ -228,8 +230,7 @@ fn handle_s(config: &ConfigHandle, cli: &Cli, f: &PacFlags, argv: &[String]) -> 
 /// the explicit `-Syu` flag bypasses this entirely as a `pacman` passthrough.
 ///
 /// `Ok(())` is "the repo upgrade ran (or there was nothing to do)"; a non-zero
-/// pacman exit surfaces as [`Error::PacmanExit`]. (There's no meaningful success
-/// code to return — `exec_pacman` yields `Ok(0)` or an error, never `Ok(n)`.)
+/// pacman exit surfaces as [`Error::PacmanExit`].
 pub(crate) fn run_repo_upgrade(cfg: &Config, sel: &ui::UpgradeSelection) -> Result<()> {
     if sel.repo.is_empty() {
         return Ok(());
@@ -258,9 +259,9 @@ pub(crate) fn run_repo_upgrade(cfg: &Config, sel: &ui::UpgradeSelection) -> Resu
         argv.push(sel.repo_skipped.join(","));
     }
     if let Some(staging) = staging {
-        invoke::exec_staged_sysupgrade(cfg, &staging, &argv).map(|_| ())
+        invoke::exec_staged_sysupgrade(cfg, &staging, &argv)
     } else {
         debug!("no rootless synced db; repo upgrade falls back to a full -Syu");
-        invoke::exec_pacman(cfg, &argv).map(|_| ())
+        invoke::exec_pacman(cfg, &argv)
     }
 }
